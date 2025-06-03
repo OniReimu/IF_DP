@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from torch.autograd import grad
+import argparse
+import os
+from torch.utils.data import DataLoader
 
 def hvp(y, w, v):
     """Multiply the Hessians of y and w by v.
@@ -50,14 +53,24 @@ def grad_z(z, t, model, gpu=-1):
             e.g. an image sample (batch_size, 3, 256, 256)
         t: torch tensor, training data labels
         model: torch NN, model used to evaluate the dataset
-        gpu: int, device id to use for GPU, -1 for CPU
+        gpu: int, device id to use for GPU, -1 for CPU/MPS
 
     Returns:
         grad_z: list of torch tensor, containing the gradients
             from model parameters to loss"""
     model.eval()
-    # initialize
-    device = torch.device(f"cuda:{gpu}" if gpu >= 0 else "cpu")
+    
+    # Handle None gpu parameter and device selection
+    if gpu is None:
+        gpu = -1
+    
+    if gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f"cuda:{gpu}")
+    elif gpu == -1 and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+        
     z, t = z.to(device), t.to(device)
     y = model(z)
     loss = calc_loss(y, t)
@@ -77,13 +90,27 @@ def calc_loss(y, t):
 
     Returns:
         loss: scalar, the loss"""
-    ####################
-    # if dim == [0, 1, 3] then dim=0; else dim=1
-    ####################
-    # y = torch.nn.functional.log_softmax(y, dim=0)
-    y = torch.nn.functional.log_softmax(y)
-    loss = torch.nn.functional.nll_loss(
-        y, t, weight=None, reduction='mean')
+    
+    # Check for empty tensors which cause MPS issues
+    if y.numel() == 0 or t.numel() == 0:
+        return torch.tensor(0.0, device=y.device, requires_grad=True)
+    
+    # Handle MPS compatibility issues
+    if y.device.type == 'mps':
+        try:
+            loss = torch.nn.functional.cross_entropy(y, t, reduction='mean')
+        except RuntimeError as e:
+            if "empty" in str(e).lower() or "placeholder" in str(e).lower():
+                # Fallback to CPU for problematic MPS operations
+                y_cpu = y.cpu()
+                t_cpu = t.cpu()
+                loss_cpu = torch.nn.functional.cross_entropy(y_cpu, t_cpu, reduction='mean')
+                loss = loss_cpu.to(y.device)
+            else:
+                raise e
+    else:
+        loss = torch.nn.functional.cross_entropy(y, t, reduction='mean')
+    
     return loss
 
 def compute_hessian_inverse(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, scale=25.0,
@@ -98,7 +125,7 @@ def compute_hessian_inverse(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, 
         t_test: torch tensor, contains all test data labels
         model: torch NN, model used to evaluate the dataset
         z_loader: torch Dataloader, can load the training dataset
-        gpu: int, GPU id to use if >=0 and -1 means use CPU
+        gpu: int, GPU id to use if >=0, -1 for CPU/MPS
         damp: float, dampening factor
         scale: float, scaling factor
         recursion_depth: int, number of iterations aka recursion depth
@@ -109,11 +136,21 @@ def compute_hessian_inverse(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, 
     v = grad_z(z_test, t_test, model, gpu)
     h_estimate = v.copy()
     
-    device = torch.device(f"cuda:{gpu}" if gpu >= 0 else "cpu")
+    # Handle None gpu parameter and device selection
+    if gpu is None:
+        gpu = -1
+    
+    if gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f"cuda:{gpu}")
+    elif gpu == -1 and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     
     for i in range(recursion_depth):
         # take just one random sample from training dataset
-        for x, t in z_loader:
+        for batch_data in z_loader:
+            x, t, _ = unpack_batch(batch_data)
             x, t = x.to(device), t.to(device)
             y = model(x)
             loss = calc_loss(y, t)
@@ -126,5 +163,12 @@ def compute_hessian_inverse(z_test, t_test, model, z_loader, gpu=-1, damp=0.01, 
             break
        
     return h_estimate
+
+def unpack_batch(batch_data):
+    """Helper function to handle both (x, y) and (x, y, user_id) formats"""
+    if len(batch_data) == 3:
+        return batch_data[0], batch_data[1], batch_data[2]  # x, y, user_id
+    else:
+        return batch_data[0], batch_data[1], None  # x, y, None
 
 

@@ -12,7 +12,7 @@ class CNN(nn.Module):
         self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
-        self.pool = nn.MaxPool2d(2, 2)
+        self.pool = nn.MaxPool2d(2, 2, return_indices=True)
         self.fc1 = nn.Linear(128 * 4 * 4, 512)
         self.bn4 = nn.BatchNorm1d(512)
         self.fc2 = nn.Linear(512, 10)
@@ -24,19 +24,19 @@ class CNN(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.pool(x)
+        x, _ = self.pool(x)
         
         # 第二个卷积块
         x = self.conv2(x)
         x = self.bn2(x)
         x = self.relu(x)
-        x = self.pool(x)
+        x, _ = self.pool(x)
         
         # 第三个卷积块
         x = self.conv3(x)
         x = self.bn3(x)
         x = self.relu(x)
-        x = self.pool(x)
+        x, _ = self.pool(x)
         
         # 展平
         x = x.view(-1, 128 * 4 * 4)
