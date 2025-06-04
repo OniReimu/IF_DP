@@ -21,16 +21,62 @@ from fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip
 from dp_sgd import train_with_vanilla_dp
 from privacy_accounting import (
     get_privacy_params_for_target_epsilon, 
-    compute_actual_epsilon,
-    validate_privacy_comparison,
-    print_privacy_summary
 )
 from model import CNN
 from mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
-from influence_function import calibrate_model, calibrate_model_efficient, diagnose_calibration, print_calibration_effect
+from influence_function import calibrate_model_research_protocol, get_critical_slice
 
 torch.manual_seed(42); np.random.seed(42)
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
+
+# ════════════════════════════════════════════════════════════════
+# Diagnostic functions (moved from influence_function.py)
+# ════════════════════════════════════════════════════════════════
+
+def diagnose_calibration(model, critical_data, critical_targets, device):
+    """
+    Simple diagnostic function to measure critical slice performance.
+    Replacement for the removed function in influence_function.py.
+    """
+    if len(critical_data) == 0:
+        return {'loss': float('inf'), 'accuracy': 0.0, 'num_samples': 0}
+    
+    model.eval()
+    with torch.no_grad():
+        output = model(critical_data)
+        loss = F.cross_entropy(output, critical_targets)
+        predictions = output.argmax(dim=1)
+        accuracy = (predictions == critical_targets).float().mean()
+    
+    return {
+        'loss': loss.item(),
+        'accuracy': accuracy.item() * 100,
+        'num_samples': len(critical_data)
+    }
+
+def print_calibration_effect(before_stats, after_stats, target_class=3):
+    """
+    Print the effect of calibration on the critical slice.
+    Replacement for the removed function in influence_function.py.
+    """
+    print(f"\n📊 Calibration Effect Analysis (Class {target_class}):")
+    print(f"   • Samples evaluated: {before_stats['num_samples']}")
+    print(f"   • Loss before:   {before_stats['loss']:.4f}")
+    print(f"   • Loss after:    {after_stats['loss']:.4f}")
+    print(f"   • Δ Loss:        {after_stats['loss'] - before_stats['loss']:+.4f}")
+    print(f"   • Accuracy before: {before_stats['accuracy']:.2f}%")
+    print(f"   • Accuracy after:  {after_stats['accuracy']:.2f}%")
+    print(f"   • Δ Accuracy:      {after_stats['accuracy'] - before_stats['accuracy']:+.2f}%")
+    
+    if after_stats['loss'] < before_stats['loss']:
+        print(f"   ✅ SUCCESS: Calibration reduced critical slice loss!")
+    else:
+        print(f"   ⚠️  WARNING: Calibration increased critical slice loss")
+    
+    if after_stats['accuracy'] > before_stats['accuracy']:
+        print(f"   ✅ SUCCESS: Calibration improved critical slice accuracy!")
+    else:
+        print(f"   ⚠️  WARNING: Calibration reduced critical slice accuracy")
 
 # ════════════════════════════════════════════════════════════════
 # Synthetic users + batch sampler (reused from main.py)
@@ -474,66 +520,48 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     # Variant 3: Fisher DP + Normal + Influence Function Calibration
     # ════════════════════════════════════════════════════════════════
     
+    # Create test loader for evaluation (needed for regularization)
+    test_loader = DataLoader(eval_base, batch_size=128, shuffle=False)
+    
     print(f"\n{'='*50}")
     print("📐 VARIANT 3: Fisher DP + Normal + Calibration")
     print(f"{'='*50}")
     
     fisher_normal_calibrated = copy.deepcopy(fisher_normal_model)
     
-    # Diagnose before calibration
-    from influence_function import diagnose_calibration, print_calibration_effect
+    # Get critical slice using the new API
+    critical_data, critical_targets = get_critical_slice(pub_loader, args.target_class, device)
     
-    # Get critical slice for diagnosis
-    critical_data = []
-    critical_targets = []
-    for batch_data in pub_loader:
-        data, target, _ = unpack_batch(batch_data)
-        mask = (target == args.target_class)
-        if mask.any():
-            critical_data.append(data[mask])
-            critical_targets.append(target[mask])
-    
-    if critical_data:
-        critical_data = torch.cat(critical_data, dim=0).to(device)
-        critical_targets = torch.cat(critical_targets, dim=0).to(device)
-        
+    if len(critical_data) > 0:
         before_stats = diagnose_calibration(fisher_normal_calibrated, critical_data, critical_targets, device)
         
-        # Apply calibration
-        if args.efficient:
-            calib_normal = calibrate_model_efficient(
-                fisher_normal_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                method=args.method, target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
-        else:
-            calib_normal = calibrate_model(
-                fisher_normal_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
+        # Apply calibration with the correct signature
+        calib_normal = calibrate_model_research_protocol(
+            fisher_normal_calibrated, pub_loader, priv_loader,
+            critical_data, critical_targets, device=device,
+            method=args.method,
+            eta=args.calibration_k,
+            trust_tau=args.trust_tau,
+            strict=True,
+            clean_model=baseline,
+            reg=args.reg
+        )
         
         after_stats = diagnose_calibration(calib_normal, critical_data, critical_targets, device)
         print_calibration_effect(before_stats, after_stats, args.target_class)
     else:
-        print(f"⚠️  No samples of class {args.target_class} found for diagnosis")
+        print(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply calibration without diagnosis
-        if args.efficient:
-            calib_normal = calibrate_model_efficient(
-                fisher_normal_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                method=args.method, target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
-        else:
-            calib_normal = calibrate_model(
-                fisher_normal_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
+        calib_normal = calibrate_model_research_protocol(
+            fisher_normal_calibrated, pub_loader, priv_loader,
+            critical_data, critical_targets, device=device,
+            method=args.method,
+            eta=args.calibration_k,
+            trust_tau=args.trust_tau,
+            strict=True,
+            clean_model=baseline,
+            reg=args.reg
+        )
     
     # ════════════════════════════════════════════════════════════════
     # Variant 4: Fisher DP + DP-SAT + Influence Function Calibration
@@ -546,51 +574,40 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     fisher_dpsat_calibrated = copy.deepcopy(fisher_dpsat_model)
     
     # Diagnose before calibration for DP-SAT variant
-    if critical_data is not None and len(critical_data) > 0:
+    if len(critical_data) > 0:
         before_stats_dpsat = diagnose_calibration(fisher_dpsat_calibrated, critical_data, critical_targets, device)
         
-        # Apply calibration
-        if args.efficient:
-            calib_dpsat = calibrate_model_efficient(
-                fisher_dpsat_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                method=args.method, target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
-        else:
-            calib_dpsat = calibrate_model(
-                fisher_dpsat_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
+        # Apply calibration with the correct signature
+        calib_dpsat = calibrate_model_research_protocol(
+            fisher_dpsat_calibrated, pub_loader, priv_loader,
+            critical_data, critical_targets, device=device,
+            method=args.method,
+            eta=args.calibration_k,
+            trust_tau=args.trust_tau,
+            strict=True,
+            clean_model=baseline,
+            reg=args.reg
+        )
         
         after_stats_dpsat = diagnose_calibration(calib_dpsat, critical_data, critical_targets, device)
         print_calibration_effect(before_stats_dpsat, after_stats_dpsat, args.target_class)
     else:
-        print(f"⚠️  No samples of class {args.target_class} found for diagnosis")
+        print(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply calibration without diagnosis
-        if args.efficient:
-            calib_dpsat = calibrate_model_efficient(
-                fisher_dpsat_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                method=args.method, target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
-        else:
-            calib_dpsat = calibrate_model(
-                fisher_dpsat_calibrated, pub_loader, priv_loader,
-                Fmat, top_k=args.calibration_k, device=device,
-                target_class=args.target_class,
-                baseline_model=baseline  # Add baseline for ΔL_DP computation
-            )
+        calib_dpsat = calibrate_model_research_protocol(
+            fisher_dpsat_calibrated, pub_loader, priv_loader,
+            critical_data, critical_targets, device=device,
+            method=args.method,
+            eta=args.calibration_k,
+            trust_tau=args.trust_tau,
+            strict=True,
+            clean_model=baseline,
+            reg=args.reg
+        )
 
     # ════════════════════════════════════════════════════════════════
     # Evaluation and Comparison
     # ════════════════════════════════════════════════════════════════
-    
-    # Create test loader for evaluation
-    test_loader = DataLoader(eval_base, batch_size=128, shuffle=False)
     
     print(f"\n{'='*70}")
     print("📊 ABLATION STUDY RESULTS")
@@ -710,7 +727,6 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         'k': args.k,
         'calibration_k': args.calibration_k,
         'calibration_method': args.method,
-        'efficient_calibration': args.efficient,
         'calibration_improvement': calib_normal_improvement,
         'full_complement_noise': args.full_complement_noise,
         'ablation_study': True
@@ -729,7 +745,6 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         'lambda_flatness': args.lambda_flatness,
         'calibration_k': args.calibration_k,
         'calibration_method': args.method,
-        'efficient_calibration': args.efficient,
         'calibration_improvement': calib_dpsat_improvement,
         'synergy_gain': synergy_gain,
         'total_combined_gain': total_calib_dpsat_gain,
@@ -935,21 +950,34 @@ def main():
     parser.add_argument('--users', type=int, default=10)
     
     # Calibration arguments (now enabled)
-    parser.add_argument('--efficient', action='store_true',
-                       help='Use efficient calibration method (linear or batch approximation)')
     parser.add_argument('--method', type=str, default='linear',
                        choices=['linear','batch','original'],
                        help='Calibration method: linear (fast), batch (medium), original (slow but accurate)')
     parser.add_argument('--calibration-k', type=int, default=100,
                        help='Number of top-k samples to use for calibration')
-    parser.add_argument('--target-class', type=int, default=3,
-                       help='Target class for critical slice (default: 3 = "cat" for CIFAR-10)')
+    parser.add_argument('--trust-tau', type=float, default=0.05,
+                       help='Trust region parameter: max relative parameter change (default: 0.05 = 5%)')
+    parser.add_argument('--reg', type=float, default=1.0,
+                       help='Regularization parameter for linear method influence vectors (default: 1.0)')
+    parser.add_argument('--target-class', default=3,
+                       help='Target class for critical slice: integer for single class, "all" for multi-class (default: 3 = "cat" for CIFAR-10)')
+    parser.add_argument('--compare-calibration', action='store_true',
+                       help='Run comparative experiment between single-class and multi-class calibration')
     
     # MIA evaluation
     parser.add_argument('--run-mia', action='store_true')
     parser.add_argument('--mia-size', type=int, default=1000)
     
     args = parser.parse_args()
+    
+    # Parse target_class argument (must be int)
+    try:
+        target_class = int(args.target_class)
+        print(f"📊 Using target class {target_class} for calibration")
+    except ValueError:
+        print(f"❌ Error: target_class must be an integer, got '{args.target_class}'")
+        exit(1)
+    args.target_class = target_class
     
     # Validate privacy parameters
     if args.use_legacy_accounting:

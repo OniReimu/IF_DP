@@ -301,6 +301,12 @@ python ablation.py --clean --target-epsilon 10.0 --epochs 30 \
     --dataset-size 15000 --run-mia --adaptive-clip
 ```
 
+## In progress
+
+[x] `python main.py --epochs 50 --dataset-size 2000 --target-epsilon 2.0 --delta 1e-5 --clip-radius 6.0 --run-mia --compare-others`
+
+[x] `python ablation.py --epochs 50 --dataset-size 5000 --calibration-k 128 --target-epsilon 2.0 --delta 1e-5 --clip-radius 2.0 --target-class 3 --trust-tau 0.1 --reg 5.0 --run-mia --method linear --compare-calibration`
+
 ## 📚 **References**
 
 - **DP-SAT**: Park, J., Kim, H., Choi, Y., & Lee, J. (2023). Differentially Private Sharpness-Aware Training. *Proceedings of the 40th International Conference on Machine Learning*, 202:27204-27224. [Link](https://proceedings.mlr.press/v202/park23g.html)
