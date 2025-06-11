@@ -19,6 +19,7 @@ from torch.autograd import grad  # Required for per-sample gradients
 # Project-specific helpers
 from fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip
 from dp_sgd import train_with_vanilla_dp
+from dp_sat import train_with_dp_sat
 from privacy_accounting import (
     get_privacy_params_for_target_epsilon, 
 )
@@ -413,10 +414,12 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     Run comprehensive ablation study on Fisher DP-SGD variants.
     
     Variants tested:
-    1. Fisher DP + Normal Optimizer (baseline)
-    2. Fisher DP + DP-SAT Optimizer (synergistic combination)
-    3. Fisher DP + Normal + Influence Function Calibration
-    4. Fisher DP + DP-SAT + Influence Function Calibration
+    1. Vanilla DP-SGD (Non-Fisher)
+    2. Vanilla DP-SGD + DP-SAT (Non-Fisher)
+    3. Fisher DP + Normal Optimizer
+    4. Fisher DP + DP-SAT Optimizer
+    5. Fisher DP + Normal + Influence Function Calibration
+    6. Fisher DP + DP-SAT + Influence Function Calibration
     """
     
     print("\n" + "="*70)
@@ -466,11 +469,56 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     ablation_results = {}
     
     # ════════════════════════════════════════════════════════════════
-    # Variant 1: Fisher DP + Normal Optimizer (Baseline)
+    # Variant 1: Vanilla DP-SGD (Non-Fisher)
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n{'='*50}")
-    print("🎯 VARIANT 1: Fisher DP + Normal Optimizer")
+    print("🔵 VARIANT 1: Vanilla DP-SGD (Non-Fisher)")
+    print(f"{'='*50}")
+    
+    vanilla_dp_model = copy.deepcopy(baseline)
+    vanilla_dp_model = train_with_vanilla_dp(
+        vanilla_dp_model, priv_loader,
+        epsilon=display_epsilon, delta=args.delta,
+        sigma=sigma,
+        clip_radius=args.clip_radius,
+        device=device,
+        target_layer=args.dp_layer,
+        adaptive_clip=args.adaptive_clip,
+        quantile=args.quantile,
+        sample_level=args.sample_level,
+        epochs=args.epochs
+    )
+    
+    # ════════════════════════════════════════════════════════════════
+    # Variant 2: Vanilla DP-SGD + DP-SAT (Non-Fisher)
+    # ════════════════════════════════════════════════════════════════
+    
+    print(f"\n{'='*50}")
+    print("🔵🔺 VARIANT 2: Vanilla DP-SGD + DP-SAT (Non-Fisher)")
+    print(f"{'='*50}")
+    
+    vanilla_dpsat_model = copy.deepcopy(baseline)
+    vanilla_dpsat_model = train_with_dp_sat(
+        vanilla_dpsat_model, priv_loader,
+        epsilon=display_epsilon, delta=args.delta,
+        sigma=sigma,
+        clip_radius=args.clip_radius,
+        device=device,
+        target_layer=args.dp_layer,
+        adaptive_clip=args.adaptive_clip,
+        quantile=args.quantile,
+        sample_level=args.sample_level,
+        epochs=args.epochs,
+        lambda_flatness=args.lambda_flatness
+    )
+    
+    # ════════════════════════════════════════════════════════════════
+    # Variant 3: Fisher DP + Normal Optimizer
+    # ════════════════════════════════════════════════════════════════
+    
+    print(f"\n{'='*50}")
+    print("🎯 VARIANT 3: Fisher DP + Normal Optimizer")
     print(f"{'='*50}")
     
     fisher_normal_model = copy.deepcopy(baseline)
@@ -491,11 +539,11 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     )
     
     # ════════════════════════════════════════════════════════════════
-    # Variant 2: Fisher DP + DP-SAT Optimizer (Synergistic)
+    # Variant 4: Fisher DP + DP-SAT Optimizer
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n{'='*50}")
-    print("🔺 VARIANT 2: Fisher DP + DP-SAT Optimizer")
+    print("🔺 VARIANT 4: Fisher DP + DP-SAT Optimizer")
     print(f"{'='*50}")
     
     fisher_dpsat_model = copy.deepcopy(baseline)
@@ -517,14 +565,14 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     )
     
     # ════════════════════════════════════════════════════════════════
-    # Variant 3: Fisher DP + Normal + Influence Function Calibration
+    # Variant 5: Fisher DP + Normal + Influence Function Calibration
     # ════════════════════════════════════════════════════════════════
     
     # Create test loader for evaluation (needed for regularization)
     test_loader = DataLoader(eval_base, batch_size=128, shuffle=False)
     
     print(f"\n{'='*50}")
-    print("📐 VARIANT 3: Fisher DP + Normal + Calibration")
+    print("📐 VARIANT 5: Fisher DP + Normal + Calibration")
     print(f"{'='*50}")
     
     fisher_normal_calibrated = copy.deepcopy(fisher_normal_model)
@@ -564,11 +612,11 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         )
     
     # ════════════════════════════════════════════════════════════════
-    # Variant 4: Fisher DP + DP-SAT + Influence Function Calibration
+    # Variant 6: Fisher DP + DP-SAT + Influence Function Calibration
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n{'='*50}")
-    print("🔺📐 VARIANT 4: Fisher DP + DP-SAT + Calibration")
+    print("🔺📐 VARIANT 6: Fisher DP + DP-SAT + Calibration")
     print(f"{'='*50}")
     
     fisher_dpsat_calibrated = copy.deepcopy(fisher_dpsat_model)
@@ -615,12 +663,16 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     
     # Compute accuracies
     baseline_acc = accuracy(baseline, test_loader, device)
+    vanilla_dp_acc = accuracy(vanilla_dp_model, test_loader, device)
+    vanilla_dpsat_acc = accuracy(vanilla_dpsat_model, test_loader, device)
     fisher_normal_acc = accuracy(fisher_normal_model, test_loader, device)
     fisher_dpsat_acc = accuracy(fisher_dpsat_model, test_loader, device)
     calib_normal_acc = accuracy(calib_normal, test_loader, device)
     calib_dpsat_acc = accuracy(calib_dpsat, test_loader, device)
     
     ablation_results['baseline'] = baseline_acc
+    ablation_results['vanilla_dp'] = vanilla_dp_acc
+    ablation_results['vanilla_dpsat'] = vanilla_dpsat_acc
     ablation_results['fisher_normal'] = fisher_normal_acc
     ablation_results['fisher_dpsat'] = fisher_dpsat_acc
     ablation_results['calib_normal'] = calib_normal_acc
@@ -629,12 +681,18 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     dp_mode = "Sample-level" if args.sample_level else f"User-level ({args.users} users)"
     print(f"\n🎯 Accuracy Comparison ({dp_mode} DP):")
     print(f"   • Baseline (Non-DP)           : {baseline_acc:6.2f}%")
+    print(f"   • Vanilla DP-SGD              : {vanilla_dp_acc:6.2f}%")
+    print(f"   • Vanilla DP-SGD + DP-SAT      : {vanilla_dpsat_acc:6.2f}%")
     print(f"   • Fisher DP + Normal          : {fisher_normal_acc:6.2f}%")
     print(f"   • Fisher DP + DP-SAT          : {fisher_dpsat_acc:6.2f}%")
     print(f"   • Fisher DP + Normal + Calib  : {calib_normal_acc:6.2f}%")
     print(f"   • Fisher DP + DP-SAT + Calib  : {calib_dpsat_acc:6.2f}%")
     
     # Compute improvements
+    vanilla_dp_improvement = vanilla_dp_acc - baseline_acc
+    vanilla_dpsat_improvement = vanilla_dpsat_acc - baseline_acc
+    vanilla_dpsat_vs_vanilla = vanilla_dpsat_acc - vanilla_dp_acc
+    fisher_vs_vanilla = fisher_normal_acc - vanilla_dp_acc
     normal_improvement = fisher_normal_acc - baseline_acc
     dpsat_improvement = fisher_dpsat_acc - baseline_acc
     synergy_gain = fisher_dpsat_acc - fisher_normal_acc
@@ -642,6 +700,10 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     calib_dpsat_improvement = calib_dpsat_acc - fisher_dpsat_acc
     
     print(f"\n📈 Improvement Analysis:")
+    print(f"   • Vanilla DP-SGD:             {vanilla_dp_improvement:+5.2f}% vs baseline")
+    print(f"   • Vanilla DP-SGD + DP-SAT:    {vanilla_dpsat_improvement:+5.2f}% vs baseline")
+    print(f"   • DP-SAT gain (Vanilla):      {vanilla_dpsat_vs_vanilla:+5.2f}% over vanilla DP")
+    print(f"   • Fisher benefit:             {fisher_vs_vanilla:+5.2f}% over vanilla DP")
     print(f"   • Fisher DP (Normal):         {normal_improvement:+5.2f}% vs baseline")
     print(f"   • Fisher DP (DP-SAT):         {dpsat_improvement:+5.2f}% vs baseline")
     print(f"   • Synergy Gain (DP-SAT):      {synergy_gain:+5.2f}% over normal Fisher DP")
@@ -658,6 +720,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     print(f"   • Total Combined effect:     {total_calib_dpsat_gain:+5.2f}% (DP-SAT + Calib)")
     
     best_method = max([
+        ('Vanilla DP-SGD', vanilla_dp_acc),
+        ('Vanilla DP-SGD + DP-SAT', vanilla_dpsat_acc),
         ('Fisher Normal', fisher_normal_acc),
         ('Fisher DP-SAT', fisher_dpsat_acc),
         ('Fisher Normal + Calib', calib_normal_acc),
@@ -685,6 +749,32 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n💾 Saving ablation study models...")
+    
+    # Save Vanilla DP-SGD
+    vanilla_dp_path = os.path.join(models_dir, 'Vanilla_DP_Ablation.pth')
+    torch.save({
+        'model_state_dict': vanilla_dp_model.state_dict(),
+        'model_type': 'vanilla_dp',
+        'accuracy': vanilla_dp_acc,
+        'epsilon': display_epsilon,
+        'clip_radius': args.clip_radius,
+        'ablation_study': True
+    }, vanilla_dp_path)
+    print(f"✅ Saved Vanilla DP-SGD to {vanilla_dp_path}")
+    
+    # Save Vanilla DP-SGD + DP-SAT
+    vanilla_dpsat_path = os.path.join(models_dir, 'Vanilla_DPSAT_Ablation.pth')
+    torch.save({
+        'model_state_dict': vanilla_dpsat_model.state_dict(),
+        'model_type': 'vanilla_dp_dpsat',
+        'accuracy': vanilla_dpsat_acc,
+        'epsilon': display_epsilon,
+        'clip_radius': args.clip_radius,
+        'lambda_flatness': args.lambda_flatness,
+        'dpsat_gain_vanilla': vanilla_dpsat_vs_vanilla,
+        'ablation_study': True
+    }, vanilla_dpsat_path)
+    print(f"✅ Saved Vanilla DP-SGD + DP-SAT to {vanilla_dpsat_path}")
     
     # Save Fisher DP + Normal
     fisher_normal_path = os.path.join(models_dir, 'Fisher_Normal_Ablation.pth')
@@ -763,6 +853,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         # Prepare all models for MIA evaluation
         models_to_evaluate = {
             'Baseline (Non-DP)': baseline,
+            'Vanilla DP-SGD': vanilla_dp_model,
+            'Vanilla DP-SGD + DP-SAT': vanilla_dpsat_model,
             'Fisher DP + Normal': fisher_normal_model,
             'Fisher DP + DP-SAT': fisher_dpsat_model,
             'Fisher DP + Normal + Calib': calib_normal,
@@ -841,8 +933,12 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         print(f"\n⚖️  Privacy vs Accuracy Tradeoff:")
         print(f"   Model                          Accuracy  Privacy (1-AUC)")
         print(f"   {'─'*30} ─────────  ──────────────")
-        for model_name in ['Fisher DP + Normal', 'Fisher DP + DP-SAT', 'Fisher DP + Normal + Calib', 'Fisher DP + DP-SAT + Calib']:
-            if model_name == 'Fisher DP + Normal':
+        for model_name in ['Vanilla DP-SGD', 'Vanilla DP-SGD + DP-SAT', 'Fisher DP + Normal', 'Fisher DP + DP-SAT', 'Fisher DP + Normal + Calib', 'Fisher DP + DP-SAT + Calib']:
+            if model_name == 'Vanilla DP-SGD':
+                acc = vanilla_dp_acc
+            elif model_name == 'Vanilla DP-SGD + DP-SAT':
+                acc = vanilla_dpsat_acc
+            elif model_name == 'Fisher DP + Normal':
                 acc = fisher_normal_acc
             elif model_name == 'Fisher DP + DP-SAT':
                 acc = fisher_dpsat_acc
@@ -1087,10 +1183,14 @@ def main():
     print(f"{'='*70}")
     
     print(f"🔬 Synergy Analysis:")
+    vanilla_dpsat_gain = results['vanilla_dpsat'] - results['vanilla_dp']
     synergy_gain = results['fisher_dpsat'] - results['fisher_normal']
+    print(f"   • Vanilla DP-SGD:         {results['vanilla_dp']:6.2f}%")
+    print(f"   • Vanilla DP-SGD + DP-SAT: {results['vanilla_dpsat']:6.2f}%")
+    print(f"   • DP-SAT gain (Vanilla):   {vanilla_dpsat_gain:+5.2f}%")
     print(f"   • Fisher DP + Normal:     {results['fisher_normal']:6.2f}%")
     print(f"   • Fisher DP + DP-SAT:     {results['fisher_dpsat']:6.2f}%")
-    print(f"   • Synergy gain:           {synergy_gain:+5.2f}%")
+    print(f"   • DP-SAT gain (Fisher):   {synergy_gain:+5.2f}%")
     
     print(f"\n📐 Calibration Analysis:")
     calib_normal_gain = results['calib_normal'] - results['fisher_normal']
@@ -1101,7 +1201,8 @@ def main():
     print(f"   • Calibration gain (DP-SAT):  {calib_dpsat_gain:+5.2f}%")
     
     print(f"\n🏆 Overall Best Performance:")
-    best_variant = max(results['fisher_normal'], results['fisher_dpsat'], 
+    best_variant = max(results['vanilla_dp'], results['vanilla_dpsat'],
+                      results['fisher_normal'], results['fisher_dpsat'], 
                       results['calib_normal'], results['calib_dpsat'])
     if best_variant == results['calib_dpsat']:
         print(f"   🥇 Fisher DP + DP-SAT + Calibration: {best_variant:.2f}%")
@@ -1112,9 +1213,15 @@ def main():
     elif best_variant == results['fisher_dpsat']:
         print(f"   🥇 Fisher DP + DP-SAT: {best_variant:.2f}%")
         print(f"   🔺 DP-SAT DOMINATES: Sharpness-aware optimization is most beneficial")
-    else:
+    elif best_variant == results['fisher_normal']:
         print(f"   🥇 Fisher DP + Normal: {best_variant:.2f}%")
-        print(f"   ⚠️  BASELINE BEST: Additional techniques may not help this configuration")
+        print(f"   🎯 FISHER DOMINATES: Fisher-informed noise is most beneficial")
+    elif best_variant == results['vanilla_dpsat']:
+        print(f"   🥇 Vanilla DP-SGD + DP-SAT: {best_variant:.2f}%")
+        print(f"   🔵🔺 SIMPLE DP-SAT: DP-SAT works best without Fisher complexity")
+    else:
+        print(f"   🥇 Vanilla DP-SGD: {best_variant:.2f}%")
+        print(f"   🔵 VANILLA BEST: Simple DP-SGD outperforms advanced techniques")
     
     if synergy_gain > 1.0:
         print(f"\n✅ STRONG DP-SAT SYNERGY: Combining Fisher + DP-SAT is highly beneficial!")
