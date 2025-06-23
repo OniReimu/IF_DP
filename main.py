@@ -28,7 +28,7 @@ from privacy_accounting import (
     print_privacy_summary
 )
 
-torch.manual_seed(42) ; np.random.seed(42)
+# torch.manual_seed(42) ; np.random.seed(42)
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════
