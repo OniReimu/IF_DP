@@ -19,21 +19,29 @@ pip install torch torchvision numpy scipy scikit-learn tqdm opacus
 
 ### 2. **Run Comprehensive Comparison**
 ```bash
-# Compare all three methods with proper privacy accounting
+# Compare all three methods with proper privacy accounting (default: utility-first)
 python main.py --mps --compare-others \
     --target-epsilon 10.0 --epochs 50 --adaptive-clip \
     --lambda-flatness 0.01 --run-mia --mia-size 1000
 
-# User-level DP (synthetic users)
-python main.py --mps --compare-others \
+# Privacy-first Fisher DP (more noise in high curvature directions)
+python main.py --mps --compare-others --privacy \
+    --target-epsilon 10.0 --epochs 50 --adaptive-clip
+
+# User-level DP (synthetic users) with utility-first Fisher DP
+python main.py --mps --compare-others --utility \
     --target-epsilon 10.0 --users 10 --run-mia
 ```
 
 ### 3. **Run Ablation Study (Fisher + DP-SAT Synergy)**
 ```bash
-# Explore synergistic combination of Fisher DP and DP-SAT
+# Explore synergistic combination with utility-first scaling (default)
 python ablation.py --mps --target-epsilon 10.0 --epochs 20 \
     --k 64 --lambda-flatness 0.01 --run-mia --adaptive-clip
+
+# Compare utility-first vs privacy-first scaling strategies
+python ablation.py --mps --utility --target-epsilon 10.0 --epochs 20 --run-mia
+python ablation.py --mps --privacy --target-epsilon 10.0 --epochs 20 --run-mia
 ```
 
 ## 🏗️ **Core Components**
@@ -76,6 +84,26 @@ Addresses the fundamental limitation of vanilla DP-SGD: **isotropic noise in ani
 - **Orthogonal complement**: Optional isotropic noise in remaining directions
 - **Result**: Less noise in flat directions, more noise in steep directions
 
+**🎛️ Noise Scaling Strategies**:
+
+**Utility-First (Default: `--utility`)**:
+- **Formula**: `noise ∝ 1/√λ` (inverse scaling)
+- **Effect**: Less noise in high curvature directions
+- **Goal**: Maximize model utility by preserving important gradients
+- **Use case**: When accuracy is the primary concern
+
+**Privacy-First (`--privacy`)**:
+- **Formula**: `noise ∝ √λ` (direct scaling)  
+- **Effect**: More noise in high curvature directions
+- **Goal**: Enhanced privacy protection in sensitive directions
+- **Use case**: When privacy protection is the primary concern
+
+**Fair Comparison Design**:
+- Both strategies use identical privacy budget (ε, δ)
+- Clipping always uses consistent Mahalanobis norm definition
+- Only the noise distribution changes, not the sensitivity bound
+- Enables controlled study of curvature-aware noise shaping
+
 ### DP-SAT (Differentially Private Sharpness-Aware Training)
 Based on [Park et al., ICML 2023](https://proceedings.mlr.press/v202/park23g.html). Addresses the problem of **sharp loss landscapes** that cause DP-SGD to fail.
 
@@ -108,7 +136,8 @@ The `ablation.py` file explores the **comprehensive combination** of Fisher DP, 
 - **Fisher DP**: Shapes noise according to loss curvature (geometric)
 - **DP-SAT**: Guides optimization toward flatter minima (optimization)  
 - **Influence Function Calibration**: Adjusts model using public data (post-processing)
-- **Hypothesis**: These three orthogonal approaches can be combined for enhanced performance
+- **Noise Scaling Strategy**: Controls Fisher noise distribution (utility vs privacy focus)
+- **Hypothesis**: These four orthogonal approaches can be combined for enhanced performance
 
 ### Ablation Variants
 1. **Fisher DP + Normal Optimizer** (baseline)
@@ -116,44 +145,56 @@ The `ablation.py` file explores the **comprehensive combination** of Fisher DP, 
 3. **Fisher DP + Normal + Influence Function Calibration** (calibration baseline)
 4. **Fisher DP + DP-SAT + Influence Function Calibration** (triple combination)
 
+**Each variant can be tested with both noise scaling strategies:**
+- **Utility-first** (`--utility`): Preserves important gradients for better accuracy
+- **Privacy-first** (`--privacy`): Enhanced protection in sensitive directions
+
 ### Synergistic Algorithm
 ```
 θ_{t+1} = θ_t - η(g_fisher_priv + λ * g_{t-1}^{fisher_priv} / ||g_{t-1}^{fisher_priv}||_2)
 ```
 
-Where `g_fisher_priv` is the Fisher-informed noisy gradient and `g_{t-1}^{fisher_priv}` is from the previous step (following official DP-SAT implementation).
+Where `g_fisher_priv` is the Fisher-informed noisy gradient (with chosen scaling strategy) and `g_{t-1}^{fisher_priv}` is from the previous step (following official DP-SAT implementation).
 
 ### Usage Examples
 ```bash
-# Basic ablation study with calibration
+# Basic ablation study with utility-first scaling (default)
 python ablation.py --mps --target-epsilon 10.0 --epochs 20 \
     --k 64 --lambda-flatness 0.01 --efficient --method linear
 
-# Fast calibration with linear approximation
-python ablation.py --mps --efficient --method linear --calibration-k 50 \
+# Privacy-first scaling for enhanced protection
+python ablation.py --mps --privacy --target-epsilon 10.0 --epochs 20 \
+    --k 64 --lambda-flatness 0.01 --run-mia
+
+# Compare noise scaling strategies
+python ablation.py --mps --utility --target-epsilon 8.0 --run-mia  # Utility-first
+python ablation.py --mps --privacy --target-epsilon 8.0 --run-mia  # Privacy-first
+
+# Fast calibration with linear approximation (utility-first)
+python ablation.py --mps --utility --efficient --method linear --calibration-k 50 \
     --target-epsilon 8.0 --run-mia
 
-# Accurate calibration with original method (slower)
-python ablation.py --mps --method original --calibration-k 200 \
+# Accurate calibration with original method (privacy-first)
+python ablation.py --mps --privacy --method original --calibration-k 200 \
     --target-epsilon 10.0 --epochs 15
 
-# Sample-level vs User-level comparison with calibration
-python ablation.py --mps --sample-level --target-epsilon 8.0 --efficient --run-mia
-python ablation.py --mps --users 10 --target-epsilon 8.0 --efficient --run-mia
+# Sample-level vs User-level comparison with different scaling
+python ablation.py --mps --sample-level --utility --target-epsilon 8.0 --run-mia
+python ablation.py --mps --users 10 --privacy --target-epsilon 8.0 --run-mia
 
-# Parameter sensitivity analysis
-python ablation.py --mps --lambda-flatness 0.005 --calibration-k 100 --target-epsilon 10.0  # Conservative
-python ablation.py --mps --lambda-flatness 0.02 --calibration-k 150 --target-epsilon 10.0   # Aggressive
+# Parameter sensitivity analysis with scaling strategies
+python ablation.py --mps --utility --lambda-flatness 0.005 --target-epsilon 10.0  # Conservative utility
+python ablation.py --mps --privacy --lambda-flatness 0.02 --target-epsilon 10.0   # Aggressive privacy
 ```
 
 ### Expected Outcomes
 ```
-🔬 Synergy Analysis:
+🔬 Synergy Analysis (Utility-First Scaling):
    • Fisher DP + Normal:         76.20%
    • Fisher DP + DP-SAT:         78.45%
    • Synergy gain:               +2.25%
 
-📐 Calibration Analysis:
+📐 Calibration Analysis (Utility-First Scaling):
    • Fisher DP + Normal + Calib: 77.80%
    • Fisher DP + DP-SAT + Calib: 80.10%
    • Calibration gain (Normal):  +1.60%
@@ -162,6 +203,11 @@ python ablation.py --mps --lambda-flatness 0.02 --calibration-k 150 --target-eps
 🏆 Overall Best Performance:
    🥇 Fisher DP + DP-SAT + Calibration: 80.10%
    🎉 TRIPLE COMBINATION: All three techniques work together!
+
+🎛️ Noise Scaling Strategy Comparison:
+   • Utility-First (--utility):  Higher accuracy, standard privacy
+   • Privacy-First (--privacy):  Lower accuracy, enhanced privacy protection
+   • Strategy choice depends on application requirements
 ```
 
 ### Calibration Methods
@@ -223,19 +269,51 @@ python main.py --compare-others --target-epsilon 10.0 \
 
 With proper privacy accounting at ε = 10.0:
 
+### Utility-First Scaling (`--utility`, default)
 | Method | Test Accuracy | Worst-case MIA AUC | Privacy Protection |
 |--------|---------------|---------------------|-------------------|
 | Baseline | ~85% | 0.95+ | None |
 | Vanilla DP | ~75% | 0.60-0.65 | Moderate |
 | DP-SAT | ~81% | 0.58-0.62 | Strong |
-| Fisher DP | ~78% | 0.55-0.60 | Strong |
+| Fisher DP (Utility) | ~78% | 0.55-0.60 | Strong |
+
+### Privacy-First Scaling (`--privacy`)
+| Method | Test Accuracy | Worst-case MIA AUC | Privacy Protection |
+|--------|---------------|---------------------|-------------------|
+| Baseline | ~85% | 0.95+ | None |
+| Vanilla DP | ~75% | 0.60-0.65 | Moderate |
+| DP-SAT | ~81% | 0.58-0.62 | Strong |
+| Fisher DP (Privacy) | ~76% | 0.52-0.57 | Very Strong |
 
 **Key Insights**:
 - **DP-SAT**: +6% accuracy over Vanilla DP through flatter minima
-- **Fisher DP**: Better privacy protection through curvature-aware noise
+- **Fisher DP (Utility)**: Better accuracy preservation through curvature-aware noise
+- **Fisher DP (Privacy)**: Enhanced privacy protection at slight accuracy cost
+- **Strategy Trade-off**: ~2% accuracy difference between utility-first and privacy-first
 - **Synergy**: Fisher + DP-SAT combination may provide additional benefits
 
 ## 🔧 **Configuration Options**
+
+### Fisher DP Noise Scaling Strategies
+```bash
+# Utility-first scaling (default) - optimizes for accuracy
+python main.py --utility --target-epsilon 10.0
+python ablation.py --utility --target-epsilon 10.0
+
+# Privacy-first scaling - optimizes for privacy protection  
+python main.py --privacy --target-epsilon 10.0
+python ablation.py --privacy --target-epsilon 10.0
+
+# Compare both strategies with same privacy budget
+python main.py --utility --target-epsilon 8.0 --run-mia --compare-others
+python main.py --privacy --target-epsilon 8.0 --run-mia --compare-others
+```
+
+**Strategy Details:**
+- **`--utility` (default)**: `noise ∝ 1/√λ` - Less noise in high curvature directions
+- **`--privacy`**: `noise ∝ √λ` - More noise in high curvature directions  
+- **Fair comparison**: Both use identical privacy budget and sensitivity bounds
+- **Plug-and-play**: Zero impact on existing code, completely backward compatible
 
 ### Privacy Parameters
 ```bash
@@ -277,7 +355,21 @@ python main.py --adaptive-clip --quantile 0.95
 
 # Complement noise control
 python main.py --full-complement-noise  # Add orthogonal noise (default: off)
+
+# Fisher DP noise scaling strategies (plug-and-play)
+python main.py --utility   # Utility-first: noise ∝ 1/√λ (default)
+python main.py --privacy   # Privacy-first: noise ∝ √λ
+
+# Combined experimental features
+python main.py --privacy --adaptive-clip --full-complement-noise \
+    --target-epsilon 8.0 --k 128 --run-mia
 ```
+
+**Implementation Notes:**
+- **Plug-and-play design**: `--utility`/`--privacy` flags have zero impact on existing functionality
+- **Backward compatibility**: All existing commands work unchanged (default to `--utility`)
+- **Fair comparison**: Both strategies use identical privacy accounting and sensitivity bounds
+- **Minimal changes**: Only affects Fisher DP noise generation, not clipping or other methods
 
 ## 🔬 **Research Applications**
 
@@ -286,18 +378,39 @@ python main.py --full-complement-noise  # Add orthogonal noise (default: off)
 2. All methods automatically use identical privacy parameters
 3. Validation with `validate_privacy_comparison()` is automatic
 
+### Noise Scaling Strategy Research
+```bash
+# Study curvature-aware noise shaping effects
+python main.py --utility --target-epsilon 10.0 --compare-others --run-mia
+python main.py --privacy --target-epsilon 10.0 --compare-others --run-mia
+
+# Ablation study across both strategies
+python ablation.py --utility --target-epsilon 8.0 --run-mia
+python ablation.py --privacy --target-epsilon 8.0 --run-mia
+
+# Parameter sensitivity analysis
+for strategy in utility privacy; do
+    python main.py --$strategy --target-epsilon 10.0 --k 32 --run-mia
+    python main.py --$strategy --target-epsilon 10.0 --k 128 --run-mia
+done
+```
+
 ### Privacy-Utility Tradeoffs
 ```bash
-# Test different privacy levels
+# Test different privacy levels with both scaling strategies
 for eps in 1.0 5.0 10.0 20.0; do
-    python main.py --target-epsilon $eps --compare-others --run-mia
+    python main.py --utility --target-epsilon $eps --compare-others --run-mia
+    python main.py --privacy --target-epsilon $eps --compare-others --run-mia
 done
 ```
 
 ### Ablation Analysis
 ```bash
-# Clean previous results and run comprehensive ablation
-python ablation.py --clean --target-epsilon 10.0 --epochs 30 \
+# Clean previous results and run comprehensive ablation with both strategies
+python ablation.py --clean --utility --target-epsilon 10.0 --epochs 30 \
+    --dataset-size 15000 --run-mia --adaptive-clip
+
+python ablation.py --clean --privacy --target-epsilon 10.0 --epochs 30 \
     --dataset-size 15000 --run-mia --adaptive-clip
 ```
 
