@@ -136,7 +136,8 @@ def train_with_dp(model, train_loader, fisher,
                   clip_radius=10.0, k=32, lam_floor=5e-1,
                   device="cuda", target_layer="conv1",
                   adaptive_clip=False, quantile=0.95, sample_level=None,
-                  epochs=1, sigma=None, full_complement_noise=False):
+                  epochs=1, sigma=None, full_complement_noise=False,
+                  privacy_first=False):
     """
     Train with Fisher-informed DP-SGD
     
@@ -152,13 +153,29 @@ def train_with_dp(model, train_loader, fisher,
         full_complement_noise: If True, add full noise to orthogonal complement.
                               If False, only add noise in Fisher subspace.
                               Setting to False preserves curvature-aware benefits.
+        privacy_first: If False (default), use utility-first scaling (noise ∝ 1/√λ).
+                      If True, use privacy-first scaling (noise ∝ √λ).
     """
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
 
     lam, U       = topk_eigh_with_floor(fisher, k=k, lam_floor=lam_floor)
     lam, U       = lam.to(device), U.to(device)
-    inv_sqrt_lam = lam.rsqrt()
+    
+    # Compute both scaling factors
+    inv_sqrt_lam = lam.rsqrt()  # 1/√λ (utility-first: less noise in high curvature)
+    sqrt_lam = lam.sqrt()       # √λ (privacy-first: more noise in high curvature)
+    
+    # Choose noise scaling strategy
+    if privacy_first:
+        noise_scaling = sqrt_lam
+        strategy_name = "Privacy-first (noise ∝ √λ)"
+    else:
+        noise_scaling = inv_sqrt_lam
+        strategy_name = "Utility-first (noise ∝ 1/√λ, default)"
+    
+    # Clipping always uses inverse scaling to maintain consistent Mahalanobis norm definition
+    clip_scaling = inv_sqrt_lam
     
     # Privacy accounting
     if sigma is not None:
@@ -211,6 +228,7 @@ def train_with_dp(model, train_loader, fisher,
     print(f"   • Target Euclidean sensitivity: Δ₂ = {clip_radius:.3f} (will convert to Mahalanobis)")
     print(f"   • Adaptive clipping: {adaptive_clip}")
     print(f"   • Full complement noise: {full_complement_noise}")
+    print(f"   • Noise scaling strategy: {strategy_name}")
     
     if not sample_level:
         print("   • User-level mode: Clipping aggregated user gradients")
@@ -253,7 +271,7 @@ def train_with_dp(model, train_loader, fisher,
                 for i in range(per_g.size(0)):
                     # Compute both norms for calibration
                     euclidean_norm = per_g[i].norm().item()
-                    proj = (U.T @ per_g[i]) * inv_sqrt_lam
+                    proj = (U.T @ per_g[i]) * clip_scaling
                     mahalanobis_norm = proj.norm().item()
                     
                     batch_euclidean_norms.append(euclidean_norm)
@@ -307,7 +325,7 @@ def train_with_dp(model, train_loader, fisher,
 
             # Mahalanobis clipping with calibrated threshold
             for i in range(per_g.size(0)):
-                per_g[i], nrm = maha_clip(per_g[i], U, inv_sqrt_lam, actual_radius)
+                per_g[i], nrm = maha_clip(per_g[i], U, clip_scaling, actual_radius)
                 grad_norm.append(nrm)
             g_bar = per_g.mean(0)
 
@@ -352,7 +370,7 @@ def train_with_dp(model, train_loader, fisher,
                     # Calibration for user-level
                     if not calibration_computed and len(euclidean_norms) >= 5:
                         # Simple heuristic: use median ratio for calibration
-                        proj = (U.T @ user_grad_flat) * inv_sqrt_lam
+                        proj = (U.T @ user_grad_flat) * clip_scaling
                         mahalanobis_norm = proj.norm().item()
                         ratio = euclidean_norm / (mahalanobis_norm + 1e-8)
                         actual_radius = euclidean_target / (ratio + 1e-8)
@@ -373,7 +391,7 @@ def train_with_dp(model, train_loader, fisher,
             # Clip each user's gradient
             clipped_user_grads = []
             for user_grad_flat in user_gradients:
-                clipped_grad, user_norm = maha_clip(user_grad_flat, U, inv_sqrt_lam, actual_radius)
+                clipped_grad, user_norm = maha_clip(user_grad_flat, U, clip_scaling, actual_radius)
                 grad_norm.append(user_norm)
                 clipped_user_grads.append(clipped_grad)
             
@@ -386,7 +404,7 @@ def train_with_dp(model, train_loader, fisher,
         
         # 1. Low-rank noise in Fisher subspace (anisotropic)
         z_fisher = torch.randn(actual_k, device=device)
-        fisher_noise = U @ (z_fisher * inv_sqrt_lam) * sigma * euclidean_target  # Use Euclidean target for noise scale
+        fisher_noise = U @ (z_fisher * noise_scaling) * sigma * euclidean_target
         
         if full_complement_noise:
             # 2. Complement noise in orthogonal subspace (isotropic)

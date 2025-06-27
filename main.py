@@ -127,6 +127,13 @@ p.add_argument('--users', type=int,          default=10,
 p.add_argument('--full-complement-noise', action='store_true',
                help='Use full complement noise in orthogonal subspace')
 
+# Fisher DP noise scaling strategy
+noise_strategy_group = p.add_mutually_exclusive_group()
+noise_strategy_group.add_argument('--utility', action='store_true', default=True,
+                                 help='Fisher DP utility-first: less noise in high curvature directions (inverse scaling, default)')
+noise_strategy_group.add_argument('--privacy', action='store_true',
+                                 help='Fisher DP privacy-first: more noise in high curvature directions (direct scaling)')
+
 # MIA evaluation flags
 p.add_argument('--run-mia', action='store_true',
                help='Run membership inference attack evaluation after training')
@@ -322,7 +329,8 @@ fisher_dp_model = train_with_dp(fisher_dp_model, priv_loader, Fmat,
                                 adaptive_clip=args.adaptive_clip,
                                 quantile=args.quantile,
                                 sample_level=args.sample_level,
-                                epochs=args.epochs)
+                                epochs=args.epochs,
+                                privacy_first=args.privacy)
 
 # ════════════════════════════════════════════════════════════════
 # 4. Vanilla DP-SGD (comparison baseline)
