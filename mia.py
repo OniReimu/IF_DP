@@ -449,7 +449,7 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     print("="*60)
     
     # Set random seed for reproducible sampling
-    # np.random.seed(42)
+    np.random.seed(42)
     
     # Prepare member and non-member datasets
     if sample_level:

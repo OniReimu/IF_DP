@@ -319,7 +319,9 @@ def train_with_dp(model, train_loader, fisher,
                     print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
                     print(f"   • Euclidean clip rate: {euclidean_clip_rate:.1%}")
                     print(f"   • Mahalanobis clip rate: {np.mean(maha_norms > actual_radius):.1%}")
-                    print(f"   → Fair comparison: same effective sensitivity bound Δ₂\n")
+                    print(f"   → Fair comparison: same effective sensitivity bound Δ₂")
+                    print(f"   🔧 NOISE SCALING FIX: Using actual_radius={actual_radius:.3f} for noise (was euclidean_target={euclidean_target:.3f})")
+                    print()
                     
                     euclidean_norms = []  # Reset for actual training statistics
 
@@ -379,7 +381,9 @@ def train_with_dp(model, train_loader, fisher,
                         print(f"🎯 User-level norm calibration:")
                         print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
                         print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                        print(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}\n")
+                        print(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}")
+                        print(f"   🔧 NOISE SCALING FIX: Using actual_radius={actual_radius:.3f} for noise (was euclidean_target={euclidean_target:.3f})")
+                        print()
                         
                         euclidean_norms = []  # Reset
             
@@ -404,7 +408,7 @@ def train_with_dp(model, train_loader, fisher,
         
         # 1. Low-rank noise in Fisher subspace (anisotropic)
         z_fisher = torch.randn(actual_k, device=device)
-        fisher_noise = U @ (z_fisher * noise_scaling) * sigma * euclidean_target
+        fisher_noise = U @ (z_fisher * noise_scaling) * sigma * actual_radius
         
         if full_complement_noise:
             # 2. Complement noise in orthogonal subspace (isotropic)
@@ -413,7 +417,7 @@ def train_with_dp(model, train_loader, fisher,
             z_complement = z_full - U @ (U.T @ z_full)  # Project to complement: (I - UU^T)z
             
             # Scale complement noise properly: σΔ (not divided by √P)
-            complement_noise = z_complement * sigma * euclidean_target  # Use Euclidean target
+            complement_noise = z_complement * sigma * actual_radius
             
             # Total noise = Fisher subspace noise + complement noise
             total_noise = fisher_noise + complement_noise
@@ -451,6 +455,7 @@ def train_with_dp(model, train_loader, fisher,
         else:
             print(f"   • Last batch noise: Fisher only={fisher_noise_norm:.1f} (complement disabled)")
     print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {epochs} epochs")
-    print(f"   • ✅ FAIR COMPARISON: Same effective sensitivity Δ₂ as vanilla DP-SGD")
+    print(f"   • ✅ FAIR COMPARISON: Same noise scale σ×Δ={sigma * actual_radius:.3f} as vanilla DP-SGD")
+    print(f"   • 🔧 NOISE SCALING FIXED: Using actual_radius for noise (not euclidean_target)")
 
     return model

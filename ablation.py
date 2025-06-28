@@ -27,7 +27,7 @@ from model import CNN
 from mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
 from influence_function import calibrate_model_research_protocol, get_critical_slice
 
-# torch.manual_seed(42); np.random.seed(42)
+torch.manual_seed(42); np.random.seed(42)
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════
