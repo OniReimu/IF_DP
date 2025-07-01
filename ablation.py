@@ -149,7 +149,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                   adaptive_clip=True, quantile=0.95, sample_level=None,
                                   epochs=1, sigma=None, full_complement_noise=False,
                                   use_dp_sat=False, lambda_flatness=0.01,
-                                  optimizer_name="Normal", privacy_first=False):
+                                  optimizer_name="Normal", positive_noise_correlation=False):
     """
     Fisher DP-SGD with optional DP-SAT optimization.
     
@@ -163,8 +163,8 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         use_dp_sat: If True, apply DP-SAT flatness adjustment after Fisher noise
         lambda_flatness: Flatness coefficient for DP-SAT (only used if use_dp_sat=True)
         optimizer_name: String identifier for logging purposes
-        privacy_first: If False (default), use utility-first scaling (noise ∝ 1/√λ).
-                      If True, use privacy-first scaling (noise ∝ √λ).
+        positive_noise_correlation: If False (default), use negatively correlated noise (noise ∝ 1/√λ).
+                                   If True, use positively correlated noise (noise ∝ √λ).
         
     Algorithm when use_dp_sat=True (CORRECTED):
         1. Compute per-sample gradients and clip them (standard DP-SGD)
@@ -180,16 +180,16 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     lam, U = lam.to(device), U.to(device)
     
     # Compute both scaling factors
-    inv_sqrt_lam = lam.rsqrt()  # 1/√λ (utility-first: less noise in high curvature)
-    sqrt_lam = lam.sqrt()       # √λ (privacy-first: more noise in high curvature)
+    inv_sqrt_lam = lam.rsqrt()  # 1/√λ (negatively correlated: less noise in high curvature)
+    sqrt_lam = lam.sqrt()       # √λ (positively correlated: more noise in high curvature)
     
     # Choose noise scaling strategy
-    if privacy_first:
+    if positive_noise_correlation:
         noise_scaling = sqrt_lam
-        strategy_name = "Privacy-first (noise ∝ √λ)"
+        strategy_name = "Positively correlated noise (noise ∝ √λ)"
     else:
         noise_scaling = inv_sqrt_lam
-        strategy_name = "Utility-first (noise ∝ 1/√λ, default)"
+        strategy_name = "Negatively correlated noise (noise ∝ 1/√λ, default)"
     
     # Clipping always uses inverse scaling to maintain consistent Mahalanobis norm definition
     clip_scaling = inv_sqrt_lam
@@ -615,7 +615,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         epochs=args.epochs,
         use_dp_sat=False,  # Normal optimizer
         optimizer_name="Normal",
-        privacy_first=args.privacy
+        positive_noise_correlation=args.positive_noise_correlation
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -642,7 +642,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         use_dp_sat=True,  # DP-SAT optimizer
         lambda_flatness=args.lambda_flatness,
         optimizer_name="DP-SAT",
-        privacy_first=args.privacy
+        positive_noise_correlation=args.positive_noise_correlation
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1116,10 +1116,10 @@ def main():
     
     # Fisher DP noise scaling strategy  
     noise_strategy_group = parser.add_mutually_exclusive_group()
-    noise_strategy_group.add_argument('--utility', action='store_true', default=True,
-                                     help='Fisher DP utility-first: less noise in high curvature directions (inverse scaling, default)')
-    noise_strategy_group.add_argument('--privacy', action='store_true',
-                                     help='Fisher DP privacy-first: more noise in high curvature directions (direct scaling)')
+    noise_strategy_group.add_argument('--negatively_correlated_noise', action='store_true', default=True,
+                                     help='Fisher DP: noise inversely correlated with curvature (noise ∝ 1/√λ, less noise in high curvature directions, default)')
+    noise_strategy_group.add_argument('--positively_correlated_noise', action='store_true',
+                                     help='Fisher DP: noise positively correlated with curvature (noise ∝ √λ, more noise in high curvature directions)')
     
     # DP-SAT arguments
     parser.add_argument('--lambda-flatness', type=float, default=0.01,
@@ -1153,6 +1153,9 @@ def main():
     parser.add_argument('--mia-size', type=int, default=1000)
     
     args = parser.parse_args()
+    
+    # Map new argument names for consistency  
+    args.positive_noise_correlation = args.positively_correlated_noise
     
     # Parse target_class argument (must be int)
     try:

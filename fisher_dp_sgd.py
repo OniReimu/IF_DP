@@ -137,7 +137,7 @@ def train_with_dp(model, train_loader, fisher,
                   device="cuda", target_layer="conv1",
                   adaptive_clip=False, quantile=0.95, sample_level=None,
                   epochs=1, sigma=None, full_complement_noise=False,
-                  privacy_first=False):
+                  positive_noise_correlation=False):
     """
     Train with Fisher-informed DP-SGD
     
@@ -153,8 +153,8 @@ def train_with_dp(model, train_loader, fisher,
         full_complement_noise: If True, add full noise to orthogonal complement.
                               If False, only add noise in Fisher subspace.
                               Setting to False preserves curvature-aware benefits.
-        privacy_first: If False (default), use utility-first scaling (noise ∝ 1/√λ).
-                      If True, use privacy-first scaling (noise ∝ √λ).
+        positive_noise_correlation: If False (default), use negatively correlated noise (noise ∝ 1/√λ).
+                                   If True, use positively correlated noise (noise ∝ √λ).
     """
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
@@ -163,16 +163,16 @@ def train_with_dp(model, train_loader, fisher,
     lam, U       = lam.to(device), U.to(device)
     
     # Compute both scaling factors
-    inv_sqrt_lam = lam.rsqrt()  # 1/√λ (utility-first: less noise in high curvature)
-    sqrt_lam = lam.sqrt()       # √λ (privacy-first: more noise in high curvature)
+    inv_sqrt_lam = lam.rsqrt()  # 1/√λ (negatively correlated: less noise in high curvature)
+    sqrt_lam = lam.sqrt()       # √λ (positively correlated: more noise in high curvature)
     
     # Choose noise scaling strategy
-    if privacy_first:
+    if positive_noise_correlation:
         noise_scaling = sqrt_lam
-        strategy_name = "Privacy-first (noise ∝ √λ)"
+        strategy_name = "Positively correlated noise (noise ∝ √λ)"
     else:
         noise_scaling = inv_sqrt_lam
-        strategy_name = "Utility-first (noise ∝ 1/√λ, default)"
+        strategy_name = "Negatively correlated noise (noise ∝ 1/√λ, default)"
     
     # Clipping always uses inverse scaling to maintain consistent Mahalanobis norm definition
     clip_scaling = inv_sqrt_lam

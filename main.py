@@ -129,10 +129,10 @@ p.add_argument('--full-complement-noise', action='store_true',
 
 # Fisher DP noise scaling strategy
 noise_strategy_group = p.add_mutually_exclusive_group()
-noise_strategy_group.add_argument('--utility', action='store_true', default=True,
-                                 help='Fisher DP utility-first: less noise in high curvature directions (inverse scaling, default)')
-noise_strategy_group.add_argument('--privacy', action='store_true',
-                                 help='Fisher DP privacy-first: more noise in high curvature directions (direct scaling)')
+noise_strategy_group.add_argument('--negatively_correlated_noise', action='store_true', default=True,
+                                 help='Fisher DP: noise inversely correlated with curvature (noise ∝ 1/√λ, less noise in high curvature directions, default)')
+noise_strategy_group.add_argument('--positively_correlated_noise', action='store_true',
+                                 help='Fisher DP: noise positively correlated with curvature (noise ∝ √λ, more noise in high curvature directions)')
 
 # MIA evaluation flags
 p.add_argument('--run-mia', action='store_true',
@@ -330,7 +330,7 @@ fisher_dp_model = train_with_dp(fisher_dp_model, priv_loader, Fmat,
                                 quantile=args.quantile,
                                 sample_level=args.sample_level,
                                 epochs=args.epochs,
-                                privacy_first=args.privacy)
+                                positive_noise_correlation=args.positively_correlated_noise)
 
 # ════════════════════════════════════════════════════════════════
 # 4. Vanilla DP-SGD (comparison baseline)
