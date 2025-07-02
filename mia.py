@@ -275,11 +275,12 @@ def validate_and_clean_features(features, labels, name="features"):
     
     return features, labels
 
-def shadow_model_attack(target_model, member_loader, non_member_loader, train_data, device):
+def shadow_model_attack(target_model, member_loader, non_member_loader, train_data, device, eval_data=None):
     """
     Shokri et al. shadow model attack.
     Uses shadow models to learn attack patterns.
     train_data: The actual training data used for the target model (priv_base)
+    eval_data: The evaluation data used for target non-members (eval_base)
     """
     
     # Prepare shadow training data from the actual training data
@@ -288,9 +289,20 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
     shadow_indices = np.random.choice(len(train_data), shadow_size, replace=False)
     shadow_trainset = Subset(train_data, shadow_indices)
     
-    # Get remaining training data as shadow non-members
-    remaining_indices = np.setdiff1d(np.arange(len(train_data)), shadow_indices)
-    shadow_non_trainset = Subset(train_data, remaining_indices[:shadow_size])  # Use same size
+    # 🔧 FIX: Use eval_data for shadow non-members to match target evaluation setup
+    # If eval_data is provided, use it for shadow non-members
+    # Otherwise, fall back to remaining train_data (original buggy behavior)
+    if eval_data is not None:
+        # Use eval_data for shadow non-members (correct approach)
+        shadow_non_member_size = min(len(eval_data), shadow_size)
+        shadow_non_member_indices = np.random.choice(len(eval_data), shadow_non_member_size, replace=False)
+        shadow_non_trainset = Subset(eval_data, shadow_non_member_indices)
+        print(f"🔧 Shadow attack: Using eval_data for non-members (correct)")
+    else:
+        # Fallback to original approach (for backward compatibility)
+        remaining_indices = np.setdiff1d(np.arange(len(train_data)), shadow_indices)
+        shadow_non_trainset = Subset(train_data, remaining_indices[:shadow_size])
+        print(f"⚠️  Shadow attack: Using train_data for non-members (may be inaccurate)")
     
     # Train shadow models
     shadow_models = train_shadow_models(shadow_trainset, num_shadows=3, epochs=3, device=device)
@@ -419,7 +431,7 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
 
 def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, eval_data, 
                                 private_indices, priv_ds, num_users, 
-                                mia_size, sample_level, device, vanilla_dp_model=None, dp_sat_model=None):
+                                mia_size, sample_level, device, vanilla_dp_model=None, dp_sat_model=None, l2_baseline_model=None):
     """Evaluate membership inference attacks on baseline, Fisher DP, and optionally Vanilla DP & DP-SAT models
     
     Args:
@@ -435,21 +447,24 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         device: Device to run evaluation on
         vanilla_dp_model: Optional vanilla DP model for comparison
         dp_sat_model: Optional DP-SAT model for comparison
+        l2_baseline_model: Optional L2 regularized baseline model for comparison
     """
-    print("\n" + "="*60)
-    print("🛡️  MEMBERSHIP INFERENCE ATTACK EVALUATION")
+    # Set reproducible random seeds for consistent MIA evaluation
+    from config import set_random_seeds
+    set_random_seeds()
+    
+    print(f"\n🛡️  MEMBERSHIP INFERENCE ATTACK EVALUATION")
     
     # Build comparison message
     methods = ["Baseline", "Fisher DP"]
+    if l2_baseline_model is not None:
+        methods.append("L2 Baseline")
     if vanilla_dp_model is not None:
         methods.append("Vanilla DP")
     if dp_sat_model is not None:
         methods.append("DP-SAT")
     print(f"    Comparing: {' vs '.join(methods)}")
     print("="*60)
-    
-    # Set random seed for reproducible sampling
-    np.random.seed(42)
     
     # Prepare member and non-member datasets
     if sample_level:
@@ -471,6 +486,8 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         'baseline': {'confidence': [], 'shadow': []},
         'fisher_dp': {'confidence': [], 'shadow': []},
     }
+    if l2_baseline_model is not None:
+        all_results['l2_baseline'] = {'confidence': [], 'shadow': []}
     if vanilla_dp_model is not None:
         all_results['vanilla_dp'] = {'confidence': [], 'shadow': []}
     if dp_sat_model is not None:
@@ -496,6 +513,10 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         all_results['baseline']['confidence'].append(baseline_conf['auc'])
         all_results['fisher_dp']['confidence'].append(fisher_conf['auc'])
         
+        if l2_baseline_model is not None:
+            l2_baseline_conf = confidence_attack(l2_baseline_model, member_loader, non_member_loader, device)
+            all_results['l2_baseline']['confidence'].append(l2_baseline_conf['auc'])
+        
         if vanilla_dp_model is not None:
             vanilla_conf = confidence_attack(vanilla_dp_model, member_loader, non_member_loader, device)
             all_results['vanilla_dp']['confidence'].append(vanilla_conf['auc'])
@@ -508,18 +529,22 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         print("\n2️⃣  SHADOW MODEL ATTACK")
         print("-" * 30)
         
-        baseline_shadow = shadow_model_attack(baseline_model, member_loader, non_member_loader, train_data, device)
-        fisher_shadow = shadow_model_attack(fisher_dp_model, member_loader, non_member_loader, train_data, device)
+        baseline_shadow = shadow_model_attack(baseline_model, member_loader, non_member_loader, train_data, device, eval_data)
+        fisher_shadow = shadow_model_attack(fisher_dp_model, member_loader, non_member_loader, train_data, device, eval_data)
         
         all_results['baseline']['shadow'].append(baseline_shadow['auc'])
         all_results['fisher_dp']['shadow'].append(fisher_shadow['auc'])
         
+        if l2_baseline_model is not None:
+            l2_baseline_shadow = shadow_model_attack(l2_baseline_model, member_loader, non_member_loader, train_data, device, eval_data)
+            all_results['l2_baseline']['shadow'].append(l2_baseline_shadow['auc'])
+        
         if vanilla_dp_model is not None:
-            vanilla_shadow = shadow_model_attack(vanilla_dp_model, member_loader, non_member_loader, train_data, device)
+            vanilla_shadow = shadow_model_attack(vanilla_dp_model, member_loader, non_member_loader, train_data, device, eval_data)
             all_results['vanilla_dp']['shadow'].append(vanilla_shadow['auc'])
         
         if dp_sat_model is not None:
-            dp_sat_shadow = shadow_model_attack(dp_sat_model, member_loader, non_member_loader, train_data, device)
+            dp_sat_shadow = shadow_model_attack(dp_sat_model, member_loader, non_member_loader, train_data, device, eval_data)
             all_results['dp_sat']['shadow'].append(dp_sat_shadow['auc'])
     
     # Statistical analysis of results
@@ -535,6 +560,8 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     print("🎯 Confidence Attack AUC:")
     baseline_conf_mean, baseline_conf_std = print_stats("  Baseline", all_results['baseline']['confidence'])
     fisher_conf_mean, fisher_conf_std = print_stats("  Fisher DP", all_results['fisher_dp']['confidence'])
+    if l2_baseline_model is not None:
+        l2_baseline_conf_mean, l2_baseline_conf_std = print_stats("  L2 Baseline", all_results['l2_baseline']['confidence'])
     if vanilla_dp_model is not None:
         vanilla_conf_mean, vanilla_conf_std = print_stats("  Vanilla DP", all_results['vanilla_dp']['confidence'])
     
@@ -544,6 +571,8 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     print("\n🕶️  Shadow Attack AUC:")
     baseline_shadow_mean, baseline_shadow_std = print_stats("  Baseline", all_results['baseline']['shadow'])
     fisher_shadow_mean, fisher_shadow_std = print_stats("  Fisher DP", all_results['fisher_dp']['shadow'])
+    if l2_baseline_model is not None:
+        l2_baseline_shadow_mean, l2_baseline_shadow_std = print_stats("  L2 Baseline", all_results['l2_baseline']['shadow'])
     if vanilla_dp_model is not None:
         vanilla_shadow_mean, vanilla_shadow_std = print_stats("  Vanilla DP", all_results['vanilla_dp']['shadow'])
     
@@ -561,6 +590,20 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     print(f"  Fisher DP vs Baseline (Confidence): p = {p_conf_fisher_base:.4f}")
     print(f"  Fisher DP vs Baseline (Shadow): p = {p_shadow_fisher_base:.4f}")
     
+    # L2 baseline tests (for regularization hypothesis)
+    if l2_baseline_model is not None:
+        # L2 baseline vs regular baseline
+        _, p_conf_l2_base = stats.ttest_rel(all_results['l2_baseline']['confidence'], all_results['baseline']['confidence'])
+        _, p_shadow_l2_base = stats.ttest_rel(all_results['l2_baseline']['shadow'], all_results['baseline']['shadow'])
+        print(f"  🎯 L2 Baseline vs Baseline (Confidence): p = {p_conf_l2_base:.4f}")
+        print(f"  🎯 L2 Baseline vs Baseline (Shadow): p = {p_shadow_l2_base:.4f}")
+        
+        # Fisher DP vs L2 baseline (key L2 regularization hypothesis test!)
+        _, p_conf_fisher_l2 = stats.ttest_rel(all_results['fisher_dp']['confidence'], all_results['l2_baseline']['confidence'])
+        _, p_shadow_fisher_l2 = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['l2_baseline']['shadow'])
+        print(f"  🔥 Fisher DP vs L2 Baseline (Confidence): p = {p_conf_fisher_l2:.4f}")
+        print(f"  🔥 Fisher DP vs L2 Baseline (Shadow): p = {p_shadow_fisher_l2:.4f}")
+    
     if vanilla_dp_model is not None:
         # Vanilla DP vs Baseline
         _, p_conf_vanilla_base = stats.ttest_rel(all_results['vanilla_dp']['confidence'], all_results['baseline']['confidence'])
@@ -573,6 +616,13 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         _, p_shadow_fisher_vanilla = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['vanilla_dp']['shadow'])
         print(f"  🔥 Fisher DP vs Vanilla DP (Confidence): p = {p_conf_fisher_vanilla:.4f}")
         print(f"  🔥 Fisher DP vs Vanilla DP (Shadow): p = {p_shadow_fisher_vanilla:.4f}")
+        
+        # L2 baseline vs Vanilla DP (if both available)
+        if l2_baseline_model is not None:
+            _, p_conf_l2_vanilla = stats.ttest_rel(all_results['l2_baseline']['confidence'], all_results['vanilla_dp']['confidence'])
+            _, p_shadow_l2_vanilla = stats.ttest_rel(all_results['l2_baseline']['shadow'], all_results['vanilla_dp']['shadow'])
+            print(f"  🆚 L2 Baseline vs Vanilla DP (Confidence): p = {p_conf_l2_vanilla:.4f}")
+            print(f"  🆚 L2 Baseline vs Vanilla DP (Shadow): p = {p_shadow_l2_vanilla:.4f}")
     
     if dp_sat_model is not None:
         # DP-SAT vs Baseline
@@ -587,6 +637,13 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         print(f"  🔥 Fisher DP vs DP-SAT (Confidence): p = {p_conf_fisher_dp_sat:.4f}")
         print(f"  🔥 Fisher DP vs DP-SAT (Shadow): p = {p_shadow_fisher_dp_sat:.4f}")
         
+        # L2 baseline vs DP-SAT (if both available)
+        if l2_baseline_model is not None:
+            _, p_conf_l2_dp_sat = stats.ttest_rel(all_results['l2_baseline']['confidence'], all_results['dp_sat']['confidence'])
+            _, p_shadow_l2_dp_sat = stats.ttest_rel(all_results['l2_baseline']['shadow'], all_results['dp_sat']['shadow'])
+            print(f"  🆚 L2 Baseline vs DP-SAT (Confidence): p = {p_conf_l2_dp_sat:.4f}")
+            print(f"  🆚 L2 Baseline vs DP-SAT (Shadow): p = {p_shadow_l2_dp_sat:.4f}")
+        
         # Vanilla DP vs DP-SAT (if both available)
         if vanilla_dp_model is not None:
             _, p_conf_vanilla_dp_sat = stats.ttest_rel(all_results['vanilla_dp']['confidence'], all_results['dp_sat']['confidence'])
@@ -600,6 +657,12 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     fisher_worst_overall = max(fisher_worst_conf, fisher_worst_shadow)
     
     worst_case_results = {'fisher_dp': fisher_worst_overall}
+    
+    if l2_baseline_model is not None:
+        l2_baseline_worst_conf = max(all_results['l2_baseline']['confidence'])
+        l2_baseline_worst_shadow = max(all_results['l2_baseline']['shadow'])
+        l2_baseline_worst_overall = max(l2_baseline_worst_conf, l2_baseline_worst_shadow)
+        worst_case_results['l2_baseline'] = l2_baseline_worst_overall
     
     if vanilla_dp_model is not None:
         vanilla_worst_conf = max(all_results['vanilla_dp']['confidence'])
@@ -617,6 +680,8 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     print("="*50)
     print(f"📊 Worst-case AUC:")
     print(f"   • Fisher DP: {fisher_worst_overall:.4f}")
+    if l2_baseline_model is not None:
+        print(f"   • L2 Baseline: {l2_baseline_worst_overall:.4f}")
     if vanilla_dp_model is not None:
         print(f"   • Vanilla DP: {vanilla_worst_overall:.4f}")
     if dp_sat_model is not None:
@@ -628,16 +693,32 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     
     if best_name == 'fisher_dp':
         print(f"   🏆 Fisher DP provides the BEST privacy protection!")
+        if l2_baseline_model is not None:
+            diff_l2 = l2_baseline_worst_overall - fisher_worst_overall
+            print(f"   📈 vs L2 Baseline: {diff_l2:.4f} AUC reduction")
         if vanilla_dp_model is not None:
             diff_vanilla = vanilla_worst_overall - fisher_worst_overall
             print(f"   📈 vs Vanilla DP: {diff_vanilla:.4f} AUC reduction")
         if dp_sat_model is not None:
             diff_dp_sat = dp_sat_worst_overall - fisher_worst_overall
             print(f"   📈 vs DP-SAT: {diff_dp_sat:.4f} AUC reduction")
+    elif best_name == 'l2_baseline':
+        print(f"   🏆 L2 Baseline provides the BEST privacy protection!")
+        diff_fisher = fisher_worst_overall - l2_baseline_worst_overall
+        print(f"   📈 vs Fisher DP: {diff_fisher:.4f} AUC reduction")
+        if vanilla_dp_model is not None:
+            diff_vanilla = vanilla_worst_overall - l2_baseline_worst_overall
+            print(f"   📈 vs Vanilla DP: {diff_vanilla:.4f} AUC reduction")
+        if dp_sat_model is not None:
+            diff_dp_sat = dp_sat_worst_overall - l2_baseline_worst_overall
+            print(f"   📈 vs DP-SAT: {diff_dp_sat:.4f} AUC reduction")
     elif best_name == 'vanilla_dp':
         print(f"   🏆 Vanilla DP provides the BEST privacy protection!")
         diff_fisher = fisher_worst_overall - vanilla_worst_overall
         print(f"   📈 vs Fisher DP: {diff_fisher:.4f} AUC reduction")
+        if l2_baseline_model is not None:
+            diff_l2 = l2_baseline_worst_overall - vanilla_worst_overall
+            print(f"   📈 vs L2 Baseline: {diff_l2:.4f} AUC reduction")
         if dp_sat_model is not None:
             diff_dp_sat = dp_sat_worst_overall - vanilla_worst_overall
             print(f"   📈 vs DP-SAT: {diff_dp_sat:.4f} AUC reduction")
@@ -645,6 +726,9 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         print(f"   🏆 DP-SAT provides the BEST privacy protection!")
         diff_fisher = fisher_worst_overall - dp_sat_worst_overall
         print(f"   📈 vs Fisher DP: {diff_fisher:.4f} AUC reduction")
+        if l2_baseline_model is not None:
+            diff_l2 = l2_baseline_worst_overall - dp_sat_worst_overall
+            print(f"   📈 vs L2 Baseline: {diff_l2:.4f} AUC reduction")
         if vanilla_dp_model is not None:
             diff_vanilla = vanilla_worst_overall - dp_sat_worst_overall
             print(f"   📈 vs Vanilla DP: {diff_vanilla:.4f} AUC reduction")
@@ -656,6 +740,12 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         print("✅ Fisher DP provides STRONG privacy protection!")
     else:
         print("⚠️  Fisher DP provides WEAK privacy protection!")
+    
+    if l2_baseline_model is not None:
+        if l2_baseline_worst_overall < privacy_threshold:
+            print("✅ L2 Baseline provides STRONG privacy protection!")
+        else:
+            print("⚠️  L2 Baseline provides WEAK privacy protection!")
         
     if vanilla_dp_model is not None:
         if vanilla_worst_overall < privacy_threshold:
@@ -671,6 +761,7 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     
     return {
         'fisher_worst_auc': fisher_worst_overall,
+        'l2_baseline_worst_auc': l2_baseline_worst_overall if l2_baseline_model else None,
         'vanilla_worst_auc': vanilla_worst_overall if vanilla_dp_model else None,
         'dp_sat_worst_auc': dp_sat_worst_overall if dp_sat_model else None,
         'statistical_results': all_results
@@ -766,6 +857,18 @@ def main():
             print("❌ DP model not found. Please train models first using main.py")
             return
         
+        # Load L2 baseline model (optional)
+        l2_baseline = None
+        l2_baseline_path = os.path.join(models_dir, 'L2基线模型.pth')
+        if os.path.exists(l2_baseline_path):
+            l2_baseline = CNN().to(device)
+            checkpoint = torch.load(l2_baseline_path, map_location=device)
+            l2_baseline.load_state_dict(checkpoint['model_state_dict'])
+            weight_decay = checkpoint.get('weight_decay', 0.0)
+            print(f"✅ Loaded L2 baseline model (λ={weight_decay})")
+        else:
+            print("ℹ️  L2 baseline model not found (optional)")
+        
         # Prepare MIA datasets using actual training data
         if training_indices is not None:
             # Use actual training data as members
@@ -805,6 +908,12 @@ def main():
         print(f"   • AUC: {baseline_conf_results['auc']:.4f}")
         print(f"   • Attack Accuracy: {baseline_conf_results['accuracy']:.4f}")
         
+        if l2_baseline is not None:
+            l2_baseline_conf_results = confidence_attack(l2_baseline, member_loader, non_member_loader, device)
+            print(f"\n🎯 L2 Baseline Model:")
+            print(f"   • AUC: {l2_baseline_conf_results['auc']:.4f}")
+            print(f"   • Attack Accuracy: {l2_baseline_conf_results['accuracy']:.4f}")
+        
         dp_conf_results = confidence_attack(dp_model, member_loader, non_member_loader, device)
         print(f"\n🔒 DP Model:")
         print(f"   • AUC: {dp_conf_results['auc']:.4f}")
@@ -823,19 +932,42 @@ def main():
             actual_train_data = trainset
             print("⚠️  Using full training set for shadow models (less accurate)")
         
-        baseline_shadow_results = shadow_model_attack(baseline, member_loader, non_member_loader, actual_train_data, device)
+        baseline_shadow_results = shadow_model_attack(baseline, member_loader, non_member_loader, actual_train_data, device, eval_data=testset)
         print(f"\n📈 Baseline Model:")
         print(f"   • AUC: {baseline_shadow_results['auc']:.4f}")
         print(f"   • Attack Accuracy: {baseline_shadow_results['accuracy']:.4f}")
         
-        dp_shadow_results = shadow_model_attack(dp_model, member_loader, non_member_loader, actual_train_data, device)
+        if l2_baseline is not None:
+            l2_baseline_shadow_results = shadow_model_attack(l2_baseline, member_loader, non_member_loader, actual_train_data, device, eval_data=testset)
+            print(f"\n🎯 L2 Baseline Model:")
+            print(f"   • AUC: {l2_baseline_shadow_results['auc']:.4f}")
+            print(f"   • Attack Accuracy: {l2_baseline_shadow_results['accuracy']:.4f}")
+        
+        dp_shadow_results = shadow_model_attack(dp_model, member_loader, non_member_loader, actual_train_data, device, eval_data=testset)
         print(f"\n🔒 DP Model:")
         print(f"   • AUC: {dp_shadow_results['auc']:.4f}")
         print(f"   • Attack Accuracy: {dp_shadow_results['accuracy']:.4f}")
         
         # Overall assessment
         worst_dp_auc = max(dp_conf_results['auc'], dp_shadow_results['auc'])
-        print(f"\n🎯 OVERALL PRIVACY PROTECTION (worst-case AUC: {worst_dp_auc:.4f}):")
+        
+        if l2_baseline is not None:
+            worst_l2_auc = max(l2_baseline_conf_results['auc'], l2_baseline_shadow_results['auc'])
+            print(f"\n🎯 OVERALL PRIVACY PROTECTION:")
+            print(f"   • DP Model (worst-case AUC): {worst_dp_auc:.4f}")
+            print(f"   • L2 Baseline (worst-case AUC): {worst_l2_auc:.4f}")
+            
+            if worst_l2_auc < worst_dp_auc:
+                diff = worst_dp_auc - worst_l2_auc
+                print(f"   📈 L2 Baseline has {diff:.4f} better privacy protection than DP model!")
+            elif worst_dp_auc < worst_l2_auc:
+                diff = worst_l2_auc - worst_dp_auc
+                print(f"   📈 DP Model has {diff:.4f} better privacy protection than L2 baseline!")
+            else:
+                print(f"   🔄 Similar privacy protection between DP and L2 baseline")
+        else:
+            print(f"\n🎯 OVERALL PRIVACY PROTECTION (worst-case AUC: {worst_dp_auc:.4f}):")
+            
         if training_indices is not None:
             print("✅ Using actual training data for accurate evaluation")
         else:

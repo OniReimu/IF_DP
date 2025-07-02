@@ -27,8 +27,9 @@ from privacy_accounting import (
     validate_privacy_comparison,
     print_privacy_summary
 )
+from config             import set_random_seeds
 
-torch.manual_seed(42) ; np.random.seed(42)
+set_random_seeds()  # Set reproducible random seeds
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════
@@ -250,10 +251,10 @@ if not args.sample_level:
           f'({len(priv_base)//args.users:.1f} samples each)')
 
 # ════════════════════════════════════════════════════════════════
-# 1. Non-private baseline
+# 1. Baseline
 # ════════════════════════════════════════════════════════════════
 baseline = CNN().to(device)
-opt_b = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=.9)
+opt_b = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=.9, weight_decay=0.0)
 print('\n⚙️  Training baseline…')
 for epoch in tqdm(range(args.epochs)):
     baseline.train()
@@ -478,6 +479,7 @@ if dp_sat_model is not None:
 if vanilla_dp_model is not None or dp_sat_model is not None:
     # Calculate improvements
     fisher_acc = accuracy(fisher_dp_model, test_loader, device)
+    baseline_acc = accuracy(baseline, test_loader, device)
     
     if vanilla_dp_model is not None:
         vanilla_acc = accuracy(vanilla_dp_model, test_loader, device)
@@ -589,4 +591,4 @@ else:
 if args.run_mia:
     evaluate_membership_inference(baseline, fisher_dp_model, priv_base, eval_base, 
                                 priv_idx, priv_ds, args.users, args.mia_size, 
-                                args.sample_level, device, vanilla_dp_model, dp_sat_model)
+                                args.sample_level, device, vanilla_dp_model, dp_sat_model, None)

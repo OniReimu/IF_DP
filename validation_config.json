@@ -11,7 +11,8 @@
     "dp-layer": "conv1,conv2",
     "mps": true,
     "clean": true,
-    "compare-others": true
+    "compare-others": true,
+    "run-mia": true
   },
   "experiments": [
     {
@@ -27,6 +28,13 @@
       "description": "25 users with negatively correlated noise (default)"
     },
     {
+      "name": "25_users_l2_reg",
+      "users": 25,
+      "negatively_correlated_noise": true,
+      "l2_regularization": 0.01,
+      "description": "25 users with L2 regularization (λ=0.01) for hypothesis testing"
+    },
+    {
       "name": "50_users_positive",
       "users": 50,
       "positively_correlated_noise": true,
@@ -37,6 +45,13 @@
       "users": 50,
       "negatively_correlated_noise": true,
       "description": "50 users with negatively correlated noise (default)"
+    },
+    {
+      "name": "50_users_l2_reg",
+      "users": 50,
+      "negatively_correlated_noise": true,
+      "l2_regularization": 0.01,
+      "description": "50 users with L2 regularization (λ=0.01) for hypothesis testing"
     },
     {
       "name": "100_users_positive",
@@ -51,6 +66,13 @@
       "description": "100 users with negatively correlated noise (default)"
     },
     {
+      "name": "100_users_l2_reg",
+      "users": 100,
+      "negatively_correlated_noise": true,
+      "l2_regularization": 0.01,
+      "description": "100 users with L2 regularization (λ=0.01) for hypothesis testing"
+    },
+    {
       "name": "200_users_positive",
       "users": 200,
       "positively_correlated_noise": true,
@@ -63,6 +85,13 @@
       "description": "200 users with negatively correlated noise (default)"
     },
     {
+      "name": "200_users_l2_reg",
+      "users": 200,
+      "negatively_correlated_noise": true,
+      "l2_regularization": 0.01,
+      "description": "200 users with L2 regularization (λ=0.01) for hypothesis testing"
+    },
+    {
       "name": "400_users_positive",
       "users": 400,
       "positively_correlated_noise": true,
@@ -73,6 +102,13 @@
       "users": 400,
       "negatively_correlated_noise": true,
       "description": "400 users with negatively correlated noise (default)"
+    },
+    {
+      "name": "400_users_l2_reg",
+      "users": 400,
+      "negatively_correlated_noise": true,
+      "l2_regularization": 0.01,
+      "description": "400 users with L2 regularization (λ=0.01) for hypothesis testing"
     }
   ],
   "output_settings": {

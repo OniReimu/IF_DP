@@ -26,8 +26,9 @@ from privacy_accounting import (
 from model import CNN
 from mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
 from influence_function import calibrate_model_research_protocol, get_critical_slice
+from config import set_random_seeds, get_random_seed
 
-torch.manual_seed(42); np.random.seed(42)
+set_random_seeds()  # Set reproducible random seeds
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════
@@ -943,7 +944,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         }
         
         # Set random seed for reproducible MIA evaluation
-        np.random.seed(42)
+        np.random.seed(get_random_seed())
         
         # Prepare member and non-member datasets
         if args.sample_level:

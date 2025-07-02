@@ -4,15 +4,15 @@ Visual Discovery Analysis: Configuration-Driven Validation
 ==========================================================
 
 This script uses a configuration file to run main.py with different settings
-and then analyzes the results. This approach ensures perfect consistency
-with main.py while keeping the validation logic simple and maintainable.
+and then saves the results. The plotting functionality has been moved to
+visual_plotter.py for better separation of concerns.
 
 Key Features:
 1. JSON configuration file defines all experiment parameters
 2. Calls main.py via subprocess for each configuration
 3. Parses results from main.py output
-4. Generates comprehensive visualizations
-5. No code duplication or consistency issues
+4. Saves comprehensive results with config for later analysis
+5. No plotting - use visual_plotter.py to generate plots
 """
 
 import json
@@ -20,15 +20,9 @@ import subprocess
 import re
 import os
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime
 from tqdm import tqdm
 import pandas as pd
-
-# Set style for publication-quality plots
-plt.style.use('seaborn-v0_8-whitegrid')
-sns.set_palette("husl")
 
 # ════════════════════════════════════════════════════════════════
 # CONFIGURATION TEMPLATE
@@ -47,7 +41,8 @@ DEFAULT_CONFIG = {
         "dp-layer": "conv1,conv2",
         "mps": True,
         "clean": True,
-        "compare-others": True
+        "compare-others": True,
+        "run-mia": True
     },
     "experiments": [
         {
@@ -167,7 +162,7 @@ def build_command(config, experiment):
     return " ".join(cmd_parts)
 
 def parse_main_output(output_text):
-    """Parse the output from main.py to extract accuracy results"""
+    """Parse the output from main.py to extract accuracy results and MIA results"""
     results = {}
     
     # Look for the accuracy summary section
@@ -201,6 +196,63 @@ def parse_main_output(output_text):
         match = re.search(pattern, output_text)
         if match:
             results[name] = float(match.group(1))
+    
+    # Extract MIA results: Confidence Attack AUCs
+    confidence_section_pattern = r"🎯 Confidence Attack AUC:(.*?)(?=\n\n|🕶️|📊|\Z)"
+    confidence_match = re.search(confidence_section_pattern, output_text, re.DOTALL)
+    
+    if confidence_match:
+        confidence_section = confidence_match.group(1)
+        confidence_patterns = {
+            'baseline_confidence_auc': r'\s+Baseline:\s*(\d+\.?\d*)',
+            'fisher_dp_confidence_auc': r'\s+Fisher DP:\s*(\d+\.?\d*)',
+            'vanilla_dp_confidence_auc': r'\s+Vanilla DP:\s*(\d+\.?\d*)',
+            'dp_sat_confidence_auc': r'\s+DP-SAT:\s*(\d+\.?\d*)',
+            'l2_baseline_confidence_auc': r'\s+L2 Baseline:\s*(\d+\.?\d*)'
+        }
+        
+        for name, pattern in confidence_patterns.items():
+            match = re.search(pattern, confidence_section)
+            if match:
+                results[name] = float(match.group(1))
+    
+    # Extract MIA results: Shadow Attack AUCs
+    shadow_section_pattern = r"🕶️\s+Shadow Attack AUC:(.*?)(?=\n\n|🧮|📊|\Z)"
+    shadow_match = re.search(shadow_section_pattern, output_text, re.DOTALL)
+    
+    if shadow_match:
+        shadow_section = shadow_match.group(1)
+        shadow_patterns = {
+            'baseline_shadow_auc': r'\s+Baseline:\s*(\d+\.?\d*)',
+            'fisher_dp_shadow_auc': r'\s+Fisher DP:\s*(\d+\.?\d*)',
+            'vanilla_dp_shadow_auc': r'\s+Vanilla DP:\s*(\d+\.?\d*)',
+            'dp_sat_shadow_auc': r'\s+DP-SAT:\s*(\d+\.?\d*)',
+            'l2_baseline_shadow_auc': r'\s+L2 Baseline:\s*(\d+\.?\d*)'
+        }
+        
+        for name, pattern in shadow_patterns.items():
+            match = re.search(pattern, shadow_section)
+            if match:
+                results[name] = float(match.group(1))
+    
+    # Extract MIA results: Worst-case AUCs
+    worst_case_pattern = r"📊 Worst-case AUC:(.*?)(?=\n\n|🏆|✅|⚠️|\Z)"
+    worst_case_match = re.search(worst_case_pattern, output_text, re.DOTALL)
+    
+    if worst_case_match:
+        worst_case_section = worst_case_match.group(1)
+        worst_case_patterns = {
+            'baseline_worst_auc': r'\s+•\s+Baseline:\s*(\d+\.?\d*)',
+            'fisher_dp_worst_auc': r'\s+•\s+Fisher DP:\s*(\d+\.?\d*)',
+            'vanilla_dp_worst_auc': r'\s+•\s+Vanilla DP:\s*(\d+\.?\d*)',
+            'dp_sat_worst_auc': r'\s+•\s+DP-SAT:\s*(\d+\.?\d*)',
+            'l2_baseline_worst_auc': r'\s+•\s+L2 Baseline:\s*(\d+\.?\d*)'
+        }
+        
+        for name, pattern in worst_case_patterns.items():
+            match = re.search(pattern, worst_case_section)
+            if match:
+                results[name] = float(match.group(1))
     
     return results
 
@@ -308,11 +360,9 @@ def run_all_experiments(config):
     
     # Create output directories
     os.makedirs(config["output_settings"]["results_dir"], exist_ok=True)
-    os.makedirs(config["output_settings"]["plots_dir"], exist_ok=True)
     
     print(f"🎯 Starting validation with {len(config['experiments'])} experiments")
     print(f"📁 Results will be saved to: {config['output_settings']['results_dir']}")
-    print(f"📊 Plots will be saved to: {config['output_settings']['plots_dir']}")
     
     # Show experiment overview
     print(f"\n📋 Experiment Overview:")
@@ -358,19 +408,38 @@ def run_all_experiments(config):
         failed_count = len(config['experiments']) - len(results)
         print(f"⚠️  {failed_count} experiments failed - check logs above for details")
     
-    # Save results
+    # Get the random seed for filename
+    from config import get_random_seed
+    seed = get_random_seed()
+    
+    # Save results with config for visual_plotter.py
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = os.path.join(config["output_settings"]["results_dir"], f"validation_results_{timestamp}.json")
+    results_file = os.path.join(config["output_settings"]["results_dir"], f"validation_results_{timestamp}_seed_{seed}.json")
+    
+    # Save both results and config in the new format
+    output_data = {
+        'results': results,
+        'config': config,
+        'metadata': {
+            'timestamp': timestamp,
+            'seed': seed,
+            'total_experiments': len(config['experiments']),
+            'successful_experiments': len(results),
+            'failed_experiments': len(config['experiments']) - len(results)
+        }
+    }
     
     with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(output_data, f, indent=2)
     
-    print(f"💾 Results saved to: {results_file}")
+    print(f"💾 Results and config saved to: {results_file}")
+    print(f"🎲 Random seed: {seed}")
+    print(f"📊 Use visual_plotter.py to generate plots from these results")
     
     return results, results_file
 
 def analyze_results(results, config):
-    """Analyze the experimental results and create visualizations"""
+    """Analyze the experimental results (no plotting, just summary)"""
     if not results:
         print("❌ No results to analyze")
         return
@@ -380,156 +449,17 @@ def analyze_results(results, config):
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(results)
     
-    # Group by user count and noise strategy
+    # Group by user count and experiment type
     user_counts = sorted(df['users'].unique())
     
-    # Prepare data for plotting
-    plot_data = {}
-    for user_count in user_counts:
-        user_data = df[df['users'] == user_count]
-        
-        positive_data = user_data[user_data['noise_strategy'] == 'positive']
-        negative_data = user_data[user_data['noise_strategy'] == 'negative']
-        
-        if len(positive_data) > 0 and len(negative_data) > 0:
-            plot_data[user_count] = {
-                'positive_fisher': positive_data['fisher_dp'].iloc[0] if 'fisher_dp' in positive_data.columns else 0,
-                'negative_fisher': negative_data['fisher_dp'].iloc[0] if 'fisher_dp' in negative_data.columns else 0,
-                'positive_vanilla': positive_data['vanilla_dp'].iloc[0] if 'vanilla_dp' in positive_data.columns else 0,
-                'negative_vanilla': negative_data['vanilla_dp'].iloc[0] if 'vanilla_dp' in negative_data.columns else 0,
-                'positive_dp_sat': positive_data['dp_sat'].iloc[0] if 'dp_sat' in positive_data.columns else 0,
-                'negative_dp_sat': negative_data['dp_sat'].iloc[0] if 'dp_sat' in negative_data.columns else 0,
-                'baseline': positive_data['baseline'].iloc[0] if 'baseline' in positive_data.columns else 0,
-                'strategy_difference': (positive_data['fisher_dp'].iloc[0] if 'fisher_dp' in positive_data.columns else 0) - 
-                                     (negative_data['fisher_dp'].iloc[0] if 'fisher_dp' in negative_data.columns else 0)
-            }
-    
-    # Create comprehensive visualization
-    create_validation_plots(plot_data, config)
-    
-    # Print summary
-    print_analysis_summary(plot_data, config)
+    # Print basic analysis summary
+    print_basic_analysis_summary(results, config, user_counts)
 
-def create_validation_plots(plot_data, config):
-    """Create comprehensive validation plots"""
-    if not plot_data:
-        print("❌ No plot data available")
-        return
-    
-    user_counts = list(plot_data.keys())
-    strategy_diffs = [plot_data[uc]['strategy_difference'] for uc in user_counts]
-    
-    # Create main validation plot
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle(f'Configuration-Driven Validation: Positively vs Negatively Correlated Fisher DP\n' + 
-                f'k={config["common_args"]["k"]}, ε={config["common_args"]["target-epsilon"]}, ' +
-                f'epochs={config["common_args"]["epochs"]}, {config["common_args"]["dp-layer"]}', 
-                fontsize=16, fontweight='bold')
-    
-    # Plot 1: Strategy difference
-    ax1 = axes[0, 0]
-    ax1.plot(user_counts, strategy_diffs, 'o-', linewidth=3, markersize=8, color='darkred')
-    ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
-    ax1.fill_between(user_counts, strategy_diffs, 0, alpha=0.3, color='darkred')
-    ax1.set_xlabel('Number of Users')
-    ax1.set_ylabel('Positively Correlated Advantage (%)')
-    ax1.set_title('Key Discovery: Positively Correlated Advantage')
-    ax1.grid(True, alpha=0.3)
-    
-    # Highlight positive values
-    for x, y in zip(user_counts, strategy_diffs):
-        if y > 0.5:
-            ax1.annotate(f'+{y:.1f}%', (x, y), textcoords="offset points", 
-                        xytext=(0,10), ha='center', fontweight='bold', color='darkred')
-    
-    # Plot 2: Fisher DP comparison
-    ax2 = axes[0, 1]
-    positive_fisher = [plot_data[uc]['positive_fisher'] for uc in user_counts]
-    negative_fisher = [plot_data[uc]['negative_fisher'] for uc in user_counts]
-    
-    ax2.plot(user_counts, positive_fisher, 'o-', label='Positively Correlated', linewidth=2, markersize=6, color='red')
-    ax2.plot(user_counts, negative_fisher, 's-', label='Negatively Correlated', linewidth=2, markersize=6, color='blue')
-    ax2.set_xlabel('Number of Users')
-    ax2.set_ylabel('Fisher DP Accuracy (%)')
-    ax2.set_title('Fisher DP: Noise Strategy Comparison')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: All methods comparison
-    ax3 = axes[1, 0]
-    vanilla_accs = [plot_data[uc]['positive_vanilla'] for uc in user_counts]
-    dp_sat_accs = [plot_data[uc]['positive_dp_sat'] for uc in user_counts]
-    baseline_accs = [plot_data[uc]['baseline'] for uc in user_counts]
-    
-    ax3.plot(user_counts, positive_fisher, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
-    ax3.plot(user_counts, negative_fisher, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
-    ax3.plot(user_counts, vanilla_accs, '^-', label='Vanilla DP', linewidth=2, markersize=6)
-    ax3.plot(user_counts, dp_sat_accs, 'd-', label='DP-SAT', linewidth=2, markersize=6)
-    ax3.plot(user_counts, baseline_accs, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
-    ax3.set_xlabel('Number of Users')
-    ax3.set_ylabel('Test Accuracy (%)')
-    ax3.set_title('All Methods Comparison')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    
-    # Plot 4: Summary statistics
-    ax4 = axes[1, 1]
-    ax4.axis('off')
-    
-    wins = sum(1 for d in strategy_diffs if d > 0.5)
-    best_user_count = user_counts[np.argmax(strategy_diffs)]
-    best_advantage = max(strategy_diffs)
-    
-    summary_text = f"""
-VALIDATION SUMMARY
-
-✅ DISCOVERY CONFIRMED
-Positively correlated noise Fisher DP 
-outperforms negatively correlated noise
-under specific conditions.
-
-📊 RESULTS:
-• Experiments completed: {len(user_counts) * 2}
-• Positively correlated wins: {wins}/{len(user_counts)}
-• Best user count: {best_user_count}
-• Maximum advantage: +{best_advantage:.2f}%
-
-🎯 CONFIGURATION:
-• k = {config["common_args"]["k"]} (Fisher subspace)
-• ε = {config["common_args"]["target-epsilon"]} (privacy)
-• epochs = {config["common_args"]["epochs"]}
-• layers = {config["common_args"]["dp-layer"]}
-
-🔬 METHOD:
-Configuration-driven validation using
-main.py ensures perfect consistency
-and eliminates implementation drift.
-    """
-    
-    ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, fontsize=10,
-            verticalalignment='top', fontfamily='monospace',
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgreen", alpha=0.8))
-    
-    plt.tight_layout()
-    
-    # Save plot
-    plots_dir = config["output_settings"]["plots_dir"]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plot_file = os.path.join(plots_dir, f"validation_summary_{timestamp}.png")
-    
-    plt.savefig(plot_file, dpi=config["output_settings"]["figure_dpi"], bbox_inches='tight')
-    print(f"📊 Validation plot saved to: {plot_file}")
-    
-    plt.show()
-
-def print_analysis_summary(plot_data, config):
-    """Print a detailed analysis summary"""
+def print_basic_analysis_summary(results, config, user_counts):
+    """Print a basic analysis summary without plotting"""
     print(f"\n" + "="*60)
     print(f"CONFIGURATION-DRIVEN VALIDATION SUMMARY")
     print(f"="*60)
-    
-    user_counts = list(plot_data.keys())
-    strategy_diffs = [plot_data[uc]['strategy_difference'] for uc in user_counts]
     
     print(f"📊 Experiment Configuration:")
     print(f"   • Fisher k: {config['common_args']['k']}")
@@ -538,31 +468,47 @@ def print_analysis_summary(plot_data, config):
     print(f"   • Layers: {config['common_args']['dp-layer']}")
     print(f"   • User counts tested: {user_counts}")
     
+    # Group results by noise strategy
+    positive_results = [r for r in results if r.get('noise_strategy') == 'positive']
+    negative_results = [r for r in results if r.get('noise_strategy') == 'negative']
+    
     print(f"\n🎯 Key Findings:")
-    wins = sum(1 for d in strategy_diffs if d > 0.5)
-    print(f"   • Positively correlated noise wins: {wins}/{len(user_counts)} conditions")
+    print(f"   📊 Experiments completed:")
+    print(f"     • Positive noise correlation: {len(positive_results)} experiments")
+    print(f"     • Negative noise correlation: {len(negative_results)} experiments")
     
-    if wins > 0:
-        best_idx = np.argmax(strategy_diffs)
-        best_user_count = user_counts[best_idx]
-        best_advantage = strategy_diffs[best_idx]
-        print(f"   • Best condition: {best_user_count} users (+{best_advantage:.2f}% advantage)")
-        
-        best_data = plot_data[best_user_count]
-        print(f"   • At best condition:")
-        print(f"     - Positively correlated Fisher DP: {best_data['positive_fisher']:.2f}%")
-        print(f"     - Negatively correlated Fisher DP: {best_data['negative_fisher']:.2f}%")
-        print(f"     - Vanilla DP: {best_data['positive_vanilla']:.2f}%")
-        print(f"     - DP-SAT: {best_data['positive_dp_sat']:.2f}%")
+    # Calculate wins for each user count
+    wins = 0
+    total_comparisons = 0
     
-    print(f"\n📈 Detailed Results by User Count:")
     for uc in user_counts:
-        data = plot_data[uc]
-        print(f"   {uc:3d} users: Pos={data['positive_fisher']:5.1f}% vs Neg={data['negative_fisher']:5.1f}% " +
-              f"(diff: {data['strategy_difference']:+5.1f}%)")
+        pos_data = [r for r in positive_results if r.get('users') == uc]
+        neg_data = [r for r in negative_results if r.get('users') == uc]
+        
+        if pos_data and neg_data:
+            pos_fisher = pos_data[0].get('fisher_dp', 0)
+            neg_fisher = neg_data[0].get('fisher_dp', 0)
+            if pos_fisher > neg_fisher + 0.5:  # Significant advantage threshold
+                wins += 1
+            total_comparisons += 1
+            
+            print(f"   {uc:3d} users:")
+            print(f"     • Positive Fisher DP: {pos_fisher:.2f}%")
+            print(f"     • Negative Fisher DP: {neg_fisher:.2f}%")
+            print(f"     • Advantage: {pos_fisher - neg_fisher:+.2f}%")
     
-    print(f"\n✅ Validation completed using configuration-driven approach")
-    print(f"   This method ensures perfect consistency with main.py")
+    if total_comparisons > 0:
+        print(f"\n📈 Overall Summary:")
+        print(f"   • Positively correlated noise wins: {wins}/{total_comparisons} conditions")
+        if wins > 0:
+            print(f"   ✅ Discovery confirmed under multiple conditions")
+        else:
+            print(f"   ❌ Positively correlated advantage not observed")
+    
+    print(f"\n📊 Next Steps:")
+    print(f"   • Use visual_plotter.py to generate comprehensive plots")
+    print(f"   • Example: python visual_plotter.py --latest")
+    print(f"\n✅ Validation analysis complete")
 
 def main():
     """Main validation function"""
@@ -570,6 +516,7 @@ def main():
     print("=" * 60)
     print("This script uses JSON configuration to run main.py with different")
     print("settings, ensuring perfect consistency and eliminating drift.")
+    print("Results are saved for later plotting with visual_plotter.py")
     print("=" * 60)
     
     # Load or create configuration
@@ -578,12 +525,12 @@ def main():
     # Run all experiments
     results, results_file = run_all_experiments(config)
     
-    # Analyze results
+    # Analyze results (basic summary only)
     analyze_results(results, config)
     
     print(f"\n🎉 Validation analysis complete!")
     print(f"📁 Results: {results_file}")
-    print(f"📊 Plots: {config['output_settings']['plots_dir']}")
+    print(f"📊 Generate plots: python visual_plotter.py --latest")
     
     return results
 

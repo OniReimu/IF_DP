@@ -50,9 +50,12 @@ def main():
     print("=" * 60)
     
     # Setup
-    device = torch.device('cpu')
-    torch.manual_seed(42)
-    np.random.seed(42)
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f'Using device: {device}')
+    
+    # Set reproducible random seeds
+    from config import set_random_seeds
+    set_random_seeds()
     
     # Data
     trans = T.Compose([T.ToTensor(), T.Normalize((.5,.5,.5),(.5,.5,.5))])
