@@ -1,0 +1,85 @@
+{
+  "experiment_name": "clip_radius_sensitivity_analysis",
+  "base_command": "uv run main.py",
+  "common_args": {
+    "k": 2048,
+    "epochs": 50,
+    "dataset-size": 50000,
+    "target-epsilon": 2.0,
+    "delta": 1e-05,
+    "users": 200,
+    "dp-layer": "conv1,conv2",
+    "mps": true,
+    "clean": true,
+    "compare-others": true,
+    "run-mia": true
+  },
+  "experiments": [
+    {
+      "name": "clip_0.5_positive",
+      "clip-radius": 0.5,
+      "positively_correlated_noise": true,
+      "description": "Clip radius 0.5 with positively correlated noise"
+    },
+    {
+      "name": "clip_0.5_negative",
+      "clip-radius": 0.5,
+      "negatively_correlated_noise": true,
+      "description": "Clip radius 0.5 with negatively correlated noise (default)"
+    },
+    {
+      "name": "clip_1.0_positive",
+      "clip-radius": 1.0,
+      "positively_correlated_noise": true,
+      "description": "Clip radius 1.0 with positively correlated noise"
+    },
+    {
+      "name": "clip_1.0_negative",
+      "clip-radius": 1.0,
+      "negatively_correlated_noise": true,
+      "description": "Clip radius 1.0 with negatively correlated noise (default)"
+    },
+    {
+      "name": "clip_2.0_positive",
+      "clip-radius": 2.0,
+      "positively_correlated_noise": true,
+      "description": "Clip radius 2.0 with positively correlated noise"
+    },
+    {
+      "name": "clip_2.0_negative",
+      "clip-radius": 2.0,
+      "negatively_correlated_noise": true,
+      "description": "Clip radius 2.0 with negatively correlated noise (default)"
+    },
+    {
+      "name": "clip_5.0_positive",
+      "clip-radius": 5.0,
+      "positively_correlated_noise": true,
+      "description": "Clip radius 5.0 with positively correlated noise"
+    },
+    {
+      "name": "clip_5.0_negative",
+      "clip-radius": 5.0,
+      "negatively_correlated_noise": true,
+      "description": "Clip radius 5.0 with negatively correlated noise (default)"
+    },
+    {
+      "name": "clip_10.0_positive",
+      "clip-radius": 10.0,
+      "positively_correlated_noise": true,
+      "description": "Clip radius 10.0 with positively correlated noise"
+    },
+    {
+      "name": "clip_10.0_negative",
+      "clip-radius": 10.0,
+      "negatively_correlated_noise": true,
+      "description": "Clip radius 10.0 with negatively correlated noise (default)"
+    }
+  ],
+  "output_settings": {
+    "results_dir": "validation_results",
+    "plots_dir": "validation_plots",
+    "save_logs": true,
+    "figure_dpi": 300
+  }
+} 

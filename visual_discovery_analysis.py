@@ -3,16 +3,31 @@
 Visual Discovery Analysis: Configuration-Driven Validation
 ==========================================================
 
-This script uses a configuration file to run main.py with different settings
+This script uses external JSON configuration files to run main.py with different settings
 and then saves the results. The plotting functionality has been moved to
 visual_plotter.py for better separation of concerns.
 
 Key Features:
-1. JSON configuration file defines all experiment parameters
-2. Calls main.py via subprocess for each configuration
-3. Parses results from main.py output
-4. Saves comprehensive results with config for later analysis
-5. No plotting - use visual_plotter.py to generate plots
+1. External JSON configuration files define all experiment parameters
+2. Support for parameter grids (automatic combinatorial experiments)
+3. Calls main.py via subprocess for each configuration
+4. Parses results from main.py output
+5. Saves comprehensive results with config for later analysis
+6. No plotting - use visual_plotter.py to generate plots
+
+Config Format:
+- Manual experiments: List each experiment individually (current approach)
+- Parameter grids: Automatically generate all combinations of parameters
+- Hybrid: Mix both approaches in the same config
+
+Available Config Files (in validation_configs/ directory):
+- validation_config_users_num.json: User count sensitivity analysis
+- validation_config_clip_radius.json: Clip radius sensitivity analysis
+
+Usage:
+  python visual_discovery_analysis.py --list-configs
+  python visual_discovery_analysis.py --config validation_config_users_num.json
+  python visual_discovery_analysis.py --config validation_config_clip_radius.json
 """
 
 import json
@@ -23,114 +38,116 @@ import numpy as np
 from datetime import datetime
 from tqdm import tqdm
 import pandas as pd
+import argparse
+from itertools import product
 
 # ════════════════════════════════════════════════════════════════
-# CONFIGURATION TEMPLATE
+# CONFIGURATION MANAGEMENT (External Files + Parameter Grids)
 # ════════════════════════════════════════════════════════════════
 
-DEFAULT_CONFIG = {
-    "experiment_name": "positively_correlated_noise_validation",
-    "base_command": "uv run main.py",
-    "common_args": {
-        "k": 2048,
-        "epochs": 50,
-        "dataset-size": 50000,
-        "target-epsilon": 2.0,
-        "delta": 1e-5,
-        "clip-radius": 2.0,
-        "dp-layer": "conv1,conv2",
-        "mps": True,
-        "clean": True,
-        "compare-others": True,
-        "run-mia": True
-    },
-    "experiments": [
-        {
-            "name": "25_users_positive",
-            "users": 25,
-            "positively_correlated_noise": True,
-            "description": "25 users with positively correlated noise"
-        },
-        {
-            "name": "25_users_negative", 
-            "users": 25,
-            "negatively_correlated_noise": True,
-            "description": "25 users with negatively correlated noise (default)"
-        },
-        {
-            "name": "50_users_positive",
-            "users": 50,
-            "positively_correlated_noise": True,
-            "description": "50 users with positively correlated noise"
-        },
-        {
-            "name": "50_users_negative",
-            "users": 50,
-            "negatively_correlated_noise": True,
-            "description": "50 users with negatively correlated noise (default)"
-        },
-        {
-            "name": "100_users_positive",
-            "users": 100,
-            "positively_correlated_noise": True,
-            "description": "100 users with positively correlated noise"
-        },
-        {
-            "name": "100_users_negative",
-            "users": 100,
-            "negatively_correlated_noise": True,
-            "description": "100 users with negatively correlated noise (default)"
-        },
-        {
-            "name": "200_users_positive",
-            "users": 200,
-            "positively_correlated_noise": True,
-            "description": "200 users with positively correlated noise"
-        },
-        {
-            "name": "200_users_negative",
-            "users": 200,
-            "negatively_correlated_noise": True,
-            "description": "200 users with negatively correlated noise (default)"
-        },
-        {
-            "name": "400_users_positive",
-            "users": 400,
-            "positively_correlated_noise": True,
-            "description": "400 users with positively correlated noise"
-        },
-        {
-            "name": "400_users_negative",
-            "users": 400,
-            "negatively_correlated_noise": True,
-            "description": "400 users with negatively correlated noise (default)"
-        }
-    ],
-    "output_settings": {
-        "results_dir": "validation_results",
-        "plots_dir": "validation_plots",
-        "save_logs": True,
-        "figure_dpi": 300
-    }
-}
-
-def create_config_file(filename="validation_config.json"):
-    """Create the default configuration file"""
-    with open(filename, 'w') as f:
-        json.dump(DEFAULT_CONFIG, f, indent=2)
-    print(f"📄 Created configuration file: {filename}")
-    return filename
-
-def load_config(filename="validation_config.json"):
-    """Load configuration from JSON file"""
-    if not os.path.exists(filename):
-        print(f"⚠️  Config file {filename} not found. Creating default...")
-        filename = create_config_file(filename)
+def expand_parameter_grid(config):
+    """Expand parameter_grid into individual experiments"""
+    if 'parameter_grid' not in config:
+        return config
     
-    with open(filename, 'r') as f:
+    grid = config['parameter_grid']
+    if not grid:
+        return config
+    
+    print(f"🔧 Expanding parameter grid...")
+    
+    # Get parameter names and values
+    param_names = list(grid.keys())
+    param_values = [grid[name] if isinstance(grid[name], list) else [grid[name]] for name in param_names]
+    
+    # Generate all combinations
+    combinations = list(product(*param_values))
+    
+    print(f"   📊 Parameters: {param_names}")
+    for name, values in zip(param_names, param_values):
+        print(f"   • {name}: {values}")
+    print(f"   🔢 Total combinations: {len(combinations)}")
+    
+    # Generate experiments from combinations
+    grid_experiments = []
+    for i, combo in enumerate(combinations):
+        # Create experiment name
+        name_parts = []
+        exp_dict = {}
+        
+        for param_name, param_value in zip(param_names, combo):
+            # Handle special parameter names for naming
+            if param_name == 'target-epsilon':
+                name_parts.append(f"eps_{param_value}")
+            elif param_name == 'dp-layer':
+                layer_name = param_value.replace(',', '_').replace('conv', 'c')
+                name_parts.append(f"layer_{layer_name}")
+            elif param_name == 'users':
+                name_parts.append(f"u{param_value}")
+            elif param_name == 'clip-radius':
+                name_parts.append(f"clip_{param_value}")
+            elif param_name == 'noise_strategy':
+                if param_value == 'positive':
+                    exp_dict['positively_correlated_noise'] = True
+                    name_parts.append("pos")
+                elif param_value == 'negative':
+                    exp_dict['negatively_correlated_noise'] = True
+                    name_parts.append("neg")
+                continue  # Don't add noise_strategy directly to exp_dict
+            else:
+                name_parts.append(f"{param_name}_{param_value}")
+            
+            # Add parameter to experiment (except noise_strategy which is handled above)
+            if param_name != 'noise_strategy':
+                exp_dict[param_name] = param_value
+        
+        exp_dict['name'] = "_".join(name_parts)
+        exp_dict['description'] = f"Grid experiment: {', '.join(f'{k}={v}' for k, v in zip(param_names, combo))}"
+        
+        grid_experiments.append(exp_dict)
+    
+    # Combine with existing manual experiments
+    manual_experiments = config.get('experiments', [])
+    all_experiments = manual_experiments + grid_experiments
+    
+    print(f"   ✅ Generated {len(grid_experiments)} experiments from parameter grid")
+    if manual_experiments:
+        print(f"   📝 Plus {len(manual_experiments)} manual experiments")
+    print(f"   🎯 Total experiments: {len(all_experiments)}")
+    
+    # Update config
+    config['experiments'] = all_experiments
+    
+    return config
+
+def load_config(filename):
+    """Load configuration from JSON file and expand parameter grids"""
+    # If filename doesn't include path, look in validation_configs directory
+    if not os.path.dirname(filename):
+        config_path = os.path.join('validation_configs', filename)
+    else:
+        config_path = filename
+    
+    if not os.path.exists(config_path):
+        print(f"❌ Config file {config_path} not found.")
+        print(f"📄 Available config files:")
+        config_dir = 'validation_configs'
+        if os.path.exists(config_dir):
+            config_files = [f for f in os.listdir(config_dir) if f.startswith('validation_config_') and f.endswith('.json')]
+            for i, config_file in enumerate(config_files, 1):
+                print(f"   {i}. {config_file}")
+        else:
+            print(f"   No validation_configs directory found")
+        raise FileNotFoundError(f"Configuration file {config_path} does not exist")
+    
+    with open(config_path, 'r') as f:
         config = json.load(f)
     
-    print(f"📄 Loaded configuration: {filename}")
+    print(f"📄 Loaded configuration: {config_path}")
+    
+    # Expand parameter grids if present
+    config = expand_parameter_grid(config)
+    
     return config
 
 def build_command(config, experiment):
@@ -368,7 +385,14 @@ def run_all_experiments(config):
     print(f"\n📋 Experiment Overview:")
     for i, exp in enumerate(config["experiments"], 1):
         noise_type = "Positive" if exp.get('positively_correlated_noise') else "Negative"
-        print(f"   {i:2d}. {exp['users']:3d} users - {noise_type} correlation")
+        # Handle different experiment types flexibly
+        if 'users' in exp:
+            param_desc = f"{exp['users']} users"
+        elif 'clip-radius' in exp:
+            param_desc = f"clip={exp['clip-radius']}"
+        else:
+            param_desc = exp.get('name', f"exp_{i}")
+        print(f"   {i:2d}. {param_desc} - {noise_type} correlation")
     
     print(f"\n" + "="*80)
     
@@ -377,7 +401,14 @@ def run_all_experiments(config):
         for i, experiment in enumerate(config["experiments"], 1):
             # Update main progress bar description
             noise_type = "Positive" if experiment.get('positively_correlated_noise') else "Negative"
-            main_pbar.set_description(f"🔬 Exp {i}/{len(config['experiments'])}: {experiment['users']} users ({noise_type})")
+            # Handle different experiment types flexibly
+            if 'users' in experiment:
+                param_desc = f"{experiment['users']} users"
+            elif 'clip-radius' in experiment:
+                param_desc = f"clip={experiment['clip-radius']}"
+            else:
+                param_desc = experiment.get('name', f"exp_{i}")
+            main_pbar.set_description(f"🔬 Exp {i}/{len(config['experiments'])}: {param_desc} - {noise_type}")
             
             print(f"\n{'='*80}")
             print(f"EXPERIMENT {i}/{len(config['experiments'])}")
@@ -449,13 +480,13 @@ def analyze_results(results, config):
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(results)
     
-    # Group by user count and experiment type
-    user_counts = sorted(df['users'].unique())
+    # Group by clip radius and experiment type
+    clip_radii = sorted(df['users'].unique())
     
     # Print basic analysis summary
-    print_basic_analysis_summary(results, config, user_counts)
+    print_basic_analysis_summary(results, config, clip_radii)
 
-def print_basic_analysis_summary(results, config, user_counts):
+def print_basic_analysis_summary(results, config, clip_radii):
     """Print a basic analysis summary without plotting"""
     print(f"\n" + "="*60)
     print(f"CONFIGURATION-DRIVEN VALIDATION SUMMARY")
@@ -466,7 +497,7 @@ def print_basic_analysis_summary(results, config, user_counts):
     print(f"   • Privacy: ε={config['common_args']['target-epsilon']}, δ={config['common_args']['delta']}")
     print(f"   • Epochs: {config['common_args']['epochs']}")
     print(f"   • Layers: {config['common_args']['dp-layer']}")
-    print(f"   • User counts tested: {user_counts}")
+    print(f"   • Users tested: {clip_radii}")
     
     # Group results by noise strategy
     positive_results = [r for r in results if r.get('noise_strategy') == 'positive']
@@ -477,13 +508,13 @@ def print_basic_analysis_summary(results, config, user_counts):
     print(f"     • Positive noise correlation: {len(positive_results)} experiments")
     print(f"     • Negative noise correlation: {len(negative_results)} experiments")
     
-    # Calculate wins for each user count
+    # Calculate wins for each clip radius
     wins = 0
     total_comparisons = 0
     
-    for uc in user_counts:
-        pos_data = [r for r in positive_results if r.get('users') == uc]
-        neg_data = [r for r in negative_results if r.get('users') == uc]
+    for cr in clip_radii:
+        pos_data = [r for r in positive_results if r.get('users') == cr]
+        neg_data = [r for r in negative_results if r.get('users') == cr]
         
         if pos_data and neg_data:
             pos_fisher = pos_data[0].get('fisher_dp', 0)
@@ -492,7 +523,7 @@ def print_basic_analysis_summary(results, config, user_counts):
                 wins += 1
             total_comparisons += 1
             
-            print(f"   {uc:3d} users:")
+            print(f"   {cr} users:")
             print(f"     • Positive Fisher DP: {pos_fisher:.2f}%")
             print(f"     • Negative Fisher DP: {neg_fisher:.2f}%")
             print(f"     • Advantage: {pos_fisher - neg_fisher:+.2f}%")
@@ -511,16 +542,82 @@ def print_basic_analysis_summary(results, config, user_counts):
     print(f"\n✅ Validation analysis complete")
 
 def main():
-    """Main validation function"""
+    """Main validation function with command line argument support"""
+    parser = argparse.ArgumentParser(
+        description='Configuration-Driven Validation Analysis',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Available Configuration Files (in validation_configs/):
+  validation_config_users_num.json      - User count sensitivity analysis
+  validation_config_clip_radius.json    - Clip radius sensitivity analysis
+
+Examples:
+  %(prog)s --config validation_config_users_num.json       # Run user count experiments
+  %(prog)s --config validation_config_clip_radius.json     # Run clip radius experiments
+  %(prog)s --list-configs                                   # List available config files
+        """
+    )
+    
+    parser.add_argument('--config', type=str, 
+                       help='Configuration file name (will look in validation_configs/ directory)')
+    parser.add_argument('--list-configs', action='store_true',
+                       help='List available configuration files and exit')
+    
+    args = parser.parse_args()
+    
     print("🎨 CONFIGURATION-DRIVEN VALIDATION ANALYSIS")
     print("=" * 60)
-    print("This script uses JSON configuration to run main.py with different")
-    print("settings, ensuring perfect consistency and eliminating drift.")
+    print("This script uses external JSON configuration files to run main.py")
+    print("with different settings, ensuring perfect consistency and eliminating drift.")
     print("Results are saved for later plotting with visual_plotter.py")
     print("=" * 60)
     
-    # Load or create configuration
-    config = load_config()
+    # Handle list configs option
+    if args.list_configs:
+        print(f"\n📄 Available Configuration Files (validation_configs/):")
+        config_dir = 'validation_configs'
+        if os.path.exists(config_dir):
+            config_files = [f for f in os.listdir(config_dir) if f.startswith('validation_config_') and f.endswith('.json')]
+            if config_files:
+                for i, config_file in enumerate(config_files, 1):
+                    config_path = os.path.join(config_dir, config_file)
+                    try:
+                        with open(config_path, 'r') as f:
+                            config_data = json.load(f)
+                        exp_name = config_data.get('experiment_name', 'Unknown')
+                        exp_count = len(config_data.get('experiments', []))
+                        print(f"   {i}. {config_file}")
+                        print(f"      • Experiment: {exp_name}")
+                        print(f"      • Total experiments: {exp_count}")
+                    except Exception as e:
+                        print(f"   {i}. {config_file} (Error reading: {e})")
+            else:
+                print("   No configuration files found matching pattern 'validation_config_*.json'")
+        else:
+            print("   validation_configs/ directory not found")
+        return None
+    
+    # Require config file
+    if not args.config:
+        print("❌ Error: --config argument is required")
+        print("\n📄 Available configuration files (validation_configs/):")
+        config_dir = 'validation_configs'
+        if os.path.exists(config_dir):
+            config_files = [f for f in os.listdir(config_dir) if f.startswith('validation_config_') and f.endswith('.json')]
+            for i, config_file in enumerate(config_files, 1):
+                print(f"   {i}. {config_file}")
+        else:
+            print("   validation_configs/ directory not found")
+        print(f"\nUsage: python {os.path.basename(__file__)} --config <config_file>")
+        print(f"   or: python {os.path.basename(__file__)} --list-configs")
+        return None
+    
+    # Load configuration
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        return None
     
     # Run all experiments
     results, results_file = run_all_experiments(config)

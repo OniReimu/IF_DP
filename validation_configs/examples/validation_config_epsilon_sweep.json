@@ -1,0 +1,24 @@
+{
+  "experiment_name": "epsilon_and_layer_sensitivity_analysis",
+  "description": "Comprehensive sweep of epsilon values and DP layers with both noise strategies",
+  "base_command": "uv run main.py",
+  "common_args": {
+    "k": 128,
+    "epochs": 30,
+    "users": 100,
+    "delta": 1e-6,
+    "mps": true,
+    "run-mia": true,
+    "compare-others": true,
+    "adaptive-clip": true
+  },
+  "parameter_grid": {
+    "target-epsilon": [1.0, 5.0, 10.0, 20.0],
+    "dp-layer": ["conv1", "conv1,conv2", "all"],
+    "noise_strategy": ["positive", "negative"]
+  },
+  "output_settings": {
+    "results_dir": "validation_results",
+    "save_logs": false
+  }
+} 
