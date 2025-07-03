@@ -1,0 +1,97 @@
+{
+  "experiment_name": "epsilon_sensitivity_analysis",
+  "base_command": "uv run main.py",
+  "common_args": {
+    "k": 2048,
+    "epochs": 50,
+    "dataset-size": 50000,
+    "delta": 1e-05,
+    "clip-radius": 2.0,
+    "users": 200,
+    "dp-layer": "conv1,conv2",
+    "mps": true,
+    "clean": true,
+    "compare-others": true,
+    "run-mia": true
+  },
+  "experiments": [
+    {
+      "name": "eps_0.01_positive",
+      "target-epsilon": 0.01,
+      "positively_correlated_noise": true,
+      "description": "ε=0.01 with positively correlated noise"
+    },
+    {
+      "name": "eps_0.01_negative",
+      "target-epsilon": 0.01,
+      "negatively_correlated_noise": true,
+      "description": "ε=0.01 with negatively correlated noise (default)"
+    },
+    {
+      "name": "eps_0.1_positive",
+      "target-epsilon": 0.1,
+      "positively_correlated_noise": true,
+      "description": "ε=0.1 with positively correlated noise"
+    },
+    {
+      "name": "eps_0.1_negative",
+      "target-epsilon": 0.1,
+      "negatively_correlated_noise": true,
+      "description": "ε=0.1 with negatively correlated noise (default)"
+    },
+    {
+      "name": "eps_1.0_positive",
+      "target-epsilon": 1.0,
+      "positively_correlated_noise": true,
+      "description": "ε=1.0 with positively correlated noise"
+    },
+    {
+      "name": "eps_1.0_negative",
+      "target-epsilon": 1.0,
+      "negatively_correlated_noise": true,
+      "description": "ε=1.0 with negatively correlated noise (default)"
+    },
+    {
+      "name": "eps_2.0_positive",
+      "target-epsilon": 2.0,
+      "positively_correlated_noise": true,
+      "description": "ε=2.0 with positively correlated noise"
+    },
+    {
+      "name": "eps_2.0_negative",
+      "target-epsilon": 2.0,
+      "negatively_correlated_noise": true,
+      "description": "ε=2.0 with negatively correlated noise (default)"
+    },
+    {
+      "name": "eps_5.0_positive",
+      "target-epsilon": 5.0,
+      "positively_correlated_noise": true,
+      "description": "ε=5.0 with positively correlated noise"
+    },
+    {
+      "name": "eps_5.0_negative",
+      "target-epsilon": 5.0,
+      "negatively_correlated_noise": true,
+      "description": "ε=5.0 with negatively correlated noise (default)"
+    },
+    {
+      "name": "eps_10.0_positive",
+      "target-epsilon": 10.0,
+      "positively_correlated_noise": true,
+      "description": "ε=10.0 with positively correlated noise"
+    },
+    {
+      "name": "eps_10.0_negative",
+      "target-epsilon": 10.0,
+      "negatively_correlated_noise": true,
+      "description": "ε=10.0 with negatively correlated noise (default)"
+    }
+  ],
+  "output_settings": {
+    "results_dir": "validation_results",
+    "plots_dir": "validation_plots",
+    "save_logs": true,
+    "figure_dpi": 300
+  }
+} 

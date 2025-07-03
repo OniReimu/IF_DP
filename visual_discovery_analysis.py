@@ -480,24 +480,97 @@ def analyze_results(results, config):
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(results)
     
-    # Group by clip radius and experiment type
-    clip_radii = sorted(df['users'].unique())
+    # Detect what parameter is varying and get its values
+    varying_param, param_values = detect_varying_parameter(results, config)
     
     # Print basic analysis summary
-    print_basic_analysis_summary(results, config, clip_radii)
+    print_basic_analysis_summary(results, config, varying_param, param_values)
 
-def print_basic_analysis_summary(results, config, clip_radii):
-    """Print a basic analysis summary without plotting"""
+def detect_varying_parameter(results, config):
+    """Detect which parameter is being varied across experiments"""
+    if not results:
+        return 'users', []
+    
+    # Check common parameters that might vary
+    param_candidates = ['users', 'target-epsilon', 'clip-radius', 'dp-layer', 'k']
+    
+    for param in param_candidates:
+        values = []
+        
+        # Check if this parameter varies across experiments
+        for result in results:
+            # Try to get value from experiment metadata or parsed fields
+            if param == 'target-epsilon':
+                # For epsilon experiments, check experiment_name or direct field
+                if 'experiment_name' in result and 'eps_' in result['experiment_name']:
+                    exp_name = result['experiment_name']
+                    parts = exp_name.split('_')
+                    for i, part in enumerate(parts):
+                        if part == 'eps' and i + 1 < len(parts):
+                            try:
+                                values.append(float(parts[i + 1]))
+                                break
+                            except ValueError:
+                                pass
+                elif param in result:
+                    values.append(result[param])
+            elif param == 'clip-radius':
+                # For clip radius experiments
+                if 'experiment_name' in result and 'clip_' in result['experiment_name']:
+                    exp_name = result['experiment_name']
+                    parts = exp_name.split('_')
+                    for i, part in enumerate(parts):
+                        if part == 'clip' and i + 1 < len(parts):
+                            try:
+                                values.append(float(parts[i + 1]))
+                                break
+                            except ValueError:
+                                pass
+                elif param in result:
+                    values.append(result[param])
+            else:
+                # For other parameters, try direct access
+                if param in result:
+                    values.append(result[param])
+        
+        # Check if this parameter actually varies
+        unique_values = list(set(values))
+        if len(unique_values) > 1:
+            return param, sorted(unique_values)
+    
+    # Fallback to users if no clear varying parameter detected
+    user_values = [r.get('users', 0) for r in results]
+    return 'users', sorted(set(user_values))
+
+def print_basic_analysis_summary(results, config, varying_param, param_values):
+    """Print a basic analysis summary without plotting - parameter agnostic"""
     print(f"\n" + "="*60)
     print(f"CONFIGURATION-DRIVEN VALIDATION SUMMARY")
     print(f"="*60)
     
     print(f"📊 Experiment Configuration:")
     print(f"   • Fisher k: {config['common_args']['k']}")
-    print(f"   • Privacy: ε={config['common_args']['target-epsilon']}, δ={config['common_args']['delta']}")
+    
+    # Handle epsilon specially - it might be varying or fixed
+    if varying_param == 'target-epsilon':
+        print(f"   • Privacy: ε=VARYING ({param_values}), δ={config['common_args']['delta']}")
+    else:
+        epsilon_val = config['common_args'].get('target-epsilon', 'N/A')
+        print(f"   • Privacy: ε={epsilon_val}, δ={config['common_args']['delta']}")
+    
     print(f"   • Epochs: {config['common_args']['epochs']}")
     print(f"   • Layers: {config['common_args']['dp-layer']}")
-    print(f"   • Users tested: {clip_radii}")
+    
+    # Show what parameter is being varied
+    if varying_param == 'users':
+        print(f"   • Users tested: {param_values}")
+    elif varying_param == 'target-epsilon':
+        print(f"   • Epsilon values tested: {param_values}")
+    elif varying_param == 'clip-radius':
+        print(f"   • Clip radius values tested: {param_values}")
+        print(f"   • Users: {config['common_args']['users']}")
+    else:
+        print(f"   • Varying parameter: {varying_param} = {param_values}")
     
     # Group results by noise strategy
     positive_results = [r for r in results if r.get('noise_strategy') == 'positive']
@@ -508,13 +581,22 @@ def print_basic_analysis_summary(results, config, clip_radii):
     print(f"     • Positive noise correlation: {len(positive_results)} experiments")
     print(f"     • Negative noise correlation: {len(negative_results)} experiments")
     
-    # Calculate wins for each clip radius
+    # Calculate wins for each parameter value
     wins = 0
     total_comparisons = 0
     
-    for cr in clip_radii:
-        pos_data = [r for r in positive_results if r.get('users') == cr]
-        neg_data = [r for r in negative_results if r.get('users') == cr]
+    for param_val in param_values:
+        # Get results for this parameter value
+        pos_data = []
+        neg_data = []
+        
+        for r in positive_results:
+            if get_param_value_from_result(r, varying_param) == param_val:
+                pos_data.append(r)
+        
+        for r in negative_results:
+            if get_param_value_from_result(r, varying_param) == param_val:
+                neg_data.append(r)
         
         if pos_data and neg_data:
             pos_fisher = pos_data[0].get('fisher_dp', 0)
@@ -523,7 +605,17 @@ def print_basic_analysis_summary(results, config, clip_radii):
                 wins += 1
             total_comparisons += 1
             
-            print(f"   {cr} users:")
+            # Format parameter value for display
+            if varying_param == 'target-epsilon':
+                param_display = f"ε={param_val}"
+            elif varying_param == 'clip-radius':
+                param_display = f"clip={param_val}"
+            elif varying_param == 'users':
+                param_display = f"{param_val} users"
+            else:
+                param_display = f"{varying_param}={param_val}"
+            
+            print(f"   {param_display}:")
             print(f"     • Positive Fisher DP: {pos_fisher:.2f}%")
             print(f"     • Negative Fisher DP: {neg_fisher:.2f}%")
             print(f"     • Advantage: {pos_fisher - neg_fisher:+.2f}%")
@@ -540,6 +632,36 @@ def print_basic_analysis_summary(results, config, clip_radii):
     print(f"   • Use visual_plotter.py to generate comprehensive plots")
     print(f"   • Example: python visual_plotter.py --latest")
     print(f"\n✅ Validation analysis complete")
+
+def get_param_value_from_result(result, param_name):
+    """Extract parameter value from result for analysis"""
+    if param_name == 'target-epsilon':
+        # Try experiment name parsing first
+        if 'experiment_name' in result and 'eps_' in result['experiment_name']:
+            exp_name = result['experiment_name']
+            parts = exp_name.split('_')
+            for i, part in enumerate(parts):
+                if part == 'eps' and i + 1 < len(parts):
+                    try:
+                        return float(parts[i + 1])
+                    except ValueError:
+                        pass
+        # Fallback to direct field access
+        return result.get('target-epsilon', result.get('target_epsilon', 0))
+    elif param_name == 'clip-radius':
+        # Try experiment name parsing first
+        if 'experiment_name' in result and 'clip_' in result['experiment_name']:
+            exp_name = result['experiment_name']
+            parts = exp_name.split('_')
+            for i, part in enumerate(parts):
+                if part == 'clip' and i + 1 < len(parts):
+                    try:
+                        return float(parts[i + 1])
+                    except ValueError:
+                        pass
+        return result.get('clip-radius', result.get('clip_radius', 0))
+    else:
+        return result.get(param_name, 0)
 
 def main():
     """Main validation function with command line argument support"""

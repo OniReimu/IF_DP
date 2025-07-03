@@ -76,29 +76,177 @@ def load_results_from_json(json_file_path):
     
     return results, config
 
+def detect_experiment_parameter(results):
+    """Detect which parameter is being varied in the experiments"""
+    if not results:
+        return None, []
+    
+    # Check what parameters vary across experiments
+    varying_params = {}
+    
+    # Common parameters to check
+    param_keys = ['users', 'target-epsilon', 'clip-radius', 'dp-layer', 'k']
+    
+    for param in param_keys:
+        # Collect all values for this parameter
+        values = []
+        for result in results:
+            if param in result:
+                values.append(result[param])
+            # Also check experiment metadata for parsed values
+            elif 'experiment_name' in result:
+                # Try to extract parameter from experiment name
+                exp_name = result['experiment_name']
+                if 'eps_' in exp_name and param == 'target-epsilon':
+                    # Extract epsilon value from name like "eps_1.0_layer_c1_pos"
+                    parts = exp_name.split('_')
+                    for i, part in enumerate(parts):
+                        if part == 'eps' and i + 1 < len(parts):
+                            try:
+                                values.append(float(parts[i + 1]))
+                            except ValueError:
+                                pass
+                elif 'clip_' in exp_name and param == 'clip-radius':
+                    # Extract clip value from name like "clip_1.0_pos"
+                    parts = exp_name.split('_')
+                    for i, part in enumerate(parts):
+                        if part == 'clip' and i + 1 < len(parts):
+                            try:
+                                values.append(float(parts[i + 1]))
+                            except ValueError:
+                                pass
+                elif 'u' in exp_name and param == 'users':
+                    # Extract users from name like "u100_pos"
+                    parts = exp_name.split('_')
+                    for part in parts:
+                        if part.startswith('u') and len(part) > 1:
+                            try:
+                                values.append(int(part[1:]))
+                            except ValueError:
+                                pass
+        
+        # Check if this parameter actually varies
+        unique_values = list(set(values))
+        if len(unique_values) > 1:
+            varying_params[param] = sorted(unique_values)
+    
+    # Determine the primary varying parameter
+    if 'users' in varying_params:
+        return 'users', varying_params['users']
+    elif 'target-epsilon' in varying_params:
+        return 'target-epsilon', varying_params['target-epsilon']
+    elif 'clip-radius' in varying_params:
+        return 'clip-radius', varying_params['clip-radius']
+    elif 'dp-layer' in varying_params:
+        return 'dp-layer', varying_params['dp-layer']
+    elif 'k' in varying_params:
+        return 'k', varying_params['k']
+    else:
+        # Fallback to users if no clear parameter is detected
+        user_counts = [r.get('users', 0) for r in results]
+        return 'users', sorted(set(user_counts))
+
+def get_parameter_value(result, param_name):
+    """Extract parameter value from result, handling different formats"""
+    # Direct parameter access
+    if param_name in result:
+        return result[param_name]
+    
+    # Extract from experiment name for grid-generated experiments
+    if 'experiment_name' in result:
+        exp_name = result['experiment_name']
+        
+        if param_name == 'target-epsilon' and 'eps_' in exp_name:
+            parts = exp_name.split('_')
+            for i, part in enumerate(parts):
+                if part == 'eps' and i + 1 < len(parts):
+                    try:
+                        return float(parts[i + 1])
+                    except ValueError:
+                        pass
+        elif param_name == 'clip-radius' and 'clip_' in exp_name:
+            parts = exp_name.split('_')
+            for i, part in enumerate(parts):
+                if part == 'clip' and i + 1 < len(parts):
+                    try:
+                        return float(parts[i + 1])
+                    except ValueError:
+                        pass
+        elif param_name == 'users' and 'u' in exp_name:
+            parts = exp_name.split('_')
+            for part in parts:
+                if part.startswith('u') and len(part) > 1:
+                    try:
+                        return int(part[1:])
+                    except ValueError:
+                        pass
+    
+    # Fallback defaults
+    if param_name == 'users':
+        return result.get('users', 0)
+    else:
+        return 0
+
+def get_axis_label(param_name):
+    """Get appropriate axis label for parameter"""
+    labels = {
+        'users': 'Number of Users',
+        'target-epsilon': 'Privacy Budget (ε)',
+        'clip-radius': 'Clipping Radius',
+        'dp-layer': 'DP Layers',
+        'k': 'Fisher Subspace Dimension (k)'
+    }
+    return labels.get(param_name, param_name.replace('-', ' ').title())
+
+def get_parameter_display_value(param_name, value):
+    """Format parameter value for display"""
+    if param_name == 'dp-layer':
+        # Clean up layer names for display
+        if value == 'conv1':
+            return 'Conv1'
+        elif value == 'conv1,conv2':
+            return 'Conv1+2'
+        elif value == 'all':
+            return 'All'
+        else:
+            return str(value)
+    else:
+        return value
+
 def analyze_results_from_json(results, config=None):
-    """Convert JSON results to plot data structure including MIA data"""
+    """Convert JSON results to plot data structure including MIA data - parameter agnostic"""
     if not results:
         print("❌ No results to analyze")
         return {}
     
     print(f"📊 Analyzing {len(results)} experimental results...")
     
+    # Detect what parameter is being varied
+    param_name, param_values = detect_experiment_parameter(results)
+    print(f"🔍 Detected varying parameter: {param_name} with values: {param_values}")
+    
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(results)
     
-    # Group by user count and experiment type
-    user_counts = sorted(df['users'].unique())
-    
     # Prepare data for plotting
     plot_data = {}
-    for user_count in user_counts:
-        user_data = df[df['users'] == user_count]
+    for param_value in param_values:
+        # Filter results for this parameter value
+        param_data = []
+        for result in results:
+            result_param_value = get_parameter_value(result, param_name)
+            if result_param_value == param_value:
+                param_data.append(result)
         
-        positive_data = user_data[user_data['noise_strategy'] == 'positive']
-        negative_data = user_data[user_data['noise_strategy'] == 'negative']
+        if not param_data:
+            continue
+            
+        param_df = pd.DataFrame(param_data)
         
-        plot_data[user_count] = {
+        positive_data = param_df[param_df['noise_strategy'] == 'positive']
+        negative_data = param_df[param_df['noise_strategy'] == 'negative']
+        
+        plot_data[param_value] = {
             'baseline': 0,
             'positive_fisher': 0,
             'negative_fisher': 0,
@@ -123,42 +271,49 @@ def analyze_results_from_json(results, config=None):
         # Extract positively correlated data
         if len(positive_data) > 0:
             pos_row = positive_data.iloc[0]
-            plot_data[user_count]['positive_fisher'] = pos_row.get('fisher_dp', 0)
-            plot_data[user_count]['positive_vanilla'] = pos_row.get('vanilla_dp', 0)
-            plot_data[user_count]['positive_dp_sat'] = pos_row.get('dp_sat', 0)
-            plot_data[user_count]['baseline'] = pos_row.get('baseline', 0)
+            plot_data[param_value]['positive_fisher'] = pos_row.get('fisher_dp', 0)
+            plot_data[param_value]['positive_vanilla'] = pos_row.get('vanilla_dp', 0)
+            plot_data[param_value]['positive_dp_sat'] = pos_row.get('dp_sat', 0)
+            plot_data[param_value]['baseline'] = pos_row.get('baseline', 0)
             
             # MIA data from positive experiments
             # Try both formats for backward compatibility
-            plot_data[user_count]['baseline_confidence_auc'] = pos_row.get('baseline_confidence_auc', pos_row.get('baseline_conf_auc', 0))
-            plot_data[user_count]['fisher_dp_confidence_auc_positive'] = pos_row.get('fisher_dp_confidence_auc', pos_row.get('fisher_dp_conf_auc', 0))
-            plot_data[user_count]['vanilla_dp_confidence_auc'] = pos_row.get('vanilla_dp_confidence_auc', pos_row.get('vanilla_dp_conf_auc', 0))
-            plot_data[user_count]['dp_sat_confidence_auc'] = pos_row.get('dp_sat_confidence_auc', pos_row.get('dp_sat_conf_auc', 0))
+            plot_data[param_value]['baseline_confidence_auc'] = pos_row.get('baseline_confidence_auc', pos_row.get('baseline_conf_auc', 0))
+            plot_data[param_value]['fisher_dp_confidence_auc_positive'] = pos_row.get('fisher_dp_confidence_auc', pos_row.get('fisher_dp_conf_auc', 0))
+            plot_data[param_value]['vanilla_dp_confidence_auc'] = pos_row.get('vanilla_dp_confidence_auc', pos_row.get('vanilla_dp_conf_auc', 0))
+            plot_data[param_value]['dp_sat_confidence_auc'] = pos_row.get('dp_sat_confidence_auc', pos_row.get('dp_sat_conf_auc', 0))
             
-            plot_data[user_count]['baseline_shadow_auc'] = pos_row.get('baseline_shadow_auc', 0)
-            plot_data[user_count]['fisher_dp_shadow_auc_positive'] = pos_row.get('fisher_dp_shadow_auc', 0)
-            plot_data[user_count]['vanilla_dp_shadow_auc'] = pos_row.get('vanilla_dp_shadow_auc', 0)
-            plot_data[user_count]['dp_sat_shadow_auc'] = pos_row.get('dp_sat_shadow_auc', 0)
+            plot_data[param_value]['baseline_shadow_auc'] = pos_row.get('baseline_shadow_auc', 0)
+            plot_data[param_value]['fisher_dp_shadow_auc_positive'] = pos_row.get('fisher_dp_shadow_auc', 0)
+            plot_data[param_value]['vanilla_dp_shadow_auc'] = pos_row.get('vanilla_dp_shadow_auc', 0)
+            plot_data[param_value]['dp_sat_shadow_auc'] = pos_row.get('dp_sat_shadow_auc', 0)
         
         # Extract negatively correlated data
         if len(negative_data) > 0:
             neg_row = negative_data.iloc[0]
-            plot_data[user_count]['negative_fisher'] = neg_row.get('fisher_dp', 0)
-            plot_data[user_count]['negative_vanilla'] = neg_row.get('vanilla_dp', 0)
-            plot_data[user_count]['negative_dp_sat'] = neg_row.get('dp_sat', 0)
+            plot_data[param_value]['negative_fisher'] = neg_row.get('fisher_dp', 0)
+            plot_data[param_value]['negative_vanilla'] = neg_row.get('vanilla_dp', 0)
+            plot_data[param_value]['negative_dp_sat'] = neg_row.get('dp_sat', 0)
             
             # MIA data from negative experiments - try both formats
-            plot_data[user_count]['fisher_dp_confidence_auc_negative'] = neg_row.get('fisher_dp_confidence_auc', neg_row.get('fisher_dp_conf_auc', 0))
-            plot_data[user_count]['fisher_dp_shadow_auc_negative'] = neg_row.get('fisher_dp_shadow_auc', 0)
+            plot_data[param_value]['fisher_dp_confidence_auc_negative'] = neg_row.get('fisher_dp_confidence_auc', neg_row.get('fisher_dp_conf_auc', 0))
+            plot_data[param_value]['fisher_dp_shadow_auc_negative'] = neg_row.get('fisher_dp_shadow_auc', 0)
         
         # Calculate strategy difference
-        if plot_data[user_count]['positive_fisher'] > 0 and plot_data[user_count]['negative_fisher'] > 0:
-            plot_data[user_count]['strategy_difference'] = plot_data[user_count]['positive_fisher'] - plot_data[user_count]['negative_fisher']
+        if plot_data[param_value]['positive_fisher'] > 0 and plot_data[param_value]['negative_fisher'] > 0:
+            plot_data[param_value]['strategy_difference'] = plot_data[param_value]['positive_fisher'] - plot_data[param_value]['negative_fisher']
+    
+    # Store metadata about the detected parameter
+    plot_data['_metadata'] = {
+        'parameter_name': param_name,
+        'parameter_values': param_values,
+        'axis_label': get_axis_label(param_name)
+    }
     
     return plot_data
 
 def create_validation_plots(plot_data, config=None, output_dir="validation_plots", json_file_path=None):
-    """Create comprehensive validation plots from plot data"""
+    """Create comprehensive validation plots from plot data - parameter agnostic"""
     if not plot_data:
         print("❌ No plot data available")
         return
@@ -166,8 +321,16 @@ def create_validation_plots(plot_data, config=None, output_dir="validation_plots
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    user_counts = list(plot_data.keys())
-    strategy_diffs = [plot_data[uc]['strategy_difference'] for uc in user_counts]
+    # Extract metadata
+    metadata = plot_data.get('_metadata', {})
+    param_name = metadata.get('parameter_name', 'users')
+    axis_label = metadata.get('axis_label', 'Parameter Value')
+    
+    # Get parameter values (excluding metadata)
+    param_values = [k for k in plot_data.keys() if k != '_metadata']
+    param_values = sorted(param_values)
+    
+    strategy_diffs = [plot_data[pv]['strategy_difference'] for pv in param_values]
     
     # Extract config values with defaults
     if config and 'common_args' in config:
@@ -189,37 +352,61 @@ def create_validation_plots(plot_data, config=None, output_dir="validation_plots
     fig.suptitle(f'Visual Plotter: Fisher DP Validation Results{seed_info}\n{title_suffix}', 
                 fontsize=16, fontweight='bold')
     
+    # Handle categorical x-axis (like dp-layer) vs numerical
+    is_categorical = param_name in ['dp-layer']
+    if is_categorical:
+        x_positions = range(len(param_values))
+        x_labels = [get_parameter_display_value(param_name, pv) for pv in param_values]
+    else:
+        x_positions = param_values
+        x_labels = param_values
+    
     # Plot 1: Key Discovery: Positively Correlated Advantage
     ax1 = axes[0, 0]
-    ax1.plot(user_counts, strategy_diffs, 'o-', linewidth=3, markersize=8, color='darkred')
+    if is_categorical:
+        ax1.plot(x_positions, strategy_diffs, 'o-', linewidth=3, markersize=8, color='darkred')
+        ax1.set_xticks(x_positions)
+        ax1.set_xticklabels(x_labels)
+    else:
+        ax1.plot(param_values, strategy_diffs, 'o-', linewidth=3, markersize=8, color='darkred')
+    
     ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
-    ax1.fill_between(user_counts, strategy_diffs, 0, alpha=0.3, color='darkred')
-    ax1.set_xlabel('Number of Users')
+    ax1.fill_between(x_positions if is_categorical else param_values, strategy_diffs, 0, alpha=0.3, color='darkred')
+    ax1.set_xlabel(axis_label)
     ax1.set_ylabel('Positively Correlated Advantage (%)')
     ax1.set_title('Key Discovery: Positively Correlated Advantage')
     ax1.grid(True, alpha=0.3)
     
     # Highlight positive values
-    for x, y in zip(user_counts, strategy_diffs):
+    for x, y in zip(x_positions if is_categorical else param_values, strategy_diffs):
         if y > 0.5:
             ax1.annotate(f'+{y:.1f}%', (x, y), textcoords="offset points", 
                         xytext=(0,10), ha='center', fontweight='bold', color='darkred')
     
     # Plot 2: All Methods Comparison
     ax2 = axes[0, 1]
-    positive_fisher = [plot_data[uc]['positive_fisher'] for uc in user_counts]
-    negative_fisher = [plot_data[uc]['negative_fisher'] for uc in user_counts]
-    vanilla_accs = [plot_data[uc]['positive_vanilla'] for uc in user_counts]
-    dp_sat_accs = [plot_data[uc]['positive_dp_sat'] for uc in user_counts]
-    baseline_accs = [plot_data[uc]['baseline'] for uc in user_counts]
+    positive_fisher = [plot_data[pv]['positive_fisher'] for pv in param_values]
+    negative_fisher = [plot_data[pv]['negative_fisher'] for pv in param_values]
+    vanilla_accs = [plot_data[pv]['positive_vanilla'] for pv in param_values]
+    dp_sat_accs = [plot_data[pv]['positive_dp_sat'] for pv in param_values]
+    baseline_accs = [plot_data[pv]['baseline'] for pv in param_values]
     
-    ax2.plot(user_counts, positive_fisher, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
-    ax2.plot(user_counts, negative_fisher, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
-    ax2.plot(user_counts, vanilla_accs, '^-', label='Vanilla DP', linewidth=2, markersize=6)
-    ax2.plot(user_counts, dp_sat_accs, 'd-', label='DP-SAT', linewidth=2, markersize=6)
-    ax2.plot(user_counts, baseline_accs, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
+    if is_categorical:
+        ax2.plot(x_positions, positive_fisher, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
+        ax2.plot(x_positions, negative_fisher, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
+        ax2.plot(x_positions, vanilla_accs, '^-', label='Vanilla DP', linewidth=2, markersize=6)
+        ax2.plot(x_positions, dp_sat_accs, 'd-', label='DP-SAT', linewidth=2, markersize=6)
+        ax2.plot(x_positions, baseline_accs, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
+        ax2.set_xticks(x_positions)
+        ax2.set_xticklabels(x_labels)
+    else:
+        ax2.plot(param_values, positive_fisher, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
+        ax2.plot(param_values, negative_fisher, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
+        ax2.plot(param_values, vanilla_accs, '^-', label='Vanilla DP', linewidth=2, markersize=6)
+        ax2.plot(param_values, dp_sat_accs, 'd-', label='DP-SAT', linewidth=2, markersize=6)
+        ax2.plot(param_values, baseline_accs, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
     
-    ax2.set_xlabel('Number of Users')
+    ax2.set_xlabel(axis_label)
     ax2.set_ylabel('Test Accuracy (%)')
     ax2.set_title('All Methods Comparison')
     ax2.legend()
@@ -227,19 +414,28 @@ def create_validation_plots(plot_data, config=None, output_dir="validation_plots
     
     # Plot 3: Privacy: Confidence Attack Results (Lower is Better)
     ax3 = axes[1, 0]
-    baseline_conf = [plot_data[uc]['baseline_confidence_auc'] for uc in user_counts]
-    fisher_conf_pos = [plot_data[uc]['fisher_dp_confidence_auc_positive'] for uc in user_counts]
-    fisher_conf_neg = [plot_data[uc]['fisher_dp_confidence_auc_negative'] for uc in user_counts]
-    vanilla_conf = [plot_data[uc]['vanilla_dp_confidence_auc'] for uc in user_counts]
-    dp_sat_conf = [plot_data[uc]['dp_sat_confidence_auc'] for uc in user_counts]
+    baseline_conf = [plot_data[pv]['baseline_confidence_auc'] for pv in param_values]
+    fisher_conf_pos = [plot_data[pv]['fisher_dp_confidence_auc_positive'] for pv in param_values]
+    fisher_conf_neg = [plot_data[pv]['fisher_dp_confidence_auc_negative'] for pv in param_values]
+    vanilla_conf = [plot_data[pv]['vanilla_dp_confidence_auc'] for pv in param_values]
+    dp_sat_conf = [plot_data[pv]['dp_sat_confidence_auc'] for pv in param_values]
     
     # Only plot if we have MIA data
     if any(baseline_conf) or any(fisher_conf_pos) or any(vanilla_conf):
-        ax3.plot(user_counts, baseline_conf, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
-        ax3.plot(user_counts, fisher_conf_pos, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
-        ax3.plot(user_counts, fisher_conf_neg, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
-        ax3.plot(user_counts, vanilla_conf, '^-', label='Vanilla DP', linewidth=2, markersize=6)
-        ax3.plot(user_counts, dp_sat_conf, 'd-', label='DP-SAT', linewidth=2, markersize=6)
+        if is_categorical:
+            ax3.plot(x_positions, baseline_conf, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
+            ax3.plot(x_positions, fisher_conf_pos, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
+            ax3.plot(x_positions, fisher_conf_neg, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
+            ax3.plot(x_positions, vanilla_conf, '^-', label='Vanilla DP', linewidth=2, markersize=6)
+            ax3.plot(x_positions, dp_sat_conf, 'd-', label='DP-SAT', linewidth=2, markersize=6)
+            ax3.set_xticks(x_positions)
+            ax3.set_xticklabels(x_labels)
+        else:
+            ax3.plot(param_values, baseline_conf, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
+            ax3.plot(param_values, fisher_conf_pos, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
+            ax3.plot(param_values, fisher_conf_neg, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
+            ax3.plot(param_values, vanilla_conf, '^-', label='Vanilla DP', linewidth=2, markersize=6)
+            ax3.plot(param_values, dp_sat_conf, 'd-', label='DP-SAT', linewidth=2, markersize=6)
         
         ax3.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7, label='Random (0.5)')
         ax3.set_ylim(0.4, max(0.8, max(baseline_conf + fisher_conf_pos + vanilla_conf + dp_sat_conf) + 0.05))
@@ -247,7 +443,7 @@ def create_validation_plots(plot_data, config=None, output_dir="validation_plots
         ax3.text(0.5, 0.5, 'No MIA Confidence Data Available', transform=ax3.transAxes, 
                 ha='center', va='center', fontsize=12, style='italic')
     
-    ax3.set_xlabel('Number of Users')
+    ax3.set_xlabel(axis_label)
     ax3.set_ylabel('Confidence Attack AUC')
     ax3.set_title('Privacy: Confidence Attack Results (Lower is Better)')
     ax3.legend()
@@ -255,19 +451,28 @@ def create_validation_plots(plot_data, config=None, output_dir="validation_plots
     
     # Plot 4: Privacy: Shadow Attack Results (Lower is Better)
     ax4 = axes[1, 1]
-    baseline_shadow = [plot_data[uc]['baseline_shadow_auc'] for uc in user_counts]
-    fisher_shadow_pos = [plot_data[uc]['fisher_dp_shadow_auc_positive'] for uc in user_counts]
-    fisher_shadow_neg = [plot_data[uc]['fisher_dp_shadow_auc_negative'] for uc in user_counts]
-    vanilla_shadow = [plot_data[uc]['vanilla_dp_shadow_auc'] for uc in user_counts]
-    dp_sat_shadow = [plot_data[uc]['dp_sat_shadow_auc'] for uc in user_counts]
+    baseline_shadow = [plot_data[pv]['baseline_shadow_auc'] for pv in param_values]
+    fisher_shadow_pos = [plot_data[pv]['fisher_dp_shadow_auc_positive'] for pv in param_values]
+    fisher_shadow_neg = [plot_data[pv]['fisher_dp_shadow_auc_negative'] for pv in param_values]
+    vanilla_shadow = [plot_data[pv]['vanilla_dp_shadow_auc'] for pv in param_values]
+    dp_sat_shadow = [plot_data[pv]['dp_sat_shadow_auc'] for pv in param_values]
     
     # Only plot if we have MIA data
     if any(baseline_shadow) or any(fisher_shadow_pos) or any(vanilla_shadow):
-        ax4.plot(user_counts, baseline_shadow, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
-        ax4.plot(user_counts, fisher_shadow_pos, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
-        ax4.plot(user_counts, fisher_shadow_neg, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
-        ax4.plot(user_counts, vanilla_shadow, '^-', label='Vanilla DP', linewidth=2, markersize=6)
-        ax4.plot(user_counts, dp_sat_shadow, 'd-', label='DP-SAT', linewidth=2, markersize=6)
+        if is_categorical:
+            ax4.plot(x_positions, baseline_shadow, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
+            ax4.plot(x_positions, fisher_shadow_pos, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
+            ax4.plot(x_positions, fisher_shadow_neg, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
+            ax4.plot(x_positions, vanilla_shadow, '^-', label='Vanilla DP', linewidth=2, markersize=6)
+            ax4.plot(x_positions, dp_sat_shadow, 'd-', label='DP-SAT', linewidth=2, markersize=6)
+            ax4.set_xticks(x_positions)
+            ax4.set_xticklabels(x_labels)
+        else:
+            ax4.plot(param_values, baseline_shadow, 'x-', label='Baseline', linewidth=2, markersize=6, alpha=0.7)
+            ax4.plot(param_values, fisher_shadow_pos, 'o-', label='Fisher DP (Positive)', linewidth=2, markersize=6)
+            ax4.plot(param_values, fisher_shadow_neg, 's-', label='Fisher DP (Negative)', linewidth=2, markersize=6)
+            ax4.plot(param_values, vanilla_shadow, '^-', label='Vanilla DP', linewidth=2, markersize=6)
+            ax4.plot(param_values, dp_sat_shadow, 'd-', label='DP-SAT', linewidth=2, markersize=6)
         
         ax4.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7, label='Random (0.5)')
         ax4.set_ylim(0.4, max(0.8, max(baseline_shadow + fisher_shadow_pos + vanilla_shadow + dp_sat_shadow) + 0.05))
@@ -275,7 +480,7 @@ def create_validation_plots(plot_data, config=None, output_dir="validation_plots
         ax4.text(0.5, 0.5, 'No MIA Shadow Data Available', transform=ax4.transAxes, 
                 ha='center', va='center', fontsize=12, style='italic')
     
-    ax4.set_xlabel('Number of Users')
+    ax4.set_xlabel(axis_label)
     ax4.set_ylabel('Shadow Attack AUC')
     ax4.set_title('Privacy: Shadow Attack Results (Lower is Better)')
     ax4.legend()
@@ -314,13 +519,21 @@ def create_validation_plots(plot_data, config=None, output_dir="validation_plots
     return plot_file
 
 def print_analysis_summary(plot_data, config=None):
-    """Print a detailed analysis summary including MIA results"""
+    """Print a detailed analysis summary including MIA results - parameter agnostic"""
     print(f"\n" + "="*60)
     print(f"VISUAL PLOTTER ANALYSIS SUMMARY")
     print(f"="*60)
     
-    user_counts = list(plot_data.keys())
-    strategy_diffs = [plot_data[uc]['strategy_difference'] for uc in user_counts]
+    # Extract metadata
+    metadata = plot_data.get('_metadata', {})
+    param_name = metadata.get('parameter_name', 'users')
+    axis_label = metadata.get('axis_label', 'Parameter Value')
+    
+    # Get parameter values (excluding metadata)
+    param_values = [k for k in plot_data.keys() if k != '_metadata']
+    param_values = sorted(param_values)
+    
+    strategy_diffs = [plot_data[pv]['strategy_difference'] for pv in param_values]
     
     # Extract config information if available
     if config and 'common_args' in config:
@@ -336,22 +549,23 @@ def print_analysis_summary(plot_data, config=None):
     if config and 'metadata' in config and 'seed' in config['metadata']:
         print(f"   • Random seed: {config['metadata']['seed']}")
     
-    print(f"   • User counts tested: {user_counts}")
+    print(f"   • Varying parameter: {axis_label}")
+    print(f"   • Parameter values tested: {param_values}")
     
     print(f"\n🎯 Key Findings:")
     
     # Noise strategy results
     wins = sum(1 for d in strategy_diffs if d > 0.5)
     print(f"   📊 Noise Strategy Comparison:")
-    print(f"     • Positively correlated noise wins: {wins}/{len(user_counts)} conditions")
+    print(f"     • Positively correlated noise wins: {wins}/{len(param_values)} conditions")
     
     if wins > 0:
         best_idx = np.argmax(strategy_diffs)
-        best_user_count = user_counts[best_idx]
+        best_param_value = param_values[best_idx]
         best_advantage = strategy_diffs[best_idx]
-        print(f"     • Best condition: {best_user_count} users (+{best_advantage:.2f}% advantage)")
+        print(f"     • Best condition: {axis_label}={best_param_value} (+{best_advantage:.2f}% advantage)")
         
-        best_data = plot_data[best_user_count]
+        best_data = plot_data[best_param_value]
         print(f"     • At best condition:")
         print(f"       - Positively correlated Fisher DP: {best_data['positive_fisher']:.2f}%")
         print(f"       - Negatively correlated Fisher DP: {best_data['negative_fisher']:.2f}%")
@@ -359,15 +573,16 @@ def print_analysis_summary(plot_data, config=None):
         print(f"       - DP-SAT: {best_data['positive_dp_sat']:.2f}%")
     
     # Check if we have MIA data
-    has_mia_data = any(plot_data[uc]['baseline_confidence_auc'] > 0 for uc in user_counts)
+    has_mia_data = any(plot_data[pv]['baseline_confidence_auc'] > 0 for pv in param_values)
     
     if has_mia_data:
         print(f"\n🛡️  Privacy Analysis (MIA Results):")
         print(f"   📊 Confidence Attack AUCs (lower = better privacy):")
-        for uc in user_counts:
-            data = plot_data[uc]
+        for pv in param_values:
+            data = plot_data[pv]
             if data['baseline_confidence_auc'] > 0:
-                print(f"     {uc:3d} users:")
+                display_value = get_parameter_display_value(param_name, pv)
+                print(f"     {axis_label}={display_value}:")
                 print(f"       - Baseline: {data['baseline_confidence_auc']:.4f}")
                 print(f"       - Fisher DP (Pos): {data['fisher_dp_confidence_auc_positive']:.4f}")
                 print(f"       - Fisher DP (Neg): {data['fisher_dp_confidence_auc_negative']:.4f}")
@@ -375,10 +590,11 @@ def print_analysis_summary(plot_data, config=None):
                 print(f"       - DP-SAT: {data['dp_sat_confidence_auc']:.4f}")
         
         print(f"\n   📊 Shadow Attack AUCs (lower = better privacy):")
-        for uc in user_counts:
-            data = plot_data[uc]
+        for pv in param_values:
+            data = plot_data[pv]
             if data['baseline_shadow_auc'] > 0:
-                print(f"     {uc:3d} users:")
+                display_value = get_parameter_display_value(param_name, pv)
+                print(f"     {axis_label}={display_value}:")
                 print(f"       - Baseline: {data['baseline_shadow_auc']:.4f}")
                 print(f"       - Fisher DP (Pos): {data['fisher_dp_shadow_auc_positive']:.4f}")
                 print(f"       - Fisher DP (Neg): {data['fisher_dp_shadow_auc_negative']:.4f}")
@@ -389,10 +605,11 @@ def print_analysis_summary(plot_data, config=None):
         print(f"   ⚠️  No MIA data available in results")
         print(f"   💡 Run experiments with --run-mia flag to get privacy analysis")
     
-    print(f"\n📈 Detailed Results by User Count:")
-    for uc in user_counts:
-        data = plot_data[uc]
-        print(f"   {uc:3d} users:")
+    print(f"\n📈 Detailed Results by {axis_label}:")
+    for pv in param_values:
+        data = plot_data[pv]
+        display_value = get_parameter_display_value(param_name, pv)
+        print(f"   {axis_label}={display_value}:")
         print(f"     • Fisher DP: Pos={data['positive_fisher']:.2f}% vs Neg={data['negative_fisher']:.1f}% " +
               f"(diff: {data['strategy_difference']:+5.1f}%)")
     
