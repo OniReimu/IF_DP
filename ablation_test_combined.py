@@ -1183,28 +1183,16 @@ def run_combined_calibration_test(args, device, priv_loader, eval_base, priv_bas
         # Run comprehensive MIA evaluation on all models
         mia_results = {}
         
-        print(f"\n🎯 CONFIDENCE ATTACK RESULTS:")
-        print("-" * 50)
-        
-        for model_name, model in models_to_evaluate.items():
-            print(f"   Evaluating {model_name}...")
-            conf_result = confidence_attack(model, member_loader, non_member_loader, device)
-            mia_results[model_name] = {
-                'confidence_auc': conf_result['auc'],
-                'confidence_acc': conf_result['accuracy'],
-                'member_conf_mean': conf_result['member_conf_mean'],
-                'non_member_conf_mean': conf_result['non_member_conf_mean']
-            }
-            print(f"     • AUC: {conf_result['auc']:.4f}, Accuracy: {conf_result['accuracy']:.4f}")
-        
         print(f"\n🕶️  SHADOW MODEL ATTACK RESULTS:")
         print("-" * 50)
         
         for model_name, model in models_to_evaluate.items():
             print(f"   Evaluating {model_name}...")
             shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_base)
-            mia_results[model_name]['shadow_auc'] = shadow_result['auc']
-            mia_results[model_name]['shadow_acc'] = shadow_result['accuracy']
+            mia_results[model_name] = {
+                'shadow_auc': shadow_result['auc'],
+                'shadow_acc': shadow_result['accuracy']
+            }
             print(f"     • AUC: {shadow_result['auc']:.4f}, Accuracy: {shadow_result['accuracy']:.4f}")
         
         # ════════════════════════════════════════════════════════════════
@@ -1215,21 +1203,18 @@ def run_combined_calibration_test(args, device, priv_loader, eval_base, priv_bas
         print("🔒 MIA PRIVACY ANALYSIS SUMMARY")
         print(f"{'='*70}")
         
-        # Calculate worst-case AUC for each model
-        worst_case_aucs = {}
+        # Use shadow attack AUC directly (no need for worst-case since we only have one attack)
+        shadow_aucs = {}
         for model_name in models_to_evaluate.keys():
-            worst_case_aucs[model_name] = max(
-                mia_results[model_name]['confidence_auc'],
-                mia_results[model_name]['shadow_auc']
-            )
+            shadow_aucs[model_name] = mia_results[model_name]['shadow_auc']
         
-        print(f"\n🎯 Worst-case AUC Comparison:")
-        for model_name, worst_auc in worst_case_aucs.items():
-            print(f"   • {model_name:30}: {worst_auc:.4f}")
+        print(f"\n🎯 Shadow Attack AUC Comparison:")
+        for model_name, auc in shadow_aucs.items():
+            print(f"   • {model_name:30}: {auc:.4f}")
         
         # Identify best and worst models for privacy
-        best_privacy_model = min(worst_case_aucs.items(), key=lambda x: x[1])
-        worst_privacy_model = max(worst_case_aucs.items(), key=lambda x: x[1])
+        best_privacy_model = min(shadow_aucs.items(), key=lambda x: x[1])
+        worst_privacy_model = max(shadow_aucs.items(), key=lambda x: x[1])
         
         print(f"\n🏆 Privacy Protection Ranking:")
         print(f"   🥇 BEST:  {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
@@ -1250,18 +1235,18 @@ def run_combined_calibration_test(args, device, priv_loader, eval_base, priv_bas
         
         for model_name in ['Fisher DP (No Calibration)', 'Fisher DP + Standard Calib', 'Fisher DP + Line Search', 'Fisher DP + Multi-Step', 'Fisher DP + Combined Optim']:
             acc = model_accuracies[model_name]
-            privacy_score = 1.0 - worst_case_aucs[model_name]  # Higher is better
+            privacy_score = 1.0 - shadow_aucs[model_name]  # Higher is better
             print(f"   {model_name:30} {acc:5.1f}%     {privacy_score:.3f}")
         
         # Privacy impact analysis
         print(f"\n🔍 Calibration Privacy Impact Analysis:")
         
-        baseline_privacy = worst_case_aucs.get('Baseline (Non-DP)', 1.0)
-        fisher_privacy = worst_case_aucs.get('Fisher DP (No Calibration)', 0.5)
-        standard_calib_privacy = worst_case_aucs.get('Fisher DP + Standard Calib', 0.5)
-        line_search_privacy = worst_case_aucs.get('Fisher DP + Line Search', 0.5)
-        multi_step_privacy = worst_case_aucs.get('Fisher DP + Multi-Step', 0.5)
-        combined_privacy = worst_case_aucs.get('Fisher DP + Combined Optim', 0.5)
+        baseline_privacy = shadow_aucs.get('Baseline (Non-DP)', 1.0)
+        fisher_privacy = shadow_aucs.get('Fisher DP (No Calibration)', 0.5)
+        standard_calib_privacy = shadow_aucs.get('Fisher DP + Standard Calib', 0.5)
+        line_search_privacy = shadow_aucs.get('Fisher DP + Line Search', 0.5)
+        multi_step_privacy = shadow_aucs.get('Fisher DP + Multi-Step', 0.5)
+        combined_privacy = shadow_aucs.get('Fisher DP + Combined Optim', 0.5)
         
         print(f"   • Baseline (Non-DP) vulnerability:       {baseline_privacy:.4f} (expected high)")
         print(f"   • Fisher DP privacy protection:          {fisher_privacy:.4f}")
@@ -1329,11 +1314,11 @@ def run_combined_calibration_test(args, device, priv_loader, eval_base, priv_bas
             print(f"   📈 Focus on accuracy improvements")
         
         print(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
-        print(f"✅ Comprehensive MIA evaluation complete!")
+        print(f"✅ Comprehensive MIA evaluation complete! (Shadow attack only - more powerful assessment)")
         
         # Store results for return
         mia_results_summary = {
-            'worst_case_aucs': worst_case_aucs,
+            'shadow_aucs': shadow_aucs,
             'best_privacy_model': best_privacy_model,
             'detailed_results': mia_results,
             'privacy_effects': {

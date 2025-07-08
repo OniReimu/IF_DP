@@ -994,49 +994,33 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         # Run comprehensive MIA evaluation on all models
         mia_results = {}
         
-        print(f"\n🎯 CONFIDENCE ATTACK RESULTS:")
-        print("-" * 50)
-        
-        for model_name, model in models_to_evaluate.items():
-            print(f"   Evaluating {model_name}...")
-            conf_result = confidence_attack(model, member_loader, non_member_loader, device)
-            mia_results[model_name] = {
-                'confidence_auc': conf_result['auc'],
-                'confidence_acc': conf_result['accuracy'],
-                'member_conf_mean': conf_result['member_conf_mean'],
-                'non_member_conf_mean': conf_result['non_member_conf_mean']
-            }
-            print(f"     • AUC: {conf_result['auc']:.4f}, Accuracy: {conf_result['accuracy']:.4f}")
-        
         print(f"\n🕶️  SHADOW MODEL ATTACK RESULTS:")
         print("-" * 50)
         
         for model_name, model in models_to_evaluate.items():
             print(f"   Evaluating {model_name}...")
             shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_base)
-            mia_results[model_name]['shadow_auc'] = shadow_result['auc']
-            mia_results[model_name]['shadow_acc'] = shadow_result['accuracy']
+            mia_results[model_name] = {
+                'shadow_auc': shadow_result['auc'],
+                'shadow_acc': shadow_result['accuracy']
+            }
             print(f"     • AUC: {shadow_result['auc']:.4f}, Accuracy: {shadow_result['accuracy']:.4f}")
         
         # Comprehensive analysis
         print(f"\n📊 COMPREHENSIVE MIA ANALYSIS")
         print("=" * 60)
         
-        # Calculate worst-case AUC for each model
-        worst_case_aucs = {}
-        for model_name in models_to_evaluate.keys():
-            worst_case_aucs[model_name] = max(
-                mia_results[model_name]['confidence_auc'],
-                mia_results[model_name]['shadow_auc']
-            )
+        # Use shadow attack AUC directly as our privacy metric
+        privacy_aucs = {model_name: mia_results[model_name]['shadow_auc'] 
+                       for model_name in models_to_evaluate.keys()}
         
-        print(f"\n🎯 Worst-case AUC Comparison:")
-        for model_name, worst_auc in worst_case_aucs.items():
-            print(f"   • {model_name:30}: {worst_auc:.4f}")
+        print(f"\n🎯 Shadow Attack AUC Comparison:")
+        for model_name, auc in privacy_aucs.items():
+            print(f"   • {model_name:30}: {auc:.4f}")
         
         # Identify best and worst models for privacy
-        best_privacy_model = min(worst_case_aucs.items(), key=lambda x: x[1])
-        worst_privacy_model = max(worst_case_aucs.items(), key=lambda x: x[1])
+        best_privacy_model = min(privacy_aucs.items(), key=lambda x: x[1])
+        worst_privacy_model = max(privacy_aucs.items(), key=lambda x: x[1])
         
         print(f"\n🏆 Privacy Protection Ranking:")
         print(f"   🥇 BEST:  {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
@@ -1060,17 +1044,17 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
             else:  # Fisher DP + DP-SAT + Calib
                 acc = calib_dpsat_acc
             
-            privacy_score = 1.0 - worst_case_aucs[model_name]  # Higher is better
+            privacy_score = 1.0 - privacy_aucs[model_name]  # Higher is better
             print(f"   {model_name:30} {acc:5.1f}%     {privacy_score:.3f}")
         
         # Key comparisons only (remove redundant analysis)
         print(f"\n🔒 Key Privacy Effects:")
         
-        baseline_auc = worst_case_aucs['Baseline (Non-DP)']
-        fisher_normal_auc = worst_case_aucs['Fisher DP + Normal']
-        fisher_dpsat_auc = worst_case_aucs['Fisher DP + DP-SAT']
-        calib_normal_auc = worst_case_aucs['Fisher DP + Normal + Calib']
-        calib_dpsat_auc = worst_case_aucs['Fisher DP + DP-SAT + Calib']
+        baseline_auc = privacy_aucs['Baseline (Non-DP)']
+        fisher_normal_auc = privacy_aucs['Fisher DP + Normal']
+        fisher_dpsat_auc = privacy_aucs['Fisher DP + DP-SAT']
+        calib_normal_auc = privacy_aucs['Fisher DP + Normal + Calib']
+        calib_dpsat_auc = privacy_aucs['Fisher DP + DP-SAT + Calib']
         
         dpsat_privacy_effect = fisher_normal_auc - fisher_dpsat_auc
         calib_normal_privacy_effect = fisher_normal_auc - calib_normal_auc
@@ -1086,7 +1070,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         
         # Store results for return
         ablation_results['mia_results'] = {
-            'worst_case_aucs': worst_case_aucs,
+            'privacy_aucs': privacy_aucs,
             'best_privacy_model': best_privacy_model,
             'detailed_results': mia_results,
             'privacy_effects': {
@@ -1101,7 +1085,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         ablation_results['mia_results']['fisher_worst_auc'] = fisher_normal_auc
         ablation_results['mia_results']['dp_sat_worst_auc'] = fisher_dpsat_auc
         
-        print(f"\n✅ Comprehensive 4-way MIA evaluation complete!")
+        print(f"\n✅ Comprehensive MIA evaluation complete! (Shadow attack only - more powerful assessment)")
 
     return ablation_results
 

@@ -7,7 +7,7 @@ import torch
 import numpy as np
 
 # Default random seed for reproducible experiments
-DEFAULT_SEED = 40
+DEFAULT_SEED = 400
 
 def get_random_seed():
     """
