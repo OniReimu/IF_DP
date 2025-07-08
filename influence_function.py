@@ -17,26 +17,99 @@ def unpack_batch(batch_data):
 # --------------------------------------------------------------
 # 1.  Critical slice extraction + gradients
 # --------------------------------------------------------------
-def get_critical_slice(eval_loader, target_class: int = 3, device="cpu"):
-    crit_x, crit_y = [], []
-    for batch_data in eval_loader:
-        # Handle both (x, y) and (x, y, user_id) formats
-        if len(batch_data) == 3:
-            x, y, _ = batch_data  # x, y, user_id
-        else:
-            x, y = batch_data     # x, y only
+def get_evaluation_slice(eval_loader, target_class="all", max_samples_per_class=200, device="cpu"):
+    """
+    Extract evaluation slice for calibration.
+    
+    Args:
+        target_class: 
+            - "all": Use all classes (recommended for general utility improvement)
+            - int: Use specific class only (for targeted fairness applications)
+        max_samples_per_class: Maximum samples per class to avoid memory issues
+    """
+    if target_class == "all":
+        print(f"🎯 Using ALL CLASSES for calibration (general utility improvement)")
+        
+        # Collect samples by class for balanced sampling
+        class_samples = {}
+        
+        for batch_data in eval_loader:
+            # Handle both (x, y) and (x, y, user_id) formats
+            if len(batch_data) == 3:
+                x, y, _ = batch_data  # x, y, user_id
+            else:
+                x, y = batch_data     # x, y only
             
-        m = y == target_class
-        if m.any():
-            crit_x.append(x[m]), crit_y.append(y[m])
-    if not crit_x:
-        print(f"⚠️  no samples of class {target_class}")
-        return torch.empty(0, 3, 32, 32, device=device), \
-               torch.empty(0, dtype=torch.long, device=device)
-    crit_x = torch.cat(crit_x).to(device)
-    crit_y = torch.cat(crit_y).to(device)
-    print(f"🎯 critical slice: {len(crit_x)} samples of class {target_class}")
-    return crit_x, crit_y
+            for i in range(len(x)):
+                class_id = y[i].item()
+                if class_id not in class_samples:
+                    class_samples[class_id] = {'x': [], 'y': []}
+                
+                # Add sample if we haven't reached the limit for this class
+                if len(class_samples[class_id]['x']) < max_samples_per_class:
+                    class_samples[class_id]['x'].append(x[i:i+1])
+                    class_samples[class_id]['y'].append(y[i:i+1])
+        
+        # Combine all classes
+        all_x, all_y = [], []
+        total_samples = 0
+        
+        for class_id in sorted(class_samples.keys()):
+            class_x = torch.cat(class_samples[class_id]['x'])
+            class_y = torch.cat(class_samples[class_id]['y'])
+            all_x.append(class_x)
+            all_y.append(class_y)
+            total_samples += len(class_x)
+            print(f"   • Class {class_id}: {len(class_x)} samples")
+        
+        if not all_x:
+            print(f"⚠️  No samples found in evaluation data")
+            return torch.empty(0, 3, 32, 32, device=device), \
+                   torch.empty(0, dtype=torch.long, device=device)
+        
+        eval_x = torch.cat(all_x).to(device)
+        eval_y = torch.cat(all_y).to(device)
+        
+        print(f"✅ Evaluation slice: {total_samples} samples across {len(class_samples)} classes")
+        
+    else:
+        # Single class mode (legacy behavior)
+        print(f"🎯 Using SINGLE CLASS {target_class} for calibration (targeted improvement)")
+        
+        eval_x, eval_y = [], []
+        for batch_data in eval_loader:
+            # Handle both (x, y) and (x, y, user_id) formats
+            if len(batch_data) == 3:
+                x, y, _ = batch_data  # x, y, user_id
+            else:
+                x, y = batch_data     # x, y only
+                
+            m = y == target_class
+            if m.any():
+                eval_x.append(x[m])
+                eval_y.append(y[m])
+        
+        if not eval_x:
+            print(f"⚠️  No samples of class {target_class}")
+            return torch.empty(0, 3, 32, 32, device=device), \
+                   torch.empty(0, dtype=torch.long, device=device)
+        
+        eval_x = torch.cat(eval_x).to(device)
+        eval_y = torch.cat(eval_y).to(device)
+        print(f"🎯 Evaluation slice: {len(eval_x)} samples of class {target_class}")
+    
+    return eval_x, eval_y
+
+
+# Keep old function name for backward compatibility but mark as deprecated
+def get_critical_slice(eval_loader, target_class: int = 3, device="cpu"):
+    """
+    ⚠️  DEPRECATED: This function is deprecated and causes overfitting to single class.
+    Use get_evaluation_slice with target_class="all" for general utility improvement.
+    """
+    print(f"⚠️  WARNING: get_critical_slice is deprecated and causes single-class overfitting!")
+    print(f"⚠️  Recommendation: Use get_evaluation_slice(target_class='all') instead")
+    return get_evaluation_slice(eval_loader, target_class=target_class, device=device)
 
 
 @torch.no_grad()
@@ -60,9 +133,16 @@ def compute_slice_gradient(model, crit_x, crit_y, device):
 # --------------------------------------------------------------
 def compute_influence_vectors(model, public_loader, train_loader,
                               device, method="linear",
-                              reg=1.0,  # ✨ FIX  stronger default
+                              reg=0.1,  # ✨ PRIVACY-PRESERVING: Reduced regularization
                               strict=True):
-    """Return list of dicts (aligned with model.named_parameters())."""
+    """
+    🔒 PRIVACY-PRESERVING: Compute influence vectors using ONLY public data and DP model.
+    
+    IMPORTANT: For post-processing theorem compliance, this function must NOT use
+    any statistics computed on the private training data (train_loader).
+    
+    Only 'linear' method is privacy-preserving. Other methods violate DP guarantees.
+    """
     # flatten public data to list[(x,y)]
     public_samples = []
     for batch_data in public_loader:
@@ -79,93 +159,111 @@ def compute_influence_vectors(model, public_loader, train_loader,
     infl_vecs = []
 
     if method == "linear":                                 # -----------------
-        for x, y in tqdm(public_samples, desc="linear-IF"):
+        print(f"🔒 Using privacy-preserving 'linear' method (reg={reg})")
+        for x, y in tqdm(public_samples, desc="Privacy-preserving linear-IF"):
             model.zero_grad()
             F.cross_entropy(model(x), y).backward()
             vec = {}
             for n, p in model.named_parameters():
                 if p.grad is not None:
                     g = p.grad.detach()
-                    # ✨ FIX  gradient clipping to unit-norm then scale by 1/reg
-                    g = g / (g.norm() + 1e-12)
-                    vec[n] = g / reg
+                    # ✨ MORE CONSERVATIVE: Scale by (1 + ||g||) instead of ||g|| alone for stability
+                    g_norm = g.norm() + 1e-8
+                    scaling_factor = 1.0 + g_norm  # More conservative scaling
+                    vec[n] = g / (scaling_factor * reg)  # Much more conservative update
                 else:
                     vec[n] = torch.zeros_like(p)
             infl_vecs.append(vec)
+
+    elif method == "public-fisher":                       # -----------------
+        print(f"🔒 Using privacy-preserving 'public-fisher' method (reg={reg})")
+        print(f"   Computing Fisher information from PUBLIC data only")
+        
+        # Use a smaller subset for Fisher computation to avoid memory issues
+        max_fisher_samples = min(100, len(public_samples))  # Much smaller for memory efficiency
+        fisher_samples = public_samples[:max_fisher_samples]
+        
+        print(f"   Using {max_fisher_samples} public samples for Fisher matrix computation")
+        
+        # Compute Fisher matrix from public data only (privacy-preserving)
+        public_grads = []
+        for x, y in tqdm(fisher_samples, desc="Computing public Fisher"):
+            try:
+                model.zero_grad()
+                F.cross_entropy(model(x), y).backward()
+                grad_vec = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+                public_grads.append(grad_vec.detach().cpu())  # Move to CPU to save GPU memory
+            except RuntimeError as e:
+                print(f"⚠️  Error computing gradient: {e}")
+                continue
+        
+        if len(public_grads) >= 10:  # Need minimum samples for stable Fisher
+            try:
+                G_public = torch.stack(public_grads)
+                dim = G_public.shape[1]
+                
+                # Add strong regularization for stability
+                fisher_public = (G_public.T @ G_public) / len(G_public) + reg * torch.eye(dim)
+                
+                print(f"   Public Fisher shape: {fisher_public.shape}")
+                print(f"   Successfully computed Fisher from {len(public_grads)} public samples")
+                
+                # Compute influence vectors using public Fisher
+                for x, y in tqdm(public_samples[:200], desc="Public-Fisher influence vectors"):  # Limit total computations
+                    try:
+                        model.zero_grad()
+                        F.cross_entropy(model(x), y).backward()
+                        grad_vec = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]).cpu()
+                        
+                        # Solve: fisher_public * v = grad_vec
+                        try:
+                            influence_vec_flat = torch.linalg.solve(fisher_public, grad_vec.unsqueeze(1)).squeeze(1)
+                        except:
+                            # Fallback to pseudo-inverse if singular
+                            print("   Using pseudo-inverse for stability")
+                            influence_vec_flat = torch.pinverse(fisher_public) @ grad_vec
+                        
+                        # Reconstruct parameter-wise influence vector
+                        vec = {}
+                        idx = 0
+                        for n, p in model.named_parameters():
+                            if p.grad is not None:
+                                n_params = p.numel()
+                                vec[n] = influence_vec_flat[idx:idx+n_params].view_as(p).to(device)
+                                idx += n_params
+                            else:
+                                vec[n] = torch.zeros_like(p)
+                        infl_vecs.append(vec)
+                    except Exception as e:
+                        print(f"⚠️  Error in influence computation: {e}")
+                        # Fallback: create zero influence vector
+                        vec = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
+                        infl_vecs.append(vec)
+                        
+            except Exception as e:
+                print(f"⚠️  Error computing public Fisher matrix: {e}")
+                print(f"   Falling back to linear method")
+                return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
+        else:
+            print(f"⚠️  Insufficient public gradients ({len(public_grads)} < 10), falling back to linear method")
+            return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
 
     elif method == "batch":                                # -----------------
-        # diagonal Fisher inverse
-        fisher_diag = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
-        total = 0
-        for batch_data in tqdm(train_loader, desc="Fisher diag"):
-            # Handle both (x, y) and (x, y, user_id) formats
-            if len(batch_data) == 3:
-                x, y, _ = batch_data  # x, y, user_id
-            else:
-                x, y = batch_data     # x, y only
-                
-            x, y = x.to(device), y.to(device)
-            model.zero_grad()
-            F.cross_entropy(model(x), y).backward()
-            bs = x.size(0); total += bs
-            for n, p in model.named_parameters():
-                if p.grad is not None:
-                    fisher_diag[n] += p.grad.detach().pow(2) * bs
-        for n in fisher_diag:
-            fisher_diag[n] = fisher_diag[n] / total + 0.1   # ✨ OPTIMIZED: stronger damping (was 1e-2)
-
-        for x, y in tqdm(public_samples, desc="diag-IF"):
-            model.zero_grad()
-            F.cross_entropy(model(x), y).backward()
-            vec = {}
-            for n, p in model.named_parameters():
-                if p.grad is not None:
-                    vec[n] = p.grad.detach() / fisher_diag[n]
-                else:
-                    vec[n] = torch.zeros_like(p)
-            infl_vecs.append(vec)
+        raise ValueError(
+            f"🚨 PRIVACY VIOLATION: 'batch' method uses private training data statistics. "
+            f"This violates the post-processing theorem. Use method='linear' instead."
+        )
 
     elif method == "original":                             # -----------------
-        # More accurate but slower: compute actual Hessian-vector products
-        print("⚠️  Original method is computationally expensive and may be slow")
-        
-        # Compute empirical Fisher for better Hessian approximation
-        fisher_full = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
-        total = 0
-        for batch_data in tqdm(train_loader, desc="Computing empirical Fisher"):
-            # Handle both (x, y) and (x, y, user_id) formats
-            if len(batch_data) == 3:
-                x, y, _ = batch_data  # x, y, user_id
-            else:
-                x, y = batch_data     # x, y only
-                
-            x, y = x.to(device), y.to(device)
-            model.zero_grad()
-            F.cross_entropy(model(x), y).backward()
-            bs = x.size(0); total += bs
-            for n, p in model.named_parameters():
-                if p.grad is not None:
-                    fisher_full[n] += p.grad.detach().pow(2) * bs
-        
-        # Add strong damping for numerical stability
-        for n in fisher_full:
-            fisher_full[n] = fisher_full[n] / total + 5.0 * torch.ones_like(fisher_full[n])  # ✨ OPTIMIZED: much stronger damping (was 1.0)
-
-        for x, y in tqdm(public_samples, desc="original-IF"):
-            model.zero_grad()
-            F.cross_entropy(model(x), y).backward()
-            vec = {}
-            for n, p in model.named_parameters():
-                if p.grad is not None:
-                    # More conservative: use stronger damping
-                    vec[n] = p.grad.detach() / fisher_full[n]
-                else:
-                    vec[n] = torch.zeros_like(p)
-            infl_vecs.append(vec)
+        raise ValueError(
+            f"🚨 PRIVACY VIOLATION: 'original' method uses private training data statistics. "
+            f"This violates the post-processing theorem. Use method='linear' instead."
+        )
 
     else:                                                  # -----------------
-        raise ValueError(f"unknown method '{method}'. Choose from: 'linear', 'batch', 'original'")
+        raise ValueError(f"unknown method '{method}'. Choose 'linear' for privacy-preserving influence functions.")
 
+    print(f"✅ Computed {len(infl_vecs)} privacy-preserving influence vectors using only public data")
     return infl_vecs, public_samples
 
 # --------------------------------------------------------------
@@ -196,15 +294,22 @@ def calibrate_model_research_protocol(model,
                                       method="linear",
                                       eta=200,
                                       target_improve=0.1,
-                                      trust_tau=0.05,
+                                      trust_tau=0.01,  # ✨ MUCH MORE CONSERVATIVE: 1% instead of 10%
                                       strict=True,
                                       clean_model=None,
-                                      reg=1.0):
+                                      reg=10.0):  # ✨ MUCH MORE CONSERVATIVE: Higher regularization
     """
-    One-shot influence calibration following the exact specification.
+    🔒 PRIVACY-PRESERVING influence calibration following post-processing theorem.
+    
+    This function only uses:
+    1. DP model parameters (output of DP algorithm)  
+    2. Public dataset (dataset B)
+    3. No statistics from private training data (dataset A)
     
     Args:
         clean_model: Non-DP baseline model for measuring ΔL_DP (utility drop due to DP)
+        trust_tau: Trust region parameter (default 0.1 = 10% of model norm)
+        reg: Regularization for influence vector computation (smaller = less regularization)
     """
 
     model.eval()
@@ -243,29 +348,51 @@ def calibrate_model_research_protocol(model,
     J = compute_slice_gradient(model, crit_x, crit_y, device)
     J_flat = torch.cat([v.flatten() for v in J.values()])
 
-    # ---- b) influence vectors
+    # ---- b) influence vectors (PRIVACY-PRESERVING: only uses public data + DP model)
     infl_vecs, public_samples = compute_influence_vectors(model, public_loader,
                                              train_loader, device,
                                              method=method, reg=reg, strict=strict)
 
-    # ---- c) influence scores  s_i = Jᵀ v_i
-    scores = np.array([ torch.dot(J_flat,
+    # ---- c) influence scores: how much would adding each public sample help the evaluation slice?
+    # Correct logic: s_i = -J^T * v_i (negative because we want loss reduction)
+    # If J points in direction of increasing loss, and v_i points in direction of decreasing loss,
+    # then -J^T * v_i > 0 indicates helpful alignment
+    scores = np.array([ -torch.dot(J_flat,
                    torch.cat([v[n].flatten() for n in J.keys()])).item()
                         for v in infl_vecs ])
 
-    # ---- d) choose η most helpful samples (FIXED: select LOWEST scores for negative I_up,loss)
-    idx = np.argsort(scores)[:eta]  # 🔧 FIX: select smallest (most negative) scores
+    # ---- d) choose η most helpful samples 
+    # ✨ CORRECTED: Select samples with HIGHEST scores (most helpful for reducing evaluation loss)
+    idx = np.argsort(scores)[-eta:]  # Select largest (most positive) scores
     w = np.zeros_like(scores)
-    w[idx] = 1.0                           # simple 0/1 for now
+    w[idx] = 1.0
 
     print(f"\n📊 Influence score statistics:")
     print(f"   • Score range: [{scores.min():.4f}, {scores.max():.4f}]")
-    print(f"   • Selected {eta} samples with LOWEST scores: [{scores[idx].min():.4f}, {scores[idx].max():.4f}]")
+    print(f"   • Selected {eta} samples with HIGHEST scores: [{scores[idx].min():.4f}, {scores[idx].max():.4f}]")
     print(f"   • Mean selected score: {scores[idx].mean():.4f}")
     print(f"   • Score std: {scores.std():.4f}")
     print(f"   • Median score: {np.median(scores):.4f}")
-    print(f"   🎯 Goal: Select negative scores to achieve negative I_up,loss for slice loss reduction")
+    print(f"   🎯 Goal: Select samples that help reduce evaluation slice loss (positive scores)")
     
+    # Additional diagnostic: check if we have any helpful samples
+    positive_scores = scores[scores > 0]
+    negative_scores = scores[scores < 0]
+    print(f"   • Helpful samples (score > 0): {len(positive_scores)} out of {len(scores)}")
+    print(f"   • Harmful samples (score < 0): {len(negative_scores)} out of {len(scores)}")
+    
+    if len(positive_scores) == 0:
+        print(f"   ⚠️  WARNING: No helpful public samples found! All would increase evaluation loss.")
+        print(f"   💡 This suggests domain mismatch between public and evaluation data.")
+    elif len(positive_scores) < eta:
+        print(f"   ⚠️  WARNING: Only {len(positive_scores)} helpful samples, but requesting {eta}")
+        print(f"   💡 Reducing eta to {len(positive_scores)} to avoid harmful samples")
+        # Only use actually helpful samples
+        helpful_idx = np.where(scores > 0)[0]
+        w = np.zeros_like(scores)
+        w[helpful_idx] = 1.0
+        eta = len(helpful_idx)
+
     # 🔍 DIAGNOSTIC: Check influence vector statistics
     infl_norms = [torch.sqrt(sum(v[n].pow(2).sum() for n in v.keys())).item() for v in infl_vecs]
     print(f"\n🔍 Influence vector diagnostics:")
@@ -273,25 +400,31 @@ def calibrate_model_research_protocol(model,
     print(f"   • Mean influence vector norm: {np.mean(infl_norms):.4f}")
     print(f"   • Influence vectors used (nonzero weights): {np.sum(w > 0)}")
 
-    # ---- e) CORRECTED: Δθ = -(1/n) H⁻¹ ∑_{z∈P} w_z ∇ℓ(z,θ̂_DP)
-    # Note: w has zeros for non-selected samples, so this correctly sums over ALL public samples
-    n_total = len(public_samples)  # Total number of public samples
+    # ---- e) ✨ CORRECTED FORMULA: Δθ = (1/η) Σ_{helpful} H⁻¹ ∇ℓ(z,θ̂_DP)
+    # Move in direction that helpful public samples suggest
+    n_selected = np.sum(w > 0)  # Number of selected samples
+    if n_selected == 0:
+        print(f"⚠️  WARNING: No helpful samples found for calibration - skipping update")
+        print(f"   💡 This suggests the public data can't help improve the evaluation slice")
+        return model
+        
     delta = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
     
     for i, weight in enumerate(w):
-        # Sum over ALL samples (w_i = 0 for non-selected samples)
-        for n in delta:
-            delta[n] -= infl_vecs[i][n] * weight / n_total  # Negative sign + divide by total n
+        if weight > 0:  # Only sum over helpful samples
+            for n in delta:
+                delta[n] += infl_vecs[i][n] * weight / n_selected  # Average of helpful influence vectors
 
     # 🔍 DIAGNOSTIC: Check delta before trust region
     delta_norm_before = _frob_norm(delta)
     print(f"\n🔍 Parameter update diagnostics:")
     print(f"   • Raw Δθ norm before trust region: {delta_norm_before:.4f}")
-    print(f"   • Using CORRECTED formula: Δθ = -(1/n) H⁻¹ ∑ w_z ∇ℓ(z)")
-    print(f"   • Total public samples n: {n_total}")
-    print(f"   • Selected samples η: {np.sum(w > 0)}")
+    print(f"   • Using CORRECTED formula: Δθ = (1/η) Σ_{{helpful}} H⁻¹ ∇ℓ(public_sample)")
+    print(f"   • Helpful samples used η: {n_selected}")
+    print(f"   • Direction: Move model toward what helpful public samples suggest")
+    print(f"   • Privacy-preserving: Uses only public data + DP model output")
 
-    # ---- f) trust-region clip
+    # ---- f) trust-region clip (IMPROVED: more generous)
     ref_norm = torch.sqrt(sum(p.pow(2).sum()
                               for p in model.parameters())).item()
     print(f"   • Model parameter norm ‖θ‖: {ref_norm:.4f}")
@@ -306,37 +439,49 @@ def calibrate_model_research_protocol(model,
     relative_change = delta_norm_after / ref_norm
     print(f"   • Relative parameter change: {relative_change:.4f} ({relative_change*100:.2f}%)")
     
-    if relative_change > 0.1:
-        print(f"   ⚠️  WARNING: Large parameter change (>{10:.0f}%) may cause instability")
-    elif relative_change < 0.001:
-        print(f"   ⚠️  WARNING: Very small parameter change (<{0.1:.1f}%) may be ineffective")
+    if relative_change > 0.2:
+        print(f"   ⚠️  WARNING: Large parameter change (>{20:.0f}%) may cause instability")
+    elif relative_change < 0.005:
+        print(f"   ⚠️  WARNING: Very small parameter change (<{0.5:.1f}%) may be ineffective")
+        print(f"   💡 SUGGESTION: Try decreasing reg parameter or increasing trust_tau")
 
     # ---- g) apply calibration: θ̂* = θ̂_DP + Δθ
     with torch.no_grad():
         for n, p in model.named_parameters():
             p.add_(delta[n])
 
-    print(f"✅ calibration applied (‖Δθ‖₂ ≈ {_frob_norm(delta):.4f}, "
+    print(f"✅ Privacy-preserving calibration applied (‖Δθ‖₂ ≈ {_frob_norm(delta):.4f}, "
           f"trust τ={trust_tau})")
+    print(f"🔒 Post-processing theorem: Privacy guarantees preserved")
     return model
 
 
 def calibrate_model(model, public_loader, train_loader, fisher,
-                    top_k=200, device=None, target_class=3, **kw):
-    crit_x, crit_y = get_critical_slice(public_loader,
-                                        target_class, device)
+                    top_k=200, device=None, target_class="all", **kw):
+    """
+    🔄 UPDATED: Now uses ALL CLASSES by default for general utility improvement.
+    
+    Args:
+        target_class: "all" for general utility (default), or int for specific class
+    """
+    eval_x, eval_y = get_evaluation_slice(public_loader, target_class, device=device)
     return calibrate_model_research_protocol(
         model, public_loader, train_loader,
-        crit_x, crit_y, device,
-        method="linear", eta=top_k, strict=True, **kw)
+        eval_x, eval_y, device,
+        method="linear", eta=top_k, trust_tau=0.01, reg=10.0, strict=True, **kw)
 
 
 def calibrate_model_efficient(model, public_loader, train_loader, fisher,
                              top_k=200, device=None, method="linear",
-                             target_class=3, **kw):
-    crit_x, crit_y = get_critical_slice(public_loader,
-                                        target_class, device)
+                             target_class="all", **kw):
+    """
+    🔄 UPDATED: Now uses ALL CLASSES by default for general utility improvement.
+    
+    Args:
+        target_class: "all" for general utility (default), or int for specific class
+    """
+    eval_x, eval_y = get_evaluation_slice(public_loader, target_class, device=device)
     return calibrate_model_research_protocol(
         model, public_loader, train_loader,
-        crit_x, crit_y, device,
-        method=method, eta=top_k, strict=True, **kw)
+        eval_x, eval_y, device,
+        method=method, eta=top_k, trust_tau=0.01, reg=10.0, strict=True, **kw)

@@ -89,19 +89,83 @@ Create new config file in `validation_configs/`:
 ### Vanilla DP-SGD: Standard Baseline
 Standard per-sample gradient clipping + isotropic Gaussian noise.
 
-## 📊 **Expected Results**
+## 📊 **Experimental Results**
 
-With proper privacy accounting at ε = 10.0:
+We use the following configuration:
+```bash
+--k 2048 --epochs 50 --dataset-size 50000 --target-epsilon 2.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 2.0 --calibration-k 200 --trust-tau 0.0005 --reg 10
+```
 
-| Method | Test Accuracy | MIA AUC | Privacy |
-|--------|---------------|---------|---------|
-| Baseline | ~85% | 0.95+ | None |
-| Vanilla DP | ~75% | 0.60-0.65 | Moderate |
-| DP-SAT | ~81% | 0.58-0.62 | Strong |
-| Fisher DP (Positive) | ~78% | 0.55-0.60 | Strong |
-| Fisher DP (Negative) | ~76% | 0.52-0.57 | Very Strong |
+### 10 Users
+```
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  59.2%     0.494
+   Vanilla DP-SGD + DP-SAT         61.1%     0.492
+   Fisher DP + Normal              61.6%     0.491
+   Fisher DP + DP-SAT              61.9%     0.478
+   Fisher DP + Normal + Calib      62.0%     0.491
+   Fisher DP + DP-SAT + Calib      62.4%     0.488
+```
 
-**Key Discovery**: Positively correlated noise counterintuitively outperforms negatively correlated approach at scale.
+### 100 Users
+```
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  49.0%     0.448
+   Vanilla DP-SGD + DP-SAT         55.4%     0.453
+   Fisher DP + Normal              65.6%     0.436
+   Fisher DP + DP-SAT              68.9%     0.423
+   Fisher DP + Normal + Calib      67.3%     0.433
+   Fisher DP + DP-SAT + Calib      70.9%     0.418
+```
+
+### 200 Users
+```
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  33.7%     0.482
+   Vanilla DP-SGD + DP-SAT         31.6%     0.491
+   Fisher DP + Normal              50.1%     0.458
+   Fisher DP + DP-SAT              48.4%     0.449
+   Fisher DP + Normal + Calib      51.6%     0.457
+   Fisher DP + DP-SAT + Calib      52.4%     0.446
+```
+
+### 400 Users
+```
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  17.8%     0.501
+   Vanilla DP-SGD + DP-SAT         20.2%     0.497
+   Fisher DP + Normal              38.4%     0.476
+   Fisher DP + DP-SAT              35.3%     0.493
+   Fisher DP + Normal + Calib      39.1%     0.477
+   Fisher DP + DP-SAT + Calib      35.9%     0.488
+```
+
+```bash
+--k 2048 --epochs 50 --dataset-size 50000 --target-epsilon 8.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 1.0 --calibration-k 200 --trust-tau 0.0005 --reg 10
+```
+
+### Sample-Level
+```
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  71.1%     0.397
+   Vanilla DP-SGD + DP-SAT         69.9%     0.413
+   Fisher DP + Normal              73.9%     0.377
+   Fisher DP + DP-SAT              72.7%     0.369
+   Fisher DP + Normal + Calib      74.4%     0.373
+   Fisher DP + DP-SAT + Calib      73.3%     0.364
+```
+
+**Key Discovery**: Fisher DP-SGD shows consistent improvements across different user counts, with the best performance at 100 users achieving 70.9% accuracy with strong privacy protection (1-AUC = 0.418).
 
 ## 🔧 **Configuration Options**
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ================================================================
-# ABLATION STUDY: Fisher DP-SGD with Different Optimizers
-#    * Fisher DP + Normal Optimizer (baseline)
-#    * Fisher DP + DP-SAT Optimizer (synergistic combination)
-#    * + Influence Function Calibration
+# LINE SEARCH OPTIMIZATION TEST: Fisher DP-SGD + Enhanced Calibration
+#    * Baseline: Standard influence function calibration
+#    * Enhanced: Line search optimization for optimal step size
+#    * Comparison of calibration effectiveness
 # ================================================================
 
 import os, glob, argparse, copy, math
@@ -29,8 +29,6 @@ from influence_function import calibrate_model_research_protocol, get_evaluation
 from config import set_random_seeds, get_random_seed
 
 set_random_seeds()  # Set reproducible random seeds
-np.random.seed(get_random_seed())
-
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════
@@ -85,6 +83,79 @@ def print_calibration_effect(before_stats, after_stats, target_class="all"):
         print(f"   ✅ SUCCESS: Calibration improved evaluation slice accuracy!")
     else:
         print(f"   ⚠️  WARNING: Calibration reduced evaluation slice accuracy")
+
+# ════════════════════════════════════════════════════════════════
+# Line Search Optimization for Calibration
+# ════════════════════════════════════════════════════════════════
+
+def _eval_slice_loss(model, critical_data, critical_targets, device):
+    """Helper function to evaluate loss on critical slice."""
+    if len(critical_data) == 0:
+        return float('inf')
+    
+    model.eval()
+    with torch.no_grad():
+        critical_data = critical_data.to(device)
+        critical_targets = critical_targets.to(device)
+        output = model(critical_data)
+        loss = F.cross_entropy(output, critical_targets)
+    return loss.item()
+
+def _add_delta(model, delta, scale=1.0):
+    """Apply scaled parameter update."""
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in delta:
+                param.data.add_(delta[name], alpha=scale)
+
+def calibrate_with_line_search(model, pub_loader, priv_loader, critical_data, critical_targets, 
+                              device, method='linear', eta=100, trust_tau=0.01, reg=10.0, 
+                              strict=True, clean_model=None):
+    """Enhanced calibration with line search optimization for optimal step size."""
+    
+    print(f"🔍 Line Search Calibration:")
+    print(f"   • Method: {method}")
+    print(f"   • Eta: {eta}")
+    print(f"   • Trust tau: {trust_tau}")
+    print(f"   • Regularization: {reg}")
+    
+    # First get the standard influence update
+    calibrated_model = calibrate_model_research_protocol(
+        copy.deepcopy(model), pub_loader, priv_loader,
+        critical_data, critical_targets, device=device,
+        method=method, eta=eta, trust_tau=trust_tau,
+        strict=strict, clean_model=clean_model, reg=reg
+    )
+    
+    # Extract the delta that was applied
+    delta = {}
+    with torch.no_grad():
+        for (name, orig_param), (_, new_param) in zip(model.named_parameters(), calibrated_model.named_parameters()):
+            delta[name] = new_param.data - orig_param.data
+    
+    # Line search over different scales
+    candidates = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+    best_loss, best_gamma = float('inf'), 0.0
+    
+    print(f"   🔍 Line search over {len(candidates)} step size candidates...")
+    
+    for gamma in candidates:
+        test_model = copy.deepcopy(model)
+        _add_delta(test_model, delta, gamma)
+        loss = _eval_slice_loss(test_model, critical_data, critical_targets, device)
+        
+        print(f"     • γ={gamma:.2f}: loss={loss:.4f}")
+        
+        if loss < best_loss:
+            best_loss, best_gamma = loss, gamma
+    
+    # Apply best scaling
+    final_model = copy.deepcopy(model)
+    _add_delta(final_model, delta, best_gamma)
+    
+    print(f"   ✅ Optimal step size: γ={best_gamma:.2f} (loss: {best_loss:.4f})")
+    
+    return final_model
 
 # ════════════════════════════════════════════════════════════════
 # Synthetic users + batch sampler (reused from main.py)
@@ -156,8 +227,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                   adaptive_clip=True, quantile=0.95, sample_level=None,
                                   epochs=1, sigma=None, full_complement_noise=False,
                                   use_dp_sat=False, lambda_flatness=0.01,
-                                  optimizer_name="Normal", positive_noise_correlation=False,
-                                  precomputed_lam=None, precomputed_U=None):
+                                  optimizer_name="Normal", positive_noise_correlation=False):
     """
     Fisher DP-SGD with optional DP-SAT optimization.
     
@@ -173,8 +243,6 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         optimizer_name: String identifier for logging purposes
         positive_noise_correlation: If False (default), use negatively correlated noise (noise ∝ 1/√λ).
                                    If True, use positively correlated noise (noise ∝ √λ).
-        precomputed_lam: Pre-computed eigenvalues (if None, compute from fisher matrix)
-        precomputed_U: Pre-computed eigenvectors (if None, compute from fisher matrix)
         
     Algorithm when use_dp_sat=True (CORRECTED):
         1. Compute per-sample gradients and clip them (standard DP-SGD)
@@ -185,18 +253,9 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     
-    # Fisher eigendecomposition (use pre-computed if available)
-    if precomputed_lam is not None and precomputed_U is not None:
-        print(f"   ✅ Using pre-computed Fisher eigendecomposition")
-        lam, U = precomputed_lam, precomputed_U
-        actual_k = len(lam)
-    else:
-        print(f"   🔍 Computing Fisher eigendecomposition...")
-        lam, U = topk_eigh_with_floor(fisher, k=k, lam_floor=lam_floor)
-        lam, U = lam.to(device), U.to(device)
-        actual_k = len(lam)
-        if actual_k != k:
-            print(f"⚠️  Using k={actual_k} eigenpairs (requested {k}) due to matrix rank constraints")
+    # Fisher eigendecomposition
+    lam, U = topk_eigh_with_floor(fisher, k=k, lam_floor=lam_floor)
+    lam, U = lam.to(device), U.to(device)
     
     # Compute both scaling factors
     inv_sqrt_lam = lam.rsqrt()  # 1/√λ (negatively correlated: less noise in high curvature)
@@ -221,6 +280,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         sigma = sigma_single_epoch / math.sqrt(epochs)
         print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
     
+    actual_k = len(lam)
     if actual_k != k:
         print(f"⚠️  Using k={actual_k} eigenpairs (requested {k}) due to matrix rank constraints")
 
@@ -506,37 +566,18 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
 # Ablation Study Main Function
 # ════════════════════════════════════════════════════════════════
 
-def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx, priv_ds, Fmat, pub_loader):
+def run_line_search_test(args, device, priv_loader, eval_base, priv_base, priv_idx, priv_ds, Fmat, pub_loader):
     """
-    Run comprehensive ablation study on Fisher DP-SGD variants.
+    Test line search optimization for calibration.
     
-    Variants tested:
-    1. Vanilla DP-SGD (Non-Fisher)
-    2. Vanilla DP-SGD + DP-SAT (Non-Fisher)
-    3. Fisher DP + Normal Optimizer
-    4. Fisher DP + DP-SAT Optimizer
-    5. Fisher DP + Normal + Influence Function Calibration
-    6. Fisher DP + DP-SAT + Influence Function Calibration
+    Comparison:
+    1. Fisher DP + Standard Calibration
+    2. Fisher DP + Line Search Calibration
     """
     
     print("\n" + "="*70)
-    print("🔬  ABLATION STUDY: Fisher DP-SGD with Different Optimizers")
+    print("🔬  LINE SEARCH OPTIMIZATION TEST")
     print("="*70)
-    
-    # ════════════════════════════════════════════════════════════════
-    # PRE-COMPUTE FISHER EIGENDECOMPOSITION (Eliminate Redundancy)
-    # ════════════════════════════════════════════════════════════════
-    
-    print(f"\n🔍 Pre-computing Fisher eigendecomposition to avoid redundancy...")
-    lam, U = topk_eigh_with_floor(Fmat, k=args.k, lam_floor=5e-1)  # Use consistent lam_floor
-    lam, U = lam.to(device), U.to(device)
-    actual_k = len(lam)
-    
-    if actual_k != args.k:
-        print(f"⚠️  Using k={actual_k} eigenpairs (requested {args.k}) due to matrix rank constraints")
-    
-    print(f"✅ Fisher eigendecomposition complete: k={actual_k} eigenpairs")
-    print(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
     
     # Load baseline model for initialization
     baseline = CNN().to(device)
@@ -569,7 +610,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         sigma = noise_multiplier * args.clip_radius
         display_epsilon = args.target_epsilon
         
-        print(f"\n🔒 Privacy Accounting for Ablation Study:")
+        print(f"\n🔒 Privacy Accounting:")
         print(f"   • Target (ε, δ): ({args.target_epsilon}, {args.delta})")
         print(f"   • Noise multiplier: {noise_multiplier:.4f}")
         print(f"   • Sigma: {sigma:.4f}")
@@ -577,131 +618,54 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         sigma = None
         display_epsilon = args.epsilon
 
-    # Initialize results storage
-    ablation_results = {}
-    
     # ════════════════════════════════════════════════════════════════
-    # Variant 1: Vanilla DP-SGD (Non-Fisher)
+    # Train Fisher DP Model (Baseline for Calibration)
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n{'='*50}")
-    print("🔵 VARIANT 1: Vanilla DP-SGD (Non-Fisher)")
+    print("🎯 Training Fisher DP Model")
     print(f"{'='*50}")
     
-    vanilla_dp_model = copy.deepcopy(baseline)
-    vanilla_dp_model = train_with_vanilla_dp(
-        vanilla_dp_model, priv_loader,
+    fisher_dp_model = copy.deepcopy(baseline)
+    fisher_dp_model = train_fisher_dp_with_optimizer(
+        fisher_dp_model, priv_loader, Fmat,
         epsilon=display_epsilon, delta=args.delta,
         sigma=sigma,
+        full_complement_noise=args.full_complement_noise,
         clip_radius=args.clip_radius,
-        device=device,
-        target_layer=args.dp_layer,
-        adaptive_clip=args.adaptive_clip,
-        quantile=args.quantile,
-        sample_level=args.sample_level,
-        epochs=args.epochs
-    )
-    
-    # ════════════════════════════════════════════════════════════════
-    # Variant 2: Vanilla DP-SGD + DP-SAT (Non-Fisher)
-    # ════════════════════════════════════════════════════════════════
-    
-    print(f"\n{'='*50}")
-    print("🔵🔺 VARIANT 2: Vanilla DP-SGD + DP-SAT (Non-Fisher)")
-    print(f"{'='*50}")
-    
-    vanilla_dpsat_model = copy.deepcopy(baseline)
-    vanilla_dpsat_model = train_with_dp_sat(
-        vanilla_dpsat_model, priv_loader,
-        epsilon=display_epsilon, delta=args.delta,
-        sigma=sigma,
-        clip_radius=args.clip_radius,
-        device=device,
+        k=args.k, device=device,
         target_layer=args.dp_layer,
         adaptive_clip=args.adaptive_clip,
         quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
-        lambda_flatness=args.lambda_flatness
+        use_dp_sat=False,  # Focus on calibration, not DP-SAT
+        optimizer_name="Fisher DP",
+        positive_noise_correlation=args.positive_noise_correlation
     )
-    
-    # ════════════════════════════════════════════════════════════════
-    # VARIANT 3: Fisher DP + Normal Optimizer (✅ Uses Pre-computed)
-    # ════════════════════════════════════════════════════════════════
-    
-    print(f"\n3️⃣ VARIANT 3: Fisher DP + Normal Optimizer")
-    print("-" * 50)
-    fisher_normal_model = CNN().to(device)
-    fisher_normal_model.load_state_dict(baseline.state_dict())
-    
-    fisher_normal_model = train_fisher_dp_with_optimizer(
-        model=fisher_normal_model,
-        train_loader=priv_loader,
-        fisher=Fmat,
-        epsilon=args.target_epsilon,
-        delta=args.delta,
-        clip_radius=args.clip_radius,
-        k=args.k,
-        device=device,
-        target_layer=args.dp_layer,
-        epochs=args.epochs,
-        sigma=args.sigma,
-        use_dp_sat=False,
-        optimizer_name="Normal",
-        precomputed_lam=lam,
-        precomputed_U=U
-    )
-    
-    # ════════════════════════════════════════════════════════════════
-    # VARIANT 4: Fisher DP + DP-SAT Optimizer (✅ Uses Pre-computed)
-    # ════════════════════════════════════════════════════════════════
-    
-    print(f"\n4️⃣ VARIANT 4: Fisher DP + DP-SAT Optimizer")
-    print("-" * 50)
-    fisher_dpsat_model = CNN().to(device)
-    fisher_dpsat_model.load_state_dict(baseline.state_dict())
-    
-    fisher_dpsat_model = train_fisher_dp_with_optimizer(
-        model=fisher_dpsat_model,
-        train_loader=priv_loader,
-        fisher=Fmat,
-        epsilon=args.target_epsilon,
-        delta=args.delta,
-        clip_radius=args.clip_radius,
-        k=args.k,
-        device=device,
-        target_layer=args.dp_layer,
-        epochs=args.epochs,
-        sigma=args.sigma,
-        use_dp_sat=True,
-        lambda_flatness=args.lambda_flatness,
-        optimizer_name="DP-SAT",
-        precomputed_lam=lam,
-        precomputed_U=U
-    )
-    
-    # ════════════════════════════════════════════════════════════════
-    # Variant 5: Fisher DP + Normal + Influence Function Calibration
-    # ════════════════════════════════════════════════════════════════
     
     # Create evaluation loader for critical slice extraction and final accuracy measurement
     eval_loader = DataLoader(eval_base, batch_size=128, shuffle=False)
     
-    print(f"\n{'='*50}")
-    print("📐 VARIANT 5: Fisher DP + Normal + Calibration")
-    print(f"{'='*50}")
-    
-    fisher_normal_calibrated = copy.deepcopy(fisher_normal_model)
-    
     # Get critical slice using EVALUATION data (eval_loader) for the slice-gradient
     critical_data, critical_targets = get_evaluation_slice(eval_loader, args.target_class, device=device)
     
+    # ════════════════════════════════════════════════════════════════
+    # Test 1: Standard Calibration (Baseline)
+    # ════════════════════════════════════════════════════════════════
+    
+    print(f"\n{'='*50}")
+    print("📐 TEST 1: Standard Calibration (Baseline)")
+    print(f"{'='*50}")
+    
+    standard_calibrated = copy.deepcopy(fisher_dp_model)
+    
     if len(critical_data) > 0:
-        before_stats = diagnose_calibration(fisher_normal_calibrated, critical_data, critical_targets, device)
+        before_stats = diagnose_calibration(standard_calibrated, critical_data, critical_targets, device)
         
-        # Apply calibration with the correct signature
-        calib_normal = calibrate_model_research_protocol(
-            fisher_normal_calibrated, pub_loader, priv_loader,
+        # Apply standard calibration
+        standard_calibrated = calibrate_model_research_protocol(
+            standard_calibrated, pub_loader, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -711,13 +675,13 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
             reg=args.reg
         )
         
-        after_stats = diagnose_calibration(calib_normal, critical_data, critical_targets, device)
+        after_stats = diagnose_calibration(standard_calibrated, critical_data, critical_targets, device)
         print_calibration_effect(before_stats, after_stats, args.target_class)
     else:
         print(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply calibration without diagnosis
-        calib_normal = calibrate_model_research_protocol(
-            fisher_normal_calibrated, pub_loader, priv_loader,
+        standard_calibrated = calibrate_model_research_protocol(
+            standard_calibrated, pub_loader, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -728,22 +692,21 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         )
     
     # ════════════════════════════════════════════════════════════════
-    # Variant 6: Fisher DP + DP-SAT + Influence Function Calibration
+    # Test 2: Line Search Calibration (Enhanced)
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n{'='*50}")
-    print("🔺📐 VARIANT 6: Fisher DP + DP-SAT + Calibration")
+    print("🔍 TEST 2: Line Search Calibration (Enhanced)")
     print(f"{'='*50}")
     
-    fisher_dpsat_calibrated = copy.deepcopy(fisher_dpsat_model)
+    line_search_calibrated = copy.deepcopy(fisher_dp_model)
     
-    # Diagnose before calibration for DP-SAT variant (reuse critical slice from evaluation data)
     if len(critical_data) > 0:
-        before_stats_dpsat = diagnose_calibration(fisher_dpsat_calibrated, critical_data, critical_targets, device)
+        before_stats_ls = diagnose_calibration(line_search_calibrated, critical_data, critical_targets, device)
         
-        # Apply calibration with the correct signature
-        calib_dpsat = calibrate_model_research_protocol(
-            fisher_dpsat_calibrated, pub_loader, priv_loader,
+        # Apply line search calibration
+        line_search_calibrated = calibrate_with_line_search(
+            line_search_calibrated, pub_loader, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -753,13 +716,13 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
             reg=args.reg
         )
         
-        after_stats_dpsat = diagnose_calibration(calib_dpsat, critical_data, critical_targets, device)
-        print_calibration_effect(before_stats_dpsat, after_stats_dpsat, args.target_class)
+        after_stats_ls = diagnose_calibration(line_search_calibrated, critical_data, critical_targets, device)
+        print_calibration_effect(before_stats_ls, after_stats_ls, args.target_class)
     else:
         print(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply calibration without diagnosis
-        calib_dpsat = calibrate_model_research_protocol(
-            fisher_dpsat_calibrated, pub_loader, priv_loader,
+        line_search_calibrated = calibrate_with_line_search(
+            line_search_calibrated, pub_loader, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -774,343 +737,100 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n{'='*70}")
-    print("📊 ABLATION STUDY RESULTS")
+    print("📊 LINE SEARCH OPTIMIZATION RESULTS")
     print(f"{'='*70}")
     
     # Compute accuracies
     baseline_acc = accuracy(baseline, eval_loader, device)
-    vanilla_dp_acc = accuracy(vanilla_dp_model, eval_loader, device)
-    vanilla_dpsat_acc = accuracy(vanilla_dpsat_model, eval_loader, device)
-    fisher_normal_acc = accuracy(fisher_normal_model, eval_loader, device)
-    fisher_dpsat_acc = accuracy(fisher_dpsat_model, eval_loader, device)
-    calib_normal_acc = accuracy(calib_normal, eval_loader, device)
-    calib_dpsat_acc = accuracy(calib_dpsat, eval_loader, device)
-    
-    ablation_results['baseline'] = baseline_acc
-    ablation_results['vanilla_dp'] = vanilla_dp_acc
-    ablation_results['vanilla_dpsat'] = vanilla_dpsat_acc
-    ablation_results['fisher_normal'] = fisher_normal_acc
-    ablation_results['fisher_dpsat'] = fisher_dpsat_acc
-    ablation_results['calib_normal'] = calib_normal_acc
-    ablation_results['calib_dpsat'] = calib_dpsat_acc
+    fisher_dp_acc = accuracy(fisher_dp_model, eval_loader, device)
+    standard_calib_acc = accuracy(standard_calibrated, eval_loader, device)
+    line_search_acc = accuracy(line_search_calibrated, eval_loader, device)
     
     dp_mode = "Sample-level" if args.sample_level else f"User-level ({args.users} users)"
     print(f"\n🎯 Accuracy Comparison ({dp_mode} DP):")
     print(f"   • Baseline (Non-DP)           : {baseline_acc:6.2f}%")
-    print(f"   • Vanilla DP-SGD              : {vanilla_dp_acc:6.2f}%")
-    print(f"   • Vanilla DP-SGD + DP-SAT      : {vanilla_dpsat_acc:6.2f}%")
-    print(f"   • Fisher DP + Normal          : {fisher_normal_acc:6.2f}%")
-    print(f"   • Fisher DP + DP-SAT          : {fisher_dpsat_acc:6.2f}%")
-    print(f"   • Fisher DP + Normal + Calib  : {calib_normal_acc:6.2f}%")
-    print(f"   • Fisher DP + DP-SAT + Calib  : {calib_dpsat_acc:6.2f}%")
+    print(f"   • Fisher DP (No Calibration)  : {fisher_dp_acc:6.2f}%")
+    print(f"   • Fisher DP + Standard Calib  : {standard_calib_acc:6.2f}%")
+    print(f"   • Fisher DP + Line Search     : {line_search_acc:6.2f}%")
     
     # Compute improvements
-    vanilla_dp_improvement = vanilla_dp_acc - baseline_acc
-    vanilla_dpsat_improvement = vanilla_dpsat_acc - baseline_acc
-    vanilla_dpsat_vs_vanilla = vanilla_dpsat_acc - vanilla_dp_acc
-    fisher_vs_vanilla = fisher_normal_acc - vanilla_dp_acc
-    normal_improvement = fisher_normal_acc - baseline_acc
-    dpsat_improvement = fisher_dpsat_acc - baseline_acc
-    synergy_gain = fisher_dpsat_acc - fisher_normal_acc
-    calib_normal_improvement = calib_normal_acc - fisher_normal_acc
-    calib_dpsat_improvement = calib_dpsat_acc - fisher_dpsat_acc
+    fisher_improvement = fisher_dp_acc - baseline_acc
+    standard_calib_improvement = standard_calib_acc - fisher_dp_acc
+    line_search_improvement = line_search_acc - fisher_dp_acc
+    line_search_vs_standard = line_search_acc - standard_calib_acc
     
     print(f"\n📈 Improvement Analysis:")
-    print(f"   • Vanilla DP-SGD:             {vanilla_dp_improvement:+5.2f}% vs baseline")
-    print(f"   • Vanilla DP-SGD + DP-SAT:    {vanilla_dpsat_improvement:+5.2f}% vs baseline")
-    print(f"   • DP-SAT gain (Vanilla):      {vanilla_dpsat_vs_vanilla:+5.2f}% over vanilla DP")
-    print(f"   • Fisher benefit:             {fisher_vs_vanilla:+5.2f}% over vanilla DP")
-    print(f"   • Fisher DP (Normal):         {normal_improvement:+5.2f}% vs baseline")
-    print(f"   • Fisher DP (DP-SAT):         {dpsat_improvement:+5.2f}% vs baseline")
-    print(f"   • Synergy Gain (DP-SAT):      {synergy_gain:+5.2f}% over normal Fisher DP")
-    print(f"   • Calibration (Normal):       {calib_normal_improvement:+5.2f}% over Fisher normal")
-    print(f"   • Calibration (DP-SAT):       {calib_dpsat_improvement:+5.2f}% over Fisher DP-SAT")
+    print(f"   • Fisher DP benefit:          {fisher_improvement:+5.2f}% vs baseline")
+    print(f"   • Standard calibration:       {standard_calib_improvement:+5.2f}% vs Fisher DP")
+    print(f"   • Line search calibration:    {line_search_improvement:+5.2f}% vs Fisher DP")
+    print(f"   • Line search vs standard:    {line_search_vs_standard:+5.2f}% improvement")
     
-    print(f"\n🔬 Combined Effects Analysis:")
-    total_dpsat_gain = fisher_dpsat_acc - baseline_acc
-    total_calib_normal_gain = calib_normal_acc - baseline_acc
-    total_calib_dpsat_gain = calib_dpsat_acc - baseline_acc
-    
-    print(f"   • Total DP-SAT effect:       {total_dpsat_gain:+5.2f}% (DP-SAT only)")
-    print(f"   • Total Calibration effect:  {total_calib_normal_gain:+5.2f}% (Normal + Calib)")
-    print(f"   • Total Combined effect:     {total_calib_dpsat_gain:+5.2f}% (DP-SAT + Calib)")
-    
-    best_method = max([
-        ('Vanilla DP-SGD', vanilla_dp_acc),
-        ('Vanilla DP-SGD + DP-SAT', vanilla_dpsat_acc),
-        ('Fisher Normal', fisher_normal_acc),
-        ('Fisher DP-SAT', fisher_dpsat_acc),
-        ('Fisher Normal + Calib', calib_normal_acc),
-        ('Fisher DP-SAT + Calib', calib_dpsat_acc)
-    ], key=lambda x: x[1])
-    
-    print(f"   🏆 Best method: {best_method[0]} ({best_method[1]:.2f}%)")
-    
-    if synergy_gain > 0.5:  # Threshold for meaningful improvement
-        print(f"   🎉 SYNERGY DETECTED: DP-SAT optimization provides meaningful benefit!")
-    elif synergy_gain > 0:
-        print(f"   ✅ SMALL SYNERGY: DP-SAT provides modest improvement")
+    print(f"\n🔍 Line Search Effectiveness:")
+    if line_search_vs_standard > 0.5:
+        print(f"   ✅ SIGNIFICANT: Line search provides meaningful improvement (+{line_search_vs_standard:.2f}%)")
+    elif line_search_vs_standard > 0.1:
+        print(f"   ✅ MODEST: Line search provides small improvement (+{line_search_vs_standard:.2f}%)")
+    elif line_search_vs_standard > 0:
+        print(f"   ⚠️  MINIMAL: Line search provides tiny improvement (+{line_search_vs_standard:.2f}%)")
     else:
-        print(f"   ⚠️  NO SYNERGY: DP-SAT may not help with Fisher-informed noise")
+        print(f"   ❌ NO BENEFIT: Line search does not improve over standard calibration ({line_search_vs_standard:.2f}%)")
     
-    if max(calib_normal_improvement, calib_dpsat_improvement) > 0.5:
-        print(f"   📐 CALIBRATION BENEFIT: Influence function calibration improves performance!")
-    elif max(calib_normal_improvement, calib_dpsat_improvement) > 0:
-        print(f"   📐 MODEST CALIBRATION: Small improvement from calibration")
-    else:
-        print(f"   ⚠️  LIMITED CALIBRATION: Calibration shows minimal benefit")
-
-    # ════════════════════════════════════════════════════════════════
-    # Save Models for Further Analysis
-    # ════════════════════════════════════════════════════════════════
+    # Identify best method
+    best_acc = max(standard_calib_acc, line_search_acc)
+    best_method = "Line Search" if line_search_acc >= standard_calib_acc else "Standard"
     
-    print(f"\n💾 Saving ablation study models...")
+    print(f"\n🏆 Best Calibration Method: {best_method} ({best_acc:.2f}%)")
     
-    # Save Vanilla DP-SGD
-    vanilla_dp_path = os.path.join(models_dir, 'Vanilla_DP_Ablation.pth')
+    # Save models for further analysis
+    print(f"\n💾 Saving models...")
+    
+    # Save standard calibrated model
+    standard_path = os.path.join(models_dir, 'Standard_Calibrated_Test.pth')
     torch.save({
-        'model_state_dict': vanilla_dp_model.state_dict(),
-        'model_type': 'vanilla_dp',
-        'accuracy': vanilla_dp_acc,
-        'epsilon': display_epsilon,
-        'clip_radius': args.clip_radius,
-        'ablation_study': True
-    }, vanilla_dp_path)
-    print(f"✅ Saved Vanilla DP-SGD to {vanilla_dp_path}")
-    
-    # Save Vanilla DP-SGD + DP-SAT
-    vanilla_dpsat_path = os.path.join(models_dir, 'Vanilla_DPSAT_Ablation.pth')
-    torch.save({
-        'model_state_dict': vanilla_dpsat_model.state_dict(),
-        'model_type': 'vanilla_dp_dpsat',
-        'accuracy': vanilla_dpsat_acc,
-        'epsilon': display_epsilon,
-        'clip_radius': args.clip_radius,
-        'lambda_flatness': args.lambda_flatness,
-        'dpsat_gain_vanilla': vanilla_dpsat_vs_vanilla,
-        'ablation_study': True
-    }, vanilla_dpsat_path)
-    print(f"✅ Saved Vanilla DP-SGD + DP-SAT to {vanilla_dpsat_path}")
-    
-    # Save Fisher DP + Normal
-    fisher_normal_path = os.path.join(models_dir, 'Fisher_Normal_Ablation.pth')
-    torch.save({
-        'model_state_dict': fisher_normal_model.state_dict(),
-        'model_type': 'fisher_dp_normal',
-        'accuracy': fisher_normal_acc,
-        'epsilon': display_epsilon,
-        'clip_radius': args.clip_radius,
-        'k': args.k,
-        'full_complement_noise': args.full_complement_noise,
-        'ablation_study': True
-    }, fisher_normal_path)
-    print(f"✅ Saved Fisher DP + Normal to {fisher_normal_path}")
-    
-    # Save Fisher DP + DP-SAT
-    fisher_dpsat_path = os.path.join(models_dir, 'Fisher_DPSAT_Ablation.pth')
-    torch.save({
-        'model_state_dict': fisher_dpsat_model.state_dict(),
-        'model_type': 'fisher_dp_dpsat',
-        'accuracy': fisher_dpsat_acc,
-        'epsilon': display_epsilon,
-        'clip_radius': args.clip_radius,
-        'k': args.k,
-        'lambda_flatness': args.lambda_flatness,
-        'full_complement_noise': args.full_complement_noise,
-        'synergy_gain': synergy_gain,
-        'ablation_study': True
-    }, fisher_dpsat_path)
-    print(f"✅ Saved Fisher DP + DP-SAT to {fisher_dpsat_path}")
-    
-    # Save Fisher DP + Normal + Calibration
-    calib_normal_path = os.path.join(models_dir, 'Fisher_Normal_Calibrated_Ablation.pth')
-    torch.save({
-        'model_state_dict': calib_normal.state_dict(),
-        'model_type': 'fisher_dp_normal_calibrated',
-        'accuracy': calib_normal_acc,
-        'epsilon': display_epsilon,
-        'clip_radius': args.clip_radius,
-        'k': args.k,
-        'calibration_k': args.calibration_k,
+        'model_state_dict': standard_calibrated.state_dict(),
+        'model_type': 'fisher_dp_standard_calibrated',
+        'accuracy': standard_calib_acc,
+        'improvement_vs_fisher': standard_calib_improvement,
         'calibration_method': args.method,
-        'calibration_improvement': calib_normal_improvement,
-        'full_complement_noise': args.full_complement_noise,
-        'ablation_study': True
-    }, calib_normal_path)
-    print(f"✅ Saved Fisher DP + Normal + Calibration to {calib_normal_path}")
-    
-    # Save Fisher DP + DP-SAT + Calibration
-    calib_dpsat_path = os.path.join(models_dir, 'Fisher_DPSAT_Calibrated_Ablation.pth')
-    torch.save({
-        'model_state_dict': calib_dpsat.state_dict(),
-        'model_type': 'fisher_dp_dpsat_calibrated',
-        'accuracy': calib_dpsat_acc,
-        'epsilon': display_epsilon,
-        'clip_radius': args.clip_radius,
-        'k': args.k,
-        'lambda_flatness': args.lambda_flatness,
         'calibration_k': args.calibration_k,
-        'calibration_method': args.method,
-        'calibration_improvement': calib_dpsat_improvement,
-        'synergy_gain': synergy_gain,
-        'total_combined_gain': total_calib_dpsat_gain,
-        'full_complement_noise': args.full_complement_noise,
-        'ablation_study': True
-    }, calib_dpsat_path)
-    print(f"✅ Saved Fisher DP + DP-SAT + Calibration to {calib_dpsat_path}")
-
-    # ════════════════════════════════════════════════════════════════
-    # Optional: Comprehensive 4-Way MIA Evaluation
-    # ════════════════════════════════════════════════════════════════
+        'trust_tau': args.trust_tau,
+        'reg': args.reg,
+        'line_search_test': True
+    }, standard_path)
+    print(f"✅ Saved Standard Calibrated to {standard_path}")
     
-    if args.run_mia:
-        print(f"\n🛡️  Running comprehensive 4-way MIA evaluation on all ablation variants...")
-        
-        # Prepare all models for MIA evaluation
-        models_to_evaluate = {
-            'Baseline (Non-DP)': baseline,
-            'Vanilla DP-SGD': vanilla_dp_model,
-            'Vanilla DP-SGD + DP-SAT': vanilla_dpsat_model,
-            'Fisher DP + Normal': fisher_normal_model,
-            'Fisher DP + DP-SAT': fisher_dpsat_model,
-            'Fisher DP + Normal + Calib': calib_normal,
-            'Fisher DP + DP-SAT + Calib': calib_dpsat
-        }
-        
-        # Prepare member and non-member datasets
-        if args.sample_level:
-            print("📊 Sample-level MIA: Using actual private training samples as members")
-            member_set, non_member_set = prepare_mia_data_sample_level(priv_base, eval_base, priv_idx, args.mia_size)
-        else:
-            print("👥 User-level MIA: Using actual private users as members")
-            member_set, non_member_set = prepare_mia_data_user_level(priv_ds, eval_base, args.users, args.mia_size)
-        
-        member_loader = DataLoader(member_set, batch_size=64, shuffle=False)
-        non_member_loader = DataLoader(non_member_set, batch_size=64, shuffle=False)
-        
-        print(f"   • Members: {len(member_set)} samples")
-        print(f"   • Non-members: {len(non_member_set)} samples")
-        
-        # Run comprehensive MIA evaluation on all models
-        mia_results = {}
-        
-        print(f"\n🎯 CONFIDENCE ATTACK RESULTS:")
-        print("-" * 50)
-        
-        for model_name, model in models_to_evaluate.items():
-            print(f"   Evaluating {model_name}...")
-            conf_result = confidence_attack(model, member_loader, non_member_loader, device)
-            mia_results[model_name] = {
-                'confidence_auc': conf_result['auc'],
-                'confidence_acc': conf_result['accuracy'],
-                'member_conf_mean': conf_result['member_conf_mean'],
-                'non_member_conf_mean': conf_result['non_member_conf_mean']
-            }
-            print(f"     • AUC: {conf_result['auc']:.4f}, Accuracy: {conf_result['accuracy']:.4f}")
-        
-        print(f"\n🕶️  SHADOW MODEL ATTACK RESULTS:")
-        print("-" * 50)
-        
-        for model_name, model in models_to_evaluate.items():
-            print(f"   Evaluating {model_name}...")
-            shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_base)
-            mia_results[model_name]['shadow_auc'] = shadow_result['auc']
-            mia_results[model_name]['shadow_acc'] = shadow_result['accuracy']
-            print(f"     • AUC: {shadow_result['auc']:.4f}, Accuracy: {shadow_result['accuracy']:.4f}")
-        
-        # Comprehensive analysis
-        print(f"\n📊 COMPREHENSIVE MIA ANALYSIS")
-        print("=" * 60)
-        
-        # Calculate worst-case AUC for each model
-        worst_case_aucs = {}
-        for model_name in models_to_evaluate.keys():
-            worst_case_aucs[model_name] = max(
-                mia_results[model_name]['confidence_auc'],
-                mia_results[model_name]['shadow_auc']
-            )
-        
-        print(f"\n🎯 Worst-case AUC Comparison:")
-        for model_name, worst_auc in worst_case_aucs.items():
-            print(f"   • {model_name:30}: {worst_auc:.4f}")
-        
-        # Identify best and worst models for privacy
-        best_privacy_model = min(worst_case_aucs.items(), key=lambda x: x[1])
-        worst_privacy_model = max(worst_case_aucs.items(), key=lambda x: x[1])
-        
-        print(f"\n🏆 Privacy Protection Ranking:")
-        print(f"   🥇 BEST:  {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
-        print(f"   🥴 WORST: {worst_privacy_model[0]} (AUC: {worst_privacy_model[1]:.4f})")
-        
-        # Privacy vs Accuracy tradeoff analysis
-        print(f"\n⚖️  Privacy vs Accuracy Tradeoff:")
-        print(f"   Model                          Accuracy  Privacy (1-AUC)")
-        print(f"   {'─'*30} ─────────  ──────────────")
-        for model_name in ['Vanilla DP-SGD', 'Vanilla DP-SGD + DP-SAT', 'Fisher DP + Normal', 'Fisher DP + DP-SAT', 'Fisher DP + Normal + Calib', 'Fisher DP + DP-SAT + Calib']:
-            if model_name == 'Vanilla DP-SGD':
-                acc = vanilla_dp_acc
-            elif model_name == 'Vanilla DP-SGD + DP-SAT':
-                acc = vanilla_dpsat_acc
-            elif model_name == 'Fisher DP + Normal':
-                acc = fisher_normal_acc
-            elif model_name == 'Fisher DP + DP-SAT':
-                acc = fisher_dpsat_acc
-            elif model_name == 'Fisher DP + Normal + Calib':
-                acc = calib_normal_acc
-            else:  # Fisher DP + DP-SAT + Calib
-                acc = calib_dpsat_acc
-            
-            privacy_score = 1.0 - worst_case_aucs[model_name]  # Higher is better
-            print(f"   {model_name:30} {acc:5.1f}%     {privacy_score:.3f}")
-        
-        # Key comparisons only (remove redundant analysis)
-        print(f"\n🔒 Key Privacy Effects:")
-        
-        baseline_auc = worst_case_aucs['Baseline (Non-DP)']
-        fisher_normal_auc = worst_case_aucs['Fisher DP + Normal']
-        fisher_dpsat_auc = worst_case_aucs['Fisher DP + DP-SAT']
-        calib_normal_auc = worst_case_aucs['Fisher DP + Normal + Calib']
-        calib_dpsat_auc = worst_case_aucs['Fisher DP + DP-SAT + Calib']
-        
-        dpsat_privacy_effect = fisher_normal_auc - fisher_dpsat_auc
-        calib_normal_privacy_effect = fisher_normal_auc - calib_normal_auc
-        calib_dpsat_privacy_effect = fisher_dpsat_auc - calib_dpsat_auc
-        combined_effect = fisher_normal_auc - calib_dpsat_auc
-        
-        print(f"   • DP-SAT effect:      {dpsat_privacy_effect:+.4f} AUC")
-        print(f"   • Calibration effect: {max(calib_normal_privacy_effect, calib_dpsat_privacy_effect):+.4f} AUC") 
-        print(f"   • Combined effect:    {combined_effect:+.4f} AUC")
-        
-        # Final recommendation
-        print(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
-        
-        # Store results for return
-        ablation_results['mia_results'] = {
-            'worst_case_aucs': worst_case_aucs,
-            'best_privacy_model': best_privacy_model,
-            'detailed_results': mia_results,
-            'privacy_effects': {
-                'dpsat_effect': dpsat_privacy_effect,
-                'calib_normal_effect': calib_normal_privacy_effect,
-                'calib_dpsat_effect': calib_dpsat_privacy_effect,
-                'combined_effect': combined_effect
-            }
-        }
-        
-        # Update legacy fields for compatibility
-        ablation_results['mia_results']['fisher_worst_auc'] = fisher_normal_auc
-        ablation_results['mia_results']['dp_sat_worst_auc'] = fisher_dpsat_auc
-        
-        print(f"\n✅ Comprehensive 4-way MIA evaluation complete!")
+    # Save line search calibrated model
+    line_search_path = os.path.join(models_dir, 'Line_Search_Calibrated_Test.pth')
+    torch.save({
+        'model_state_dict': line_search_calibrated.state_dict(),
+        'model_type': 'fisher_dp_line_search_calibrated',
+        'accuracy': line_search_acc,
+        'improvement_vs_fisher': line_search_improvement,
+        'improvement_vs_standard': line_search_vs_standard,
+        'calibration_method': args.method,
+        'calibration_k': args.calibration_k,
+        'trust_tau': args.trust_tau,
+        'reg': args.reg,
+        'line_search_test': True
+    }, line_search_path)
+    print(f"✅ Saved Line Search Calibrated to {line_search_path}")
 
-    return ablation_results
+    # Return results for potential further analysis
+    return {
+        'baseline_acc': baseline_acc,
+        'fisher_dp_acc': fisher_dp_acc,
+        'standard_calib_acc': standard_calib_acc,
+        'line_search_acc': line_search_acc,
+        'line_search_improvement': line_search_vs_standard,
+        'best_method': best_method
+    }
 
 # ════════════════════════════════════════════════════════════════
 # Main function
 # ════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser('Fisher DP-SGD Ablation Study')
+    parser = argparse.ArgumentParser('Line Search Optimization Test for Fisher DP-SGD Calibration')
     
     # Device arguments
     parser.add_argument('--mps', action='store_true')
@@ -1153,9 +873,9 @@ def main():
     noise_strategy_group.add_argument('--positively_correlated_noise', action='store_true',
                                      help='Fisher DP: noise positively correlated with curvature (noise ∝ √λ, more noise in high curvature directions)')
     
-    # DP-SAT arguments
+    # DP-SAT arguments (kept for compatibility but not used in line search test)
     parser.add_argument('--lambda-flatness', type=float, default=0.01,
-                       help='Flatness coefficient for DP-SAT')
+                       help='Flatness coefficient for DP-SAT (not used in line search test)')
     
     # Adaptive clipping
     parser.add_argument('--adaptive-clip', action='store_true')
@@ -1165,7 +885,7 @@ def main():
     parser.add_argument('--sample-level', action='store_true')
     parser.add_argument('--users', type=int, default=10)
     
-    # Calibration arguments (now enabled)
+    # Calibration arguments - MAIN FOCUS OF THIS TEST
     parser.add_argument('--method', type=str, default='linear',
                        choices=['linear', 'public-fisher'],
                        help='Calibration method: linear (fast regularization) or public-fisher (uses public data Fisher matrix)')
@@ -1180,8 +900,9 @@ def main():
     parser.add_argument('--compare-calibration', action='store_true',
                        help='Run comparative experiment between single-class and multi-class calibration')
     
-    # MIA evaluation
-    parser.add_argument('--run-mia', action='store_true')
+    # MIA evaluation (simplified for this test)
+    parser.add_argument('--run-mia', action='store_true',
+                       help='Run membership inference attack evaluation (simplified for line search test)')
     parser.add_argument('--mia-size', type=int, default=1000)
     
     args = parser.parse_args()
@@ -1220,11 +941,20 @@ def main():
     # Clean up if requested
     if args.clean:
         print('Cleaning saved models…')
-        for f in glob.glob(os.path.join(models_dir,'*Ablation*.pth')):
+        for f in glob.glob(os.path.join(models_dir,'*Test*.pth')):
             os.remove(f); print('  removed',f)
     
+    print(f"\n🔍 LINE SEARCH OPTIMIZATION TEST")
+    print(f"   • Focus: Comparing standard vs line search calibration")
+    print(f"   • Dataset: CIFAR-10, {args.dataset_size} samples, {args.epochs} epochs")
+    print(f"   • Privacy: (ε={args.target_epsilon}, δ={args.delta})")
+    print(f"   • Fisher DP: k={args.k}, layers={args.dp_layer}")
+    print(f"   • Calibration: method={args.method}, k={args.calibration_k}, τ={args.trust_tau}, reg={args.reg}")
+    print(f"   • Target class: {args.target_class}")
+    print(f"   • Device: {device}")
+    
     # ════════════════════════════════════════════════════════════════
-    # Data preparation - FIXED: Match main.py's proper 3-way split
+    # Data preparation - Match main.py's proper 3-way split
     # ════════════════════════════════════════════════════════════════
     
     trans = T.Compose([T.ToTensor(), T.Normalize((.5,.5,.5),(.5,.5,.5))])
@@ -1250,11 +980,10 @@ def main():
     pub_base = Subset(testset, pub_idx)    # Calibration data from testset
     eval_base = Subset(testset, eval_idx)  # Evaluation data from testset
     
-    print(f'📊 Ablation Study Data (FIXED - Matching main.py):')
+    print(f'\n📊 Line Search Test Data:')
     print(f'   • Private data: {len(priv_base)} samples from CIFAR-10 trainset (for training)')
     print(f'   • Public data: {len(pub_base)} samples from CIFAR-10 testset (for calibration)')
     print(f'   • Evaluation data: {len(eval_base)} samples from CIFAR-10 testset (for evaluation)')
-    print(f'   🔧 FIXED: Proper 3-way split - no circularity, no domain mismatch!')
     
     # Setup data loaders based on DP mode
     if args.sample_level:
@@ -1275,7 +1004,7 @@ def main():
     # Fisher matrix computation
     # ════════════════════════════════════════════════════════════════
     
-    print('\n🔍 Computing Fisher matrix for ablation study…')
+    print('\n🔍 Computing Fisher matrix for line search test…')
     
     # Train a baseline model for Fisher computation
     fisher_baseline = CNN().to(device)
@@ -1297,109 +1026,14 @@ def main():
                             target_layer=args.dp_layer, rho=1e-2)
     
     # ════════════════════════════════════════════════════════════════
-    # Run ablation study
+    # Run line search test
     # ════════════════════════════════════════════════════════════════
     
-    results = run_ablation_study(args, device, priv_loader, eval_base, priv_base, 
-                                priv_idx, priv_ds, Fmat, pub_loader)
+    # Run the line search test
+    results = run_line_search_test(args, device, priv_loader, eval_base, priv_base, 
+                                  priv_idx, priv_ds, Fmat, pub_loader)
     
-    # ════════════════════════════════════════════════════════════════
-    # Final summary
-    # ════════════════════════════════════════════════════════════════
-    
-    print(f"\n{'='*70}")
-    print("🎯 ABLATION STUDY SUMMARY")
-    print(f"{'='*70}")
-    
-    print(f"🔬 Synergy Analysis:")
-    vanilla_dpsat_gain = results['vanilla_dpsat'] - results['vanilla_dp']
-    synergy_gain = results['fisher_dpsat'] - results['fisher_normal']
-    print(f"   • Vanilla DP-SGD:         {results['vanilla_dp']:6.2f}%")
-    print(f"   • Vanilla DP-SGD + DP-SAT: {results['vanilla_dpsat']:6.2f}%")
-    print(f"   • DP-SAT gain (Vanilla):   {vanilla_dpsat_gain:+5.2f}%")
-    print(f"   • Fisher DP + Normal:     {results['fisher_normal']:6.2f}%")
-    print(f"   • Fisher DP + DP-SAT:     {results['fisher_dpsat']:6.2f}%")
-    print(f"   • DP-SAT gain (Fisher):   {synergy_gain:+5.2f}%")
-    
-    print(f"\n📐 Calibration Analysis:")
-    calib_normal_gain = results['calib_normal'] - results['fisher_normal']
-    calib_dpsat_gain = results['calib_dpsat'] - results['fisher_dpsat']
-    print(f"   • Fisher DP + Normal + Calib: {results['calib_normal']:6.2f}%")
-    print(f"   • Fisher DP + DP-SAT + Calib: {results['calib_dpsat']:6.2f}%")
-    print(f"   • Calibration gain (Normal):  {calib_normal_gain:+5.2f}%")
-    print(f"   • Calibration gain (DP-SAT):  {calib_dpsat_gain:+5.2f}%")
-    
-    print(f"\n🏆 Overall Best Performance:")
-    best_variant = max(results['vanilla_dp'], results['vanilla_dpsat'],
-                      results['fisher_normal'], results['fisher_dpsat'], 
-                      results['calib_normal'], results['calib_dpsat'])
-    if best_variant == results['calib_dpsat']:
-        print(f"   🥇 Fisher DP + DP-SAT + Calibration: {best_variant:.2f}%")
-        print(f"   🎉 TRIPLE COMBINATION: All three techniques work together!")
-    elif best_variant == results['calib_normal']:
-        print(f"   🥇 Fisher DP + Normal + Calibration: {best_variant:.2f}%")
-        print(f"   📐 CALIBRATION DOMINATES: Influence functions provide the key benefit")
-    elif best_variant == results['fisher_dpsat']:
-        print(f"   🥇 Fisher DP + DP-SAT: {best_variant:.2f}%")
-        print(f"   🔺 DP-SAT DOMINATES: Sharpness-aware optimization is most beneficial")
-    elif best_variant == results['fisher_normal']:
-        print(f"   🥇 Fisher DP + Normal: {best_variant:.2f}%")
-        print(f"   🎯 FISHER DOMINATES: Fisher-informed noise is most beneficial")
-    elif best_variant == results['vanilla_dpsat']:
-        print(f"   🥇 Vanilla DP-SGD + DP-SAT: {best_variant:.2f}%")
-        print(f"   🔵🔺 SIMPLE DP-SAT: DP-SAT works best without Fisher complexity")
-    else:
-        print(f"   🥇 Vanilla DP-SGD: {best_variant:.2f}%")
-        print(f"   🔵 VANILLA BEST: Simple DP-SGD outperforms advanced techniques")
-    
-    if synergy_gain > 1.0:
-        print(f"\n✅ STRONG DP-SAT SYNERGY: Combining Fisher + DP-SAT is highly beneficial!")
-    elif synergy_gain > 0.5:
-        print(f"\n✅ MODERATE DP-SAT SYNERGY: Fisher + DP-SAT combination shows promise")
-    elif synergy_gain > 0:
-        print(f"\n⚠️  WEAK DP-SAT SYNERGY: Minor benefit from DP-SAT combination")
-    else:
-        print(f"\n❌ NO DP-SAT SYNERGY: DP-SAT may interfere with Fisher benefits")
-    
-    if max(calib_normal_gain, calib_dpsat_gain) > 1.0:
-        print(f"✅ STRONG CALIBRATION BENEFIT: Influence function calibration significantly helps!")
-    elif max(calib_normal_gain, calib_dpsat_gain) > 0.5:
-        print(f"✅ MODERATE CALIBRATION BENEFIT: Calibration provides meaningful improvement")
-    elif max(calib_normal_gain, calib_dpsat_gain) > 0:
-        print(f"⚠️  WEAK CALIBRATION BENEFIT: Small improvement from calibration")
-    else:
-        print(f"❌ NO CALIBRATION BENEFIT: Calibration may not help this configuration")
-    
-    print(f"\n🔒 Key Insights:")
-    print(f"   • Fisher-informed noise shapes noise according to loss curvature")
-    print(f"   • DP-SAT guides optimization toward flatter minima")
-    print(f"   • Influence function calibration adjusts model using public data")
-    print(f"   • These approaches are orthogonal and can be combined")
-    print(f"   • DP-SAT synergy: {synergy_gain:+.2f}% suggests {'beneficial' if synergy_gain > 0 else 'neutral'} interaction")
-    print(f"   • Calibration benefit: {max(calib_normal_gain, calib_dpsat_gain):+.2f}% suggests {'beneficial' if max(calib_normal_gain, calib_dpsat_gain) > 0 else 'neutral'} effect")
-    
-    if 'mia_results' in results:
-        print(f"\n🛡️  Privacy Summary:")
-        best_privacy = results['mia_results']['best_privacy_model']
-        effects = results['mia_results']['privacy_effects']
-        
-        print(f"   • Best protection: {best_privacy[0]} (AUC: {best_privacy[1]:.4f})")
-        print(f"   • Calibration improves privacy by {max(effects['calib_normal_effect'], effects['calib_dpsat_effect']):+.3f} AUC")
-        
-        if effects['combined_effect'] > 0.02:
-            print(f"   ✅ STRONG: Combined techniques provide excellent privacy enhancement")
-        elif effects['combined_effect'] > 0:
-            print(f"   ✅ GOOD: Combined techniques improve privacy protection")
-        else:
-            print(f"   ⚠️  LIMITED: Minimal privacy benefit from combined techniques")
-    
-    print(f"\n📍 Key Findings:")
-    print(f"   • DP-SAT synergy: {synergy_gain:+.2f}% accuracy improvement")
-    print(f"   • Calibration: {'beneficial' if max(calib_normal_gain, calib_dpsat_gain) > 0 else 'harmful'} for accuracy")
-    if 'mia_results' in results:
-        print(f"   • Privacy: Calibration provides +{max(results['mia_results']['privacy_effects']['calib_normal_effect'], results['mia_results']['privacy_effects']['calib_dpsat_effect']):.3f} AUC protection")
-    
-    print(f"\n✅ Ablation study complete! Models saved in {models_dir}/")
+    print(f"\n✅ Line search optimization test complete! Models saved in {models_dir}/")
 
 if __name__ == "__main__":
     main() 

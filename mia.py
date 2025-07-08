@@ -21,7 +21,11 @@ from model import CNN
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-NUM_RUNS = 1 
+# Set reproducible random seeds for consistent MIA evaluation
+from config import set_random_seeds
+set_random_seeds()
+
+NUM_RUNS = 5 
 
 def unpack_batch(batch_data):
     """Helper function to handle both (x, y) and (x, y, user_id) formats"""
@@ -449,9 +453,6 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         dp_sat_model: Optional DP-SAT model for comparison
         l2_baseline_model: Optional L2 regularized baseline model for comparison
     """
-    # Set reproducible random seeds for consistent MIA evaluation
-    from config import set_random_seeds
-    set_random_seeds()
     
     print(f"\n🛡️  MEMBERSHIP INFERENCE ATTACK EVALUATION")
     
