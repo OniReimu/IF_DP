@@ -93,20 +93,7 @@ Standard per-sample gradient clipping + isotropic Gaussian noise.
 
 We use the following configuration:
 ```bash
---k 2048 --epochs 50 --dataset-size 50000 --target-epsilon 2.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 2.0 --calibration-k 200 --trust-tau 0.0005 --reg 10
-```
-
-### 10 Users
-```
-⚖️  Privacy vs Accuracy Tradeoff:
-   Model                          Accuracy  Privacy (1-AUC)
-   ────────────────────────────── ─────────  ──────────────
-   Vanilla DP-SGD                  59.2%     0.494
-   Vanilla DP-SGD + DP-SAT         61.1%     0.492
-   Fisher DP + Normal              61.6%     0.491
-   Fisher DP + DP-SAT              61.9%     0.478
-   Fisher DP + Normal + Calib      62.0%     0.491
-   Fisher DP + DP-SAT + Calib      62.4%     0.488
+uv run ablation_optimized.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 2.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 2.0 --run-mia --users 100 --calibration-k 200 --trust-tau 0.0005 --reg 10
 ```
 
 ### 100 Users
@@ -114,58 +101,36 @@ We use the following configuration:
 ⚖️  Privacy vs Accuracy Tradeoff:
    Model                          Accuracy  Privacy (1-AUC)
    ────────────────────────────── ─────────  ──────────────
-   Vanilla DP-SGD                  49.0%     0.448
-   Vanilla DP-SGD + DP-SAT         55.4%     0.453
-   Fisher DP + Normal              65.6%     0.436
-   Fisher DP + DP-SAT              68.9%     0.423
-   Fisher DP + Normal + Calib      67.3%     0.433
-   Fisher DP + DP-SAT + Calib      70.9%     0.418
+   Vanilla DP-SGD                  48.3%     0.509
+   Vanilla DP-SGD + DP-SAT         50.2%     0.500
+   Fisher DP + Normal              65.7%     0.498
+   Fisher DP + DP-SAT              63.4%     0.493
+   Fisher DP + Normal + Calib      66.8%     0.491
+   Fisher DP + DP-SAT + Calib      64.2%     0.506
 ```
 
-### 200 Users
-```
-⚖️  Privacy vs Accuracy Tradeoff:
-   Model                          Accuracy  Privacy (1-AUC)
-   ────────────────────────────── ─────────  ──────────────
-   Vanilla DP-SGD                  33.7%     0.482
-   Vanilla DP-SGD + DP-SAT         31.6%     0.491
-   Fisher DP + Normal              50.1%     0.458
-   Fisher DP + DP-SAT              48.4%     0.449
-   Fisher DP + Normal + Calib      51.6%     0.457
-   Fisher DP + DP-SAT + Calib      52.4%     0.446
-```
+**Key Discovery**: Fisher DP-SGD shows significant improvements over vanilla DP-SGD, with Fisher DP + Normal + Calibration achieving the best accuracy of 66.8% while maintaining strong privacy protection (1-AUC = 0.491).
 
-### 400 Users
-```
-⚖️  Privacy vs Accuracy Tradeoff:
-   Model                          Accuracy  Privacy (1-AUC)
-   ────────────────────────────── ─────────  ──────────────
-   Vanilla DP-SGD                  17.8%     0.501
-   Vanilla DP-SGD + DP-SAT         20.2%     0.497
-   Fisher DP + Normal              38.4%     0.476
-   Fisher DP + DP-SAT              35.3%     0.493
-   Fisher DP + Normal + Calib      39.1%     0.477
-   Fisher DP + DP-SAT + Calib      35.9%     0.488
-```
+### Sample-Level DP
 
+Using sample-level configuration:
 ```bash
---k 2048 --epochs 50 --dataset-size 50000 --target-epsilon 8.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 1.0 --calibration-k 200 --trust-tau 0.0005 --reg 10
+uv run ablation_optimized.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 5.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 1.0 --run-mia --sample-level --calibration-k 200 --trust-tau 0.0005 --reg 10
 ```
 
-### Sample-Level
 ```
 ⚖️  Privacy vs Accuracy Tradeoff:
    Model                          Accuracy  Privacy (1-AUC)
    ────────────────────────────── ─────────  ──────────────
-   Vanilla DP-SGD                  71.1%     0.397
-   Vanilla DP-SGD + DP-SAT         69.9%     0.413
-   Fisher DP + Normal              73.9%     0.377
-   Fisher DP + DP-SAT              72.7%     0.369
-   Fisher DP + Normal + Calib      74.4%     0.373
-   Fisher DP + DP-SAT + Calib      73.3%     0.364
+   Vanilla DP-SGD                  59.8%     0.473
+   Vanilla DP-SGD + DP-SAT         59.4%     0.477
+   Fisher DP + Normal              64.0%     0.464
+   Fisher DP + DP-SAT              65.7%     0.534
+   Fisher DP + Normal + Calib      64.6%     0.461
+   Fisher DP + DP-SAT + Calib      66.4%     0.536
 ```
 
-**Key Discovery**: Fisher DP-SGD shows consistent improvements across different user counts, with the best performance at 100 users achieving 70.9% accuracy with strong privacy protection (1-AUC = 0.418).
+**Sample-Level Discovery**: Fisher DP + DP-SAT + Calibration achieves the highest accuracy of 66.4% in sample-level DP, demonstrating the effectiveness of combining all three techniques.
 
 ## 🔧 **Configuration Options**
 
