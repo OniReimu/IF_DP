@@ -20,28 +20,28 @@ pip install torch torchvision numpy scipy scikit-learn tqdm opacus
 ### Run Single Experiments
 ```bash
 # Compare all three methods (default: positively correlated noise)
-python main.py --mps --compare-others --target-epsilon 10.0 --run-mia
+uv run main.py --mps --compare-others --target-epsilon 10.0 --run-mia
 
 # Try negatively correlated noise strategy
-python main.py --mps --compare-others --negatively_correlated_noise --target-epsilon 10.0
+uv run main.py --mps --compare-others --negatively_correlated_noise --target-epsilon 10.0
 
 # Run ablation study with Fisher + DP-SAT synergy
-python ablation.py --mps --target-epsilon 10.0 --k 64 --lambda-flatness 0.01 --run-mia
+uv run ablation.py --mps --target-epsilon 10.0 --k 64 --lambda-flatness 0.01 --run-mia
 ```
 
 ### Run Systematic Validation Studies
 ```bash
 # 1. List available experiment configurations
-python visual_discovery_analysis.py --list-configs
+uv run visual_discovery_analysis.py --list-configs
 
 # 2. Run user count sensitivity experiments (10 experiments total)
-python visual_discovery_analysis.py --config validation_config_users_num.json
+uv run visual_discovery_analysis.py --config validation_config_users_num.json
 
 # 3. Run clip radius sensitivity experiments (10 experiments total)
-python visual_discovery_analysis.py --config validation_config_clip_radius.json
+uv run visual_discovery_analysis.py --config validation_config_clip_radius.json
 
 # 4. Generate comprehensive plots from results
-python visual_plotter.py --latest
+uv run visual_plotter.py --latest
 ```
 
 ## 🎨 **Configuration-Driven Validation System**
@@ -89,7 +89,7 @@ Create new config file in `validation_configs/`:
 ### Vanilla DP-SGD: Standard Baseline
 Standard per-sample gradient clipping + isotropic Gaussian noise.
 
-## 📊 **Experimental Results**
+## 📊 **Experimental Results (negatively related noise)**
 
 We use the following configuration:
 ```bash
@@ -172,22 +172,22 @@ uv run ablation_optimized.py --mps --k 2048 --epochs 100 --dataset-size 50000 --
 
 ### Compare Noise Strategies
 ```bash
-python main.py --positively_correlated_noise --target-epsilon 8.0 --compare-others --run-mia
-python main.py --negatively_correlated_noise --target-epsilon 8.0 --compare-others --run-mia
+uv run main.py --positively_correlated_noise --target-epsilon 8.0 --compare-others --run-mia
+uv run main.py --negatively_correlated_noise --target-epsilon 8.0 --compare-others --run-mia
 ```
 
 ### Privacy-Utility Tradeoffs
 ```bash
 for eps in 1.0 5.0 10.0 20.0; do
-    python main.py --target-epsilon $eps --compare-others --run-mia
+    uv run main.py --target-epsilon $eps --compare-others --run-mia
 done
 ```
 
 ### Systematic Validation
 ```bash
 # Run comprehensive experiments
-python visual_discovery_analysis.py --config validation_config_users_num.json
-python visual_plotter.py --latest
+uv run visual_discovery_analysis.py --config validation_config_users_num.json
+uv run visual_plotter.py --latest
 ```
 
 ## 🏗️ **Core Files**
