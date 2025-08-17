@@ -93,7 +93,9 @@ def print_calibration_effect(before_stats, after_stats, target_class="all"):
 # ════════════════════════════════════════════════════════════════
 
 def _eval_slice_loss(model, critical_data, critical_targets, device):
-    """Helper function to evaluate loss on critical slice."""
+    """Helper function to evaluate loss on critical slice.
+    Paper mapping — used to compute L_crit(θ) for back-tracking line search (Step d(iii)).
+    """
     if len(critical_data) == 0:
         return float('inf')
     
@@ -115,7 +117,14 @@ def _add_delta(model, delta, scale=1.0):
 def calibrate_with_line_search(model, pub_loader, priv_loader, critical_data, critical_targets, 
                               device, method='linear', eta=100, trust_tau=0.01, reg=10.0, 
                               strict=True, clean_model=None):
-    """Enhanced calibration with line search optimization for optimal step size."""
+    """Enhanced calibration with line search optimization for optimal step size.
+    
+    Paper mapping — Step d(iii): Back-tracking line search over α ∈ {1, 1/2, 1/4, …}
+    We:
+      1) call calibrate_model_research_protocol to compute a base Δθ (Steps c–d(ii)),
+      2) extract Δθ, then evaluate L_crit(θ + αΔθ) for a candidate set,
+      3) pick α that yields the lowest L_crit on the critical slice.
+    """
     
     print(f"🔍 Line Search Calibration:")
     print(f"   • Method: {method}")
@@ -124,6 +133,7 @@ def calibrate_with_line_search(model, pub_loader, priv_loader, critical_data, cr
     print(f"   • Regularization: {reg}")
     
     # First get the standard influence update
+    # Paper mapping — Steps 3–4(b): compute α(z), select top-η, form Δθ via influence vectors
     calibrated_model = calibrate_model_research_protocol(
         copy.deepcopy(model), pub_loader, priv_loader,
         critical_data, critical_targets, device=device,
@@ -138,6 +148,7 @@ def calibrate_with_line_search(model, pub_loader, priv_loader, critical_data, cr
             delta[name] = new_param.data - orig_param.data
     
     # Line search over different scales
+    # Paper mapping — Step d(iii): try α ∈ {0, 1/4, 1/2, 3/4, 1, 5/4, 3/2, 2} and pick best
     candidates = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     best_loss, best_gamma = float('inf'), 0.0
     
@@ -165,7 +176,12 @@ def calibrate_with_combined_optimization(model, pub_loader, priv_loader, critica
                                         device, method='linear', eta=100, trust_tau=0.01, reg=10.0, 
                                         strict=True, clean_model=None, max_steps=3, patience=2, 
                                         min_improvement=0.001):
-    """Combined line search + multi-step calibration optimization."""
+    """Combined line search + multi-step calibration optimization.
+    
+    Paper mapping — Step d(iv): T refinement rounds (typically T=3).
+    Each round recomputes α(z) at the current θ̂^(t) (inside calibrate_model_research_protocol),
+    reselects top-η, recomputes Δθ^(t), then performs a back-tracking line search to get θ̂^(t+1).
+    """
     
     print(f"🚀 Combined Line Search + Multi-Step Calibration:")
     print(f"   • Method: {method}")
@@ -184,6 +200,7 @@ def calibrate_with_combined_optimization(model, pub_loader, priv_loader, critica
         print(f"   🔄 Combined Step {step + 1}/{max_steps}:")
         
         # Apply line search calibration for this step
+        # Paper mapping — Step 4(d): recompute α(z) and Δθ at θ̂^(t), then line search to obtain θ̂^(t+1)
         step_calibrated = calibrate_with_line_search(
             current_model, pub_loader, priv_loader,
             critical_data, critical_targets, device=device,

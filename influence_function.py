@@ -21,6 +21,9 @@ def get_evaluation_slice(eval_loader, target_class="all", max_samples_per_class=
     """
     Extract evaluation slice for calibration.
     
+    Paper mapping — Step a (Critical slice):
+    S_crit = {all classes in the public test split} when target_class == "all".
+    
     Args:
         target_class: 
             - "all": Use all classes (recommended for general utility improvement)
@@ -315,6 +318,8 @@ def calibrate_model_research_protocol(model,
     model.eval()
 
     # ---- 0) MEASURE ΔL_DP: Utility drop due to DP noise
+    # Paper mapping — Step b (Measure utility drop):
+    #   ΔL_DP = (1/|S_crit|) Σ_{s∈S_crit} [ℓ(s, θ̂_DP) − ℓ(s, θ̂_clean)]
     if clean_model is not None and len(crit_x) > 0:
         print(f"\n📏 MEASURING ΔL_DP: Utility drop due to DP noise on critical slice")
         
@@ -345,24 +350,27 @@ def calibrate_model_research_protocol(model,
             print(f"\n⚠️  SKIPPING ΔL_DP measurement: No critical slice samples")
 
     # ---- a) slice gradient J
+    # Paper mapping — Step c(a): J = ∇_θ (1/m Σ_{s∈S_crit} ℓ(s, θ̂)) at the current θ̂
     J = compute_slice_gradient(model, crit_x, crit_y, device)
     J_flat = torch.cat([v.flatten() for v in J.values()])
 
     # ---- b) influence vectors (PRIVACY-PRESERVING: only uses public data + DP model)
+    # Paper mapping — Step c(b): v(z) ≈ H_{θ̂}^{-1} ∇_θ ℓ(z, θ̂) for z in the public pool
     infl_vecs, public_samples = compute_influence_vectors(model, public_loader,
                                              train_loader, device,
                                              method=method, reg=reg, strict=strict)
 
     # ---- c) influence scores: how much would adding each public sample help the evaluation slice?
-    # Correct logic: s_i = -J^T * v_i (negative because we want loss reduction)
-    # If J points in direction of increasing loss, and v_i points in direction of decreasing loss,
-    # then -J^T * v_i > 0 indicates helpful alignment
+    # Paper mapping — Step c(c): α(z) = - J^T v(z).
+    # If J points to increasing loss and v(z) points to decreasing loss, then α(z) > 0 is helpful.
+    # Note: α(z) depends on current θ̂, so it must be recomputed after each update in the refinement loop.
     scores = np.array([ -torch.dot(J_flat,
                    torch.cat([v[n].flatten() for n in J.keys()])).item()
                         for v in infl_vecs ])
 
     # ---- d) choose η most helpful samples 
-    # ✨ CORRECTED: Select samples with HIGHEST scores (most helpful for reducing evaluation loss)
+    # Paper mapping — Step d(i): Initial selection via sparse re-weighting
+    # ✨ Implementation: indicator weights by selecting the η largest (most helpful) α(z)
     idx = np.argsort(scores)[-eta:]  # Select largest (most positive) scores
     w = np.zeros_like(scores)
     w[idx] = 1.0
@@ -400,7 +408,9 @@ def calibrate_model_research_protocol(model,
     print(f"   • Mean influence vector norm: {np.mean(infl_norms):.4f}")
     print(f"   • Influence vectors used (nonzero weights): {np.sum(w > 0)}")
 
-    # ---- e) ✨ CORRECTED FORMULA: Δθ = (1/η) Σ_{helpful} H⁻¹ ∇ℓ(z,θ̂_DP)
+    # ---- e) Bias computation
+    # Paper mapping — Step d(ii): Δθ = - (1/n) H_{θ̂}^{-1} Σ_z w_z ∇ℓ(z, θ̂)
+    # Here we average v(z) ≈ H^{-1}∇ℓ(z) over selected z, implementing the same update up to scaling.
     # Move in direction that helpful public samples suggest
     n_selected = np.sum(w > 0)  # Number of selected samples
     if n_selected == 0:
@@ -425,6 +435,10 @@ def calibrate_model_research_protocol(model,
     print(f"   • Privacy-preserving: Uses only public data + DP model output")
 
     # ---- f) trust-region clip (IMPROVED: more generous)
+    # Paper mapping — Step d(iii): Back-tracking line search over α ∈ {1, 1/2, 1/4, ...}
+    # Note: We enforce a conservative trust region here. The explicit back-tracking
+    #       line search that picks α by minimizing L_crit(θ̂ + αΔθ) is executed in
+    #       ablation_optimized.calibrate_with_line_search(), which wraps this update.
     ref_norm = torch.sqrt(sum(p.pow(2).sum()
                               for p in model.parameters())).item()
     print(f"   • Model parameter norm ‖θ‖: {ref_norm:.4f}")
