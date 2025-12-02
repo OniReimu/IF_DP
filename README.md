@@ -29,49 +29,6 @@ uv run main.py --mps --compare-others --negatively_correlated_noise --target-eps
 uv run ablation.py --mps --target-epsilon 10.0 --k 64 --lambda-flatness 0.01 --run-mia
 ```
 
-### Run Systematic Validation Studies
-```bash
-# 1. List available experiment configurations
-uv run visual_discovery_analysis.py --list-configs
-
-# 2. Run user count sensitivity experiments (10 experiments total)
-uv run visual_discovery_analysis.py --config validation_config_users_num.json
-
-# 3. Run clip radius sensitivity experiments (10 experiments total)
-uv run visual_discovery_analysis.py --config validation_config_clip_radius.json
-
-# 4. Generate comprehensive plots from results
-uv run visual_plotter.py --latest
-```
-
-## 🎨 **Configuration-Driven Validation System**
-
-**NEW**: Systematic experiment framework with perfect reproducibility.
-
-### Available Configurations
-- **`validation_config_users_num.json`**: User count sensitivity (25, 50, 100, 200, 400 users)
-- **`validation_config_clip_radius.json`**: Clip radius sensitivity (0.5, 1.0, 2.0, 5.0, 10.0)
-
-### Results Structure
-```
-📁 validation_configs/           # Experiment configurations
-📁 validation_results/           # Results with seed tracking
-📁 validation_plots/             # Generated visualizations
-```
-
-### Create Custom Studies
-Create new config file in `validation_configs/`:
-```json
-{
-  "experiment_name": "epsilon_sensitivity_analysis",
-  "common_args": {"k": 2048, "epochs": 50, "users": 100, "mps": true},
-  "experiments": [
-    {"name": "eps_1.0_positive", "target-epsilon": 1.0, "positively_correlated_noise": true},
-    {"name": "eps_1.0_negative", "target-epsilon": 1.0, "negatively_correlated_noise": true}
-  ]
-}
-```
-
 ## 🎯 **Method Overview**
 
 ### Fisher DP-SGD: Curvature-Aware Noise
@@ -93,7 +50,7 @@ Standard per-sample gradient clipping + isotropic Gaussian noise.
 
 We use the following configuration:
 ```bash
-uv run ablation_optimized.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 2.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 2.0 --run-mia --users 100 --calibration-k 200 --trust-tau 0.0005 --reg 10
+uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 2.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 2.0 --run-mia --users 100 --calibration-k 200 --trust-tau 0.0005 --reg 10
 ```
 
 ### 100 Users
@@ -115,7 +72,7 @@ uv run ablation_optimized.py --mps --k 2048 --epochs 100 --dataset-size 50000 --
 
 Using sample-level configuration:
 ```bash
-uv run ablation_optimized.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 5.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 1.0 --run-mia --sample-level --calibration-k 200 --trust-tau 0.0005 --reg 10
+uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 5.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 1.0 --run-mia --sample-level --calibration-k 200 --trust-tau 0.0005 --reg 10
 ```
 
 ```
@@ -153,6 +110,12 @@ uv run ablation_optimized.py --mps --k 2048 --epochs 100 --dataset-size 50000 --
 --k 256                # Larger subspace (more accurate)
 ```
 
+### Parameter Relationship: `--k` vs `--dp-layer`
+- **`--dp-layer` (Scope)**: Selects which parameters (total count $P$) are trained with DP.
+- **`--k` (Fidelity)**: Sets the rank of the Fisher approximation within that scope.
+  - **Constraint**: $k \le P$ (automatically clamped if larger).
+  - **Tradeoff**: Higher $k$ captures more curvature information but requires more memory/compute. Lower $k$ is faster but uses a coarser approximation.
+
 ### Advanced Features
 ```bash
 # Adaptive clipping
@@ -183,19 +146,10 @@ for eps in 1.0 5.0 10.0 20.0; do
 done
 ```
 
-### Systematic Validation
-```bash
-# Run comprehensive experiments
-uv run visual_discovery_analysis.py --config validation_config_users_num.json
-uv run visual_plotter.py --latest
-```
-
 ## 🏗️ **Core Files**
 
 - **`main.py`**: Single experiment comparison
 - **`ablation.py`**: Fisher + DP-SAT synergy study
-- **`visual_discovery_analysis.py`**: Systematic validation framework
-- **`visual_plotter.py`**: Results visualization
 - **`fisher_dp_sgd.py`**: Fisher-informed DP-SGD implementation
 - **`dp_sat.py`**: DP-SAT implementation
 - **`mia.py`**: Membership inference attack evaluation
