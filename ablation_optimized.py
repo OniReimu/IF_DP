@@ -304,9 +304,10 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                   device="cuda", target_layer="conv1",
                                   adaptive_clip=True, quantile=0.95, sample_level=None,
                                   epochs=1, sigma=None, full_complement_noise=False,
-                                  use_dp_sat=False, lambda_flatness=0.01,
+                                  use_dp_sat=False,
                                   optimizer_name="Normal", positive_noise_correlation=False,
-                                  precomputed_lam=None, precomputed_U=None):
+                                  precomputed_lam=None, precomputed_U=None,
+                                  dp_sat_mode="none", rho_sat=0.001):
     """
     Fisher DP-SGD with optional DP-SAT optimization.
     
@@ -317,19 +318,21 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     Args:
         clip_radius: Target Euclidean sensitivity Δ₂ (same as vanilla DP-SGD for fair comparison).
                     This will be converted to appropriate Mahalanobis threshold internally.
-        use_dp_sat: If True, apply DP-SAT flatness adjustment after Fisher noise
-        lambda_flatness: Flatness coefficient for DP-SAT (only used if use_dp_sat=True)
+        use_dp_sat: If True, apply DP-SAT flatness adjustment (legacy flag)
+        dp_sat_mode: "none", "euclidean", "fisher"
+        rho_sat: Perturbation radius for Exact DP-SAT
         optimizer_name: String identifier for logging purposes
         positive_noise_correlation: If False (default), use negatively correlated noise (noise ∝ 1/√λ).
                                    If True, use positively correlated noise (noise ∝ √λ).
         precomputed_lam: Pre-computed eigenvalues (if None, compute from fisher matrix)
         precomputed_U: Pre-computed eigenvectors (if None, compute from fisher matrix)
         
-    Algorithm when use_dp_sat=True (CORRECTED):
+    Algorithm when dp_sat_mode != 'none':
         1. Compute per-sample gradients and clip them (standard DP-SGD)
         2. Add Fisher-informed noise → g_fisher_priv
-        3. Apply DP-SAT flatness adjustment: g_flat = λ * g_{t-1}^{fisher_priv} / ||g_{t-1}^{fisher_priv}||_2
-        4. Final update: θ ← θ - η(g_fisher_priv + g_flat)
+        3. Apply DP-SAT flatness adjustment:
+           - Perturb weights before gradient computation (Exact DP-SAT)
+        4. Final update: θ ← θ - η g_fisher_priv
     """
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
@@ -406,9 +409,12 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     print(f"   • Full complement noise: {full_complement_noise}")
     print(f"   • Optimizer type: {opt_type}")
     print(f"   • Noise scaling strategy: {strategy_name}")
-    if use_dp_sat:
-        print(f"   • DP-SAT flatness coefficient λ: {lambda_flatness:.4f}")
-        print(f"   • ✅ CORRECTED: Uses previous step Fisher gradient for flatness")
+    if use_dp_sat or dp_sat_mode != "none":
+        print(f"   • DP-SAT enabled: mode={dp_sat_mode}, ρ={rho_sat}")
+        if dp_sat_mode == "fisher":
+            print(f"   • ✨ Using Fisher-whitened weight perturbation (Fisher DP-SAT)")
+        elif dp_sat_mode == "euclidean":
+            print(f"   • ⚠️  Using Euclidean weight perturbation (Euclidean DP-SAT)")
     print(f"   • Adaptive clipping: {adaptive_clip}")
     
     if not sample_level:
@@ -435,6 +441,29 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             x, y = batch_data
             user_ids = None
         x, y = x.to(device), y.to(device)
+
+        # ============================================================
+        # DP-SAT Exact Mode: Weight Perturbation (Start of Step)
+        # ============================================================
+        perturbation = None
+        if dp_sat_mode != "none" and g_fisher_priv_prev is not None:
+             if dp_sat_mode == "euclidean":
+                 # Euclidean perturbation: δ = ρ * g / ||g||₂
+                 g_norm = g_fisher_priv_prev.norm() + 1e-8
+                 perturbation = rho_sat * g_fisher_priv_prev / g_norm
+             elif dp_sat_mode == "fisher":
+                 # Fisher perturbation: δ = ρ * F⁻¹g / ||F⁻¹g||_F
+                 alpha = U.T @ g_fisher_priv_prev
+                 alpha_white = alpha * inv_sqrt_lam
+                 alpha_white_norm = alpha_white.norm() + 1e-8
+                 perturbation = rho_sat * (U @ (alpha_white / alpha_white_norm * inv_sqrt_lam))
+
+             # Apply perturbation
+             current_idx = 0
+             for p in params:
+                 n = p.numel()
+                 p.data.add_(perturbation[current_idx:current_idx+n].view_as(p))
+                 current_idx += n
 
         model.zero_grad()
         losses = F.cross_entropy(model(x), y, reduction="none")
@@ -601,26 +630,19 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         # OPTIONAL: DP-SAT OPTIMIZATION (Sharpness-Aware) - CORRECTED
         # ============================================================
         
-        if use_dp_sat:
-            if g_fisher_priv_prev is not None:
-                # Apply DP-SAT flatness adjustment using PREVIOUS step's Fisher-noisy gradient
-                g_fisher_priv_prev_norm = g_fisher_priv_prev.norm() + 1e-8
-                g_flat = lambda_flatness * g_fisher_priv_prev / g_fisher_priv_prev_norm
-                flatness_norm.append(g_flat.norm().item())
-                
-                # Final gradient: current Fisher-noisy + flatness adjustment from previous step
-                g_final = g_fisher_priv + g_flat
-            else:
-                # First step: no previous gradient available, use standard Fisher DP
-                g_final = g_fisher_priv
-                flatness_norm.append(0.0)  # No flatness adjustment
-                
-            # Store current Fisher-noisy gradient for next iteration
+        g_final = g_fisher_priv
+        
+        # 1. Restore weights if using Exact Mode
+        if perturbation is not None:
+            current_idx = 0
+            for p in params:
+                 n = p.numel()
+                 p.data.sub_(perturbation[current_idx:current_idx+n].view_as(p))
+                 current_idx += n
+
+        # Store current Fisher-noisy gradient for next iteration (needed for Exact)
+        if use_dp_sat or dp_sat_mode != "none":
             g_fisher_priv_prev = g_fisher_priv.clone().detach()
-        else:
-            # Standard Fisher DP: just use Fisher-noisy gradient
-            g_final = g_fisher_priv
-            flatness_norm.append(0.0)  # No flatness adjustment
 
         # Scatter back to model parameters
         idx = 0
@@ -636,9 +658,6 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
     print(f"   • Median {grad_type} = {np.median(grad_norm):.2f}")
     print(f"   • Fisher noise ℓ₂ ∈ [{min(noise_l2):.1f},{max(noise_l2):.1f}]")
-    if use_dp_sat and len(flatness_norm) > 0 and max(flatness_norm) > 0:
-        print(f"   • Flatness adjustment ℓ₂ ∈ [{min(flatness_norm):.3f},{max(flatness_norm):.3f}]")
-        print(f"   • Flatness coefficient λ = {lambda_flatness:.4f}")
     if full_complement_noise:
         print(f"   • Last batch: Fisher={fisher_noise_norm:.1f}, Complement={complement_noise_norm:.1f}")
     else:
@@ -820,8 +839,9 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
-        use_dp_sat=True,  # DP-SAT optimizer
-        lambda_flatness=args.lambda_flatness,
+        use_dp_sat=(args.dp_sat_mode != 'none'),  # DP-SAT optimizer flag
+        dp_sat_mode=args.dp_sat_mode,  # Pass exact mode
+        rho_sat=args.rho_sat,
         optimizer_name="DP-SAT",
         positive_noise_correlation=args.positive_noise_correlation,
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
@@ -1303,8 +1323,13 @@ def main():
                                      help='Fisher DP: noise positively correlated with curvature (noise ∝ √λ, more noise in high curvature directions)')
     
     # DP-SAT arguments
+    parser.add_argument('--rho-sat', type=float, default=0.001,
+                       help='Perturbation radius for Fisher/Euclidean DP-SAT (Exact Method)')
     parser.add_argument('--lambda-flatness', type=float, default=0.01,
-                       help='Flatness coefficient for DP-SAT')
+                       help='Flatness coefficient for Vanilla DP-SAT (Original Paper Baseline)')
+    parser.add_argument('--dp-sat-mode', type=str, default='none',
+                       choices=['none', 'euclidean', 'fisher'],
+                       help='DP-SAT mode: none (default), euclidean (Exact Euclidean), fisher (Exact Fisher)')
     
     # Adaptive clipping
     parser.add_argument('--adaptive-clip', action='store_true')

@@ -137,7 +137,8 @@ def train_with_dp(model, train_loader, fisher,
                   device="cuda", target_layer="conv1",
                   adaptive_clip=False, quantile=0.95, sample_level=None,
                   epochs=1, sigma=None, full_complement_noise=False,
-                  positive_noise_correlation=False):
+                  positive_noise_correlation=False,
+                  dp_sat_mode="none", rho_sat=0.001):
     """
     Train with Fisher-informed DP-SGD
     
@@ -155,6 +156,8 @@ def train_with_dp(model, train_loader, fisher,
                               Setting to False preserves curvature-aware benefits.
         positive_noise_correlation: If False (default), use negatively correlated noise (noise ∝ 1/√λ).
                                    If True, use positively correlated noise (noise ∝ √λ).
+        dp_sat_mode: "none" (default), "euclidean" (Euclidean DP-SAT), "fisher" (Fisher DP-SAT).
+        rho_sat: Perturbation radius for Exact DP-SAT.
     """
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
@@ -230,6 +233,13 @@ def train_with_dp(model, train_loader, fisher,
     print(f"   • Full complement noise: {full_complement_noise}")
     print(f"   • Noise scaling strategy: {strategy_name}")
     
+    if dp_sat_mode != "none":
+        print(f"   • DP-SAT enabled: mode={dp_sat_mode}, ρ={rho_sat}")
+        if dp_sat_mode == "fisher":
+            print(f"     ✨ Using Fisher-whitened weight perturbation (Fisher DP-SAT)")
+        elif dp_sat_mode == "euclidean":
+            print(f"     ⚠️  Using Euclidean weight perturbation (Euclidean DP-SAT)")
+    
     if not sample_level:
         print("   • User-level mode: Clipping aggregated user gradients")
     else:
@@ -242,6 +252,9 @@ def train_with_dp(model, train_loader, fisher,
     euclidean_target = clip_radius  # Store the target Euclidean sensitivity
     actual_radius = clip_radius  # Will be calibrated to Mahalanobis space
     calibration_computed = False  # Flag for norm calibration
+    
+    # Initialize previous step's noisy gradient for DP-SAT
+    g_prev_priv = None
 
     for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP-SGD ({mode_str})")):
         # accept (x,y) OR (x,y,uid)
@@ -251,6 +264,33 @@ def train_with_dp(model, train_loader, fisher,
             x, y = batch_data
             user_ids = None
         x, y = x.to(device), y.to(device)
+
+        # ============================================================
+        # DP-SAT Exact Mode: Weight Perturbation (Start of Step)
+        # ============================================================
+        perturbation = None
+        if dp_sat_mode != "none" and g_prev_priv is not None:
+             if dp_sat_mode == "euclidean":
+                 # Euclidean perturbation: δ = ρ * g / ||g||₂
+                 g_norm = g_prev_priv.norm() + 1e-8
+                 perturbation = rho_sat * g_prev_priv / g_norm
+             elif dp_sat_mode == "fisher":
+                 # Fisher perturbation: δ = ρ * F⁻¹g / ||F⁻¹g||_F
+                 # Derived as: ρ * U(α_white / ||α_white|| * 1/√λ)
+                 alpha = U.T @ g_prev_priv
+                 alpha_white = alpha * inv_sqrt_lam
+                 alpha_white_norm = alpha_white.norm() + 1e-8
+                 
+                 # Direction in whitened space scaled back to parameter space
+                 perturbation = rho_sat * (U @ (alpha_white / alpha_white_norm * inv_sqrt_lam))
+
+             # Apply perturbation
+             if perturbation is not None:
+                 current_idx = 0
+                 for p in params:
+                     n = p.numel()
+                     p.data.add_(perturbation[current_idx:current_idx+n].view_as(p))
+                     current_idx += n
 
         model.zero_grad()
         losses = F.cross_entropy(model(x), y, reduction="none")
@@ -428,6 +468,21 @@ def train_with_dp(model, train_loader, fisher,
             complement_noise_norm = 0.0
         
         g_priv = g_bar + total_noise
+        
+        # ============================================================
+        # DP-SAT: Sharpness-Aware Optimization
+        # ============================================================
+        
+        # 1. Restore weights if using Exact Mode
+        if perturbation is not None:
+            current_idx = 0
+            for p in params:
+                 n = p.numel()
+                 p.data.sub_(perturbation[current_idx:current_idx+n].view_as(p))
+                 current_idx += n
+        
+        # Store current noisy gradient for next iteration
+        g_prev_priv = g_priv.clone().detach()
         
         # Track noise components
         fisher_noise_norm = fisher_noise.norm().item()
