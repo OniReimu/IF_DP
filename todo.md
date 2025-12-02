@@ -150,10 +150,19 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 
 ### 6. Optional: Looser Privacy (ε = 4.0)
 
-- [ ] **ε = 4.0, k = 512, epochs = 200**
+- [ ] **ε = 4.0, k = 512, epochs = 300**
   - ```bash
-    uv run ablation.py --mps --k 512 --epochs 200 --dataset-size 50000 \
+    uv run ablation.py --mps --k 512 --epochs 300 --dataset-size 50000 \
       --target-epsilon 4.0 --delta 1e-5 \
+      --dp-layer conv1,conv2 --clip-radius 2.0 \
+      --run-mia --users 100 --calibration-k 2000 \
+      --rho_sat 0.001 --dp-sat-mode fisher
+    ```
+
+- [ ] **ε = 8.0, k = 512, epochs = 300**
+  - ```bash
+    uv run ablation.py --mps --k 512 --epochs 300 --dataset-size 50000 \
+      --target-epsilon 8.0 --delta 1e-5 \
       --dp-layer conv1,conv2 --clip-radius 2.0 \
       --run-mia --users 100 --calibration-k 2000 \
       --rho_sat 0.001 --dp-sat-mode fisher
