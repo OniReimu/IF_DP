@@ -1,9 +1,12 @@
 # dp_sat.py  – DP-SAT: Differentially Private Sharpness-Aware Training
 # ------------------------------------------------------------
 #  * Implementation of Park et al. "Differentially Private Sharpness-Aware Training" (ICML 2023)
+#  * EXACT Implementation (Algorithm 1 from the paper):
+#    1. Perturb weights w' = w + ρ * g_prev / ||g_prev||
+#    2. Compute DP gradient at w'
+#    3. Restore weights w = w' - ρ * g_prev / ||g_prev||
+#    4. Update w = w - η * g_priv
 #  * Standard Euclidean gradient clipping + isotropic Gaussian noise (like vanilla DP-SGD)
-#  * Additional sharpness-aware flatness adjustment that doesn't consume privacy budget
-#  * Flatness proxy: λ * g_priv / ||g_priv||_2 added to the update
 #  * Works with both sample-level and user-level DP modes
 
 import math, numpy as np, torch, torch.nn.functional as F
@@ -13,18 +16,12 @@ from tqdm import tqdm
 def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                       clip_radius=10.0, device="cuda", target_layer="conv1",
                       adaptive_clip=True, quantile=0.95, sample_level=None,
-                      epochs=1, sigma=None, lambda_flatness=0.01):
+                      epochs=1, sigma=None, rho_sat=0.001, lambda_flatness=None):
     """
     DP-SAT training: Vanilla DP-SGD + Sharpness-Aware flatness adjustment.
     
-    The algorithm (CORRECTED to match official paper):
-    1. Compute per-sample gradients and clip them (standard DP-SGD)
-    2. Add isotropic Gaussian noise → g_priv
-    3. Compute flatness adjustment: g_flat = λ * g_{t-1}^p / ||g_{t-1}^p||_2  [USES PREVIOUS STEP]
-    4. Update: θ ← θ - η(g_priv + g_flat)
-    
-    The flatness adjustment uses the previous step's noisy gradient (post-processing),
-    so it doesn't consume additional privacy budget.
+    This implements the EXACT DP-SAT algorithm (Algorithm 1) via weight perturbation,
+    replacing the approximate gradient-addition method.
     
     Args:
         model: PyTorch model to train
@@ -42,11 +39,18 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         epochs: Number of training epochs (for privacy accounting)
         sigma: If provided, use this sigma directly (for proper privacy accounting).
                If None, compute sigma from epsilon using legacy method.
-        lambda_flatness: Flatness adjustment coefficient (non-private hyperparameter)
+        rho_sat: Perturbation radius (ρ) for weight perturbation (default: 0.001).
+        lambda_flatness: Legacy parameter, mapped to rho_sat if rho_sat is default.
     
     Returns:
         Trained model with DP-SAT
     """
+    
+    # Handle legacy parameter mapping
+    if lambda_flatness is not None and rho_sat == 0.001:
+        print(f"⚠️  Note: Using legacy 'lambda_flatness' ({lambda_flatness}) as 'rho_sat'")
+        rho_sat = lambda_flatness
+
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     
@@ -73,6 +77,18 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                  if target_layer in n]
     params = [dict(model.named_parameters())[n] for n in names]
     
+    # Strict DP: Freeze all other layers
+    frozen_count = 0
+    for name, p in model.named_parameters():
+        if name not in names:
+            p.requires_grad = False
+            frozen_count += 1
+        else:
+            p.requires_grad = True
+            
+    if frozen_count > 0:
+        print(f"   🔒 Strict DP: Frozen {frozen_count} parameter groups (trained on public data)")
+    
     # Auto-detect DP mode if not specified
     if sample_level is None:
         # Check first batch to determine mode
@@ -92,8 +108,8 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     else:
         print(f"   • Multi-epoch privacy: T={epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
     print(f"   • Euclidean clipping with radius {clip_radius}")
-    print(f"   • Isotropic Gaussian noise + Sharpness-aware flatness adjustment")
-    print(f"   • Flatness coefficient λ: {lambda_flatness:.4f}")
+    print(f"   • Isotropic Gaussian noise")
+    print(f"   • EXACT DP-SAT: Weight perturbation with radius ρ={rho_sat}")
     print(f"   • Adaptive clipping: {adaptive_clip}")
     
     if not sample_level:
@@ -102,7 +118,7 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         print("   • Sample-level mode: Clipping individual sample gradients")
     print()
     
-    noise_l2, grad_norm, flatness_norm = [], [], []
+    noise_l2, grad_norm = [], []
     adaptive_radius_computed = False
     actual_radius = clip_radius  # Start with provided radius
     
@@ -118,6 +134,23 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
             user_ids = None
         x, y = x.to(device), y.to(device)
         
+        # ============================================================
+        # DP-SAT EXACT: 1. Perturb weights
+        # ============================================================
+        perturbation = None
+        if g_prev_priv is not None:
+            # Euclidean perturbation: δ = ρ * g / ||g||₂
+            g_norm = g_prev_priv.norm() + 1e-8
+            perturbation = rho_sat * g_prev_priv / g_norm
+            
+            # Apply perturbation
+            current_idx = 0
+            for p in params:
+                n = p.numel()
+                p.data.add_(perturbation[current_idx:current_idx+n].view_as(p))
+                current_idx += n
+
+        # Standard DP-SGD forward/backward on (possibly perturbed) weights
         model.zero_grad()
         losses = F.cross_entropy(model(x), y, reduction="none")
         
@@ -164,7 +197,7 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
             g_bar = per_g.mean(0)
             
         else:
-            # USER-LEVEL DP: Compute gradient per user (more robust approach)
+            # USER-LEVEL DP
             user_gradients = []
             unique_users = torch.unique(user_ids) if user_ids is not None else [0]
             
@@ -173,22 +206,19 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                     mask = (user_ids == uid)
                     user_losses = losses[mask]
                 else:
-                    # If no user_ids (shouldn't happen in user-level mode), treat all as one user
                     user_losses = losses
                     mask = torch.ones_like(losses, dtype=torch.bool)
                 
-                # Compute gradient of user's total loss: ∇_θ ∑_{i ∈ user} ℓ(x_i, y_i, θ)
                 user_total_loss = user_losses.sum()
                 user_grad = grad(user_total_loss, params, retain_graph=True)
                 user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
                 user_gradients.append(user_grad_flat)
                 
-                # Adaptive clipping: collect user gradient norms
+                # Adaptive clipping
                 if adaptive_clip and not adaptive_radius_computed:
                     user_norm = user_grad_flat.norm().item()
                     grad_norm.append(user_norm)
                     
-                    # If we have enough users or it's the first batch, compute adaptive radius
                     if len(grad_norm) >= min(10, len(train_loader)) or batch_idx == 0:
                         adaptive_radius = np.quantile(grad_norm, quantile)
                         actual_radius = adaptive_radius
@@ -201,12 +231,10 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                         print(f"   • Max user grad norm: {np.max(grad_norm):.3f}")
                         print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
                         
-                        grad_norm = []  # Reset for actual training statistics
+                        grad_norm = []
             
-            # In user-level DP with UserBatchSampler, we should have exactly one user per batch
             if len(user_gradients) != 1:
                 print(f"⚠️  Warning: Expected 1 user per batch, got {len(user_gradients)} users")
-                print(f"   Unique users in batch: {unique_users.tolist()}")
             
             # Clip each user's gradient (Euclidean clipping)
             clipped_user_grads = []
@@ -217,7 +245,6 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                 grad_norm.append(user_norm.item())
                 clipped_user_grads.append(user_grad_flat)
             
-            # Average across users in batch (should be just one user for UserBatchSampler)
             g_bar = torch.stack(clipped_user_grads).mean(0)
         
         # Add isotropic Gaussian noise (standard DP-SGD)
@@ -226,32 +253,25 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         noise_l2.append(iso_noise.norm().item())
         
         # ============================================================
-        # DP-SAT CORE: Sharpness-aware flatness adjustment (CORRECTED)
+        # DP-SAT EXACT: 3. Restore weights & 4. Update
         # ============================================================
-        # Compute flatness proxy using PREVIOUS step's noisy gradient: λ * g_{t-1}^p / ||g_{t-1}^p||_2
-        # This is deterministic post-processing of g_{t-1}^p → no extra privacy cost
         
-        if g_prev_priv is not None:
-            # Use previous step's noisy gradient for flatness adjustment (official algorithm)
-            g_prev_priv_norm = g_prev_priv.norm() + 1e-8  # Add small epsilon to avoid division by zero
-            g_flat = lambda_flatness * g_prev_priv / g_prev_priv_norm
-            flatness_norm.append(g_flat.norm().item())
-            
-            # Final gradient: current noisy gradient + flatness adjustment from previous step
-            g_final = g_priv + g_flat
-        else:
-            # First step: no previous gradient available, use standard DP-SGD
-            g_final = g_priv
-            flatness_norm.append(0.0)  # No flatness adjustment
+        # Restore weights
+        if perturbation is not None:
+            current_idx = 0
+            for p in params:
+                 n = p.numel()
+                 p.data.sub_(perturbation[current_idx:current_idx+n].view_as(p))
+                 current_idx += n
         
         # Store current noisy gradient for next iteration
         g_prev_priv = g_priv.clone().detach()
         
-        # scatter back to model parameters
+        # Apply update
         idx = 0
         for p in params:
             n = p.numel()
-            p.grad = g_final[idx:idx+n].view_as(p)
+            p.grad = g_priv[idx:idx+n].view_as(p)
             idx += n
         opt.step()
     
@@ -259,10 +279,8 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     print(f"\n📊  DP-SAT final stats:")
     print(f"   • Median {grad_type} = {np.median(grad_norm):.2f}")
     print(f"   • Isotropic noise ℓ₂ ∈ [{min(noise_l2):.1f},{max(noise_l2):.1f}]")
-    if len(flatness_norm) > 0 and max(flatness_norm) > 0:
-        print(f"   • Flatness adjustment ℓ₂ ∈ [{min(flatness_norm):.3f},{max(flatness_norm):.3f}]")
-    print(f"   • Flatness coefficient λ = {lambda_flatness:.4f}")
+    print(f"   • Perturbation radius ρ = {rho_sat:.4f}")
     print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {epochs} epochs")
-    print(f"   • ✅ CORRECTED: Uses previous step gradient for flatness adjustment")
+    print(f"   • ✅ IMPLEMENTATION: Exact DP-SAT (Weight Perturbation)")
     
-    return model 
+    return model

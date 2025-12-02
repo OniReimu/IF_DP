@@ -406,6 +406,18 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     params = [dict(model.named_parameters())[n] for n in names]
     param_dim = sum(p.numel() for p in params)
 
+    # Strict DP: Freeze all other layers
+    frozen_count = 0
+    for name, p in model.named_parameters():
+        if name not in names:
+            p.requires_grad = False
+            frozen_count += 1
+        else:
+            p.requires_grad = True
+    
+    if frozen_count > 0:
+        print(f"   🔒 Strict DP: Frozen {frozen_count} parameter groups (trained on public data)")
+
     # Auto-detect DP mode if not specified
     if sample_level is None:
         first_batch = next(iter(train_loader))
@@ -735,14 +747,17 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     baseline = CNN().to(device)
     opt_b = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=.9)
     
-    print('\n⚙️  Training baseline for initialization…')
+    print('\n⚙️  Training baseline on PUBLIC data (Strict DP Setup)...')
+    print(f"   • Public data size: {len(pub_loader.dataset)} samples")
+    print(f"   • Private data will ONLY be used for DP-training selected layers ({args.dp_layer})")
+    
     for epoch in tqdm(range(args.epochs)):
         baseline.train()
-        for batch_data in priv_loader:
-            if args.sample_level:
-                x, y = batch_data
-            else:
+        for batch_data in pub_loader:
+            if len(batch_data) == 3:
                 x, y, _ = batch_data
+            else:
+                x, y = batch_data
             x, y = x.to(device), y.to(device)
             opt_b.zero_grad(); F.cross_entropy(baseline(x),y).backward(); opt_b.step()
 
@@ -815,7 +830,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
-        lambda_flatness=args.lambda_flatness
+        rho_sat=args.rho_sat  # Use consistent perturbation radius
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1325,7 +1340,8 @@ def main():
     parser.add_argument('--cpu', action='store_true')
     
     # Data arguments
-    parser.add_argument('--dataset-size', type=int, default=10000)
+    parser.add_argument('--dataset-size', type=int, default=None,
+                       help='Size of private dataset (default: use all available samples from trainset)')
     parser.add_argument('--private-ratio', type=float, default=0.8)
     parser.add_argument('--epochs', type=int, default=10)
     
@@ -1452,13 +1468,15 @@ def main():
     testset = torchvision.datasets.CIFAR10('./data', train=False, download=True, transform=trans)
     
     # Data partitioning for differential privacy (MATCHING main.py):
-    # - priv_base: From trainset - used for baseline training, DP training
-    # - pub_base: From testset subset - used for calibration (public data)  
-    # - eval_base: From testset subset - used for evaluation (independent)
+    # - priv_base: From trainset - used for DP training (PRIVATE dataset, size controlled by --dataset-size)
+    # - pub_base: From testset subset - used for baseline training and calibration (PUBLIC data, ~50% of testset)
+    # - eval_base: From testset subset - used for evaluation (independent, ~50% of testset)
     
     # Private data: use subset of trainset for training
-    perm_train = np.random.permutation(min(args.dataset_size, len(trainset)))
-    priv_idx = perm_train[:min(args.dataset_size, len(trainset))]
+    # If dataset_size is None, use all available samples
+    effective_dataset_size = args.dataset_size if args.dataset_size is not None else len(trainset)
+    perm_train = np.random.permutation(min(effective_dataset_size, len(trainset)))
+    priv_idx = perm_train[:min(effective_dataset_size, len(trainset))]
     priv_base = Subset(trainset, priv_idx)  # Training data from trainset
     
     # Public data: use subset of testset for calibration

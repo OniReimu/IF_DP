@@ -62,6 +62,18 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
                  if target_layer in n]
     params = [dict(model.named_parameters())[n] for n in names]
     
+    # Strict DP: Freeze all other layers
+    frozen_count = 0
+    for name, p in model.named_parameters():
+        if name not in names:
+            p.requires_grad = False
+            frozen_count += 1
+        else:
+            p.requires_grad = True
+    
+    if frozen_count > 0:
+        print(f"   🔒 Strict DP: Frozen {frozen_count} parameter groups (trained on public data)")
+    
     # Auto-detect DP mode if not specified
     if sample_level is None:
         # Check first batch to determine mode

@@ -46,6 +46,42 @@ uv run ablation.py --mps --target-epsilon 10.0 --k 64 --lambda-flatness 0.01 --r
 ### Vanilla DP-SGD: Standard Baseline
 Standard per-sample gradient clipping + isotropic Gaussian noise.
 
+## 🔒 **Strict Differential Privacy Guarantee**
+
+This repository implements **Option 1: Frozen Backbone + DP Finetuning** to provide formal $(\epsilon, \delta)$-DP guarantees for the entire released model.
+
+### Architecture
+
+**Strict DP Setup**:
+1. **Baseline Training (Public Data)**: The baseline model is pre-trained on **public data only** (e.g., public subset of CIFAR-10 test set). This ensures the initial weights for frozen layers contain no private information.
+2. **DP Finetuning (Private Data)**: Only selected layers (specified via `--dp-layer`) are trained with DP-SGD on the **private dataset**. All other layers are **frozen** (`requires_grad=False`).
+3. **Formal Guarantee**: The entire released model is $(\epsilon, \delta)$-DP with respect to the private dataset, because:
+   - Frozen layers depend only on public data (no privacy leakage).
+   - DP-trained layers use formal DP-SGD mechanisms (Fisher DP-SGD or Vanilla DP-SGD).
+
+### Why This Approach?
+
+Computing Fisher information matrices for all parameters is computationally expensive. By:
+- Training the baseline on public data (free),
+- Freezing most layers (no DP cost),
+- Applying Fisher DP-SGD only to selected layers (manageable cost),
+
+we achieve **strict DP** while maintaining computational feasibility.
+
+### Implementation Details
+
+- **Baseline**: Trained on `pub_loader` (public data) in `ablation.py`.
+- **Freezing**: All parameters NOT in `--dp-layer` are automatically frozen during DP training.
+- **Verification**: The code logs `🔒 Strict DP: Frozen N parameter groups` to confirm the setup.
+
+**Example**:
+```bash
+# Train only conv1 and conv2 with DP, freeze all other layers
+uv run ablation.py --dp-layer "conv1,conv2" --target-epsilon 10.0
+```
+
+This ensures the final model has a formal $(\epsilon, \delta)$-DP guarantee w.r.t. the private training dataset.
+
 ## 📊 **Experimental Results (negatively related noise)**
 
 We use the following configuration:
@@ -97,6 +133,11 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 --target-epsilon 1.0    # High privacy
 --target-epsilon 10.0   # Moderate privacy
 
+# Dataset sizes
+--dataset-size 10000    # Size of PRIVATE dataset (from CIFAR-10 trainset)
+                        # Default: None (uses all available samples from trainset, ~50,000 for CIFAR-10)
+                        # Note: Public dataset size is fixed at 50% of testset (~5000 samples)
+
 # Fisher strategies
 --positively_correlated_noise   # More noise in high curvature (default)
 --negatively_correlated_noise   # Less noise in high curvature
@@ -111,7 +152,7 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 ```
 
 ### Parameter Relationship: `--k` vs `--dp-layer`
-- **`--dp-layer` (Scope)**: Selects which parameters (total count $P$) are trained with DP.
+- **`--dp-layer` (Scope)**: Selects which parameters (total count $P$) are trained with DP. **All other parameters are frozen** (trained on public data only), ensuring strict DP.
 - **`--k` (Fidelity)**: Sets the rank of the Fisher approximation within that scope.
   - **Constraint**: $k \le P$ (automatically clamped if larger).
   - **Tradeoff**: Higher $k$ captures more curvature information but requires more memory/compute. Lower $k$ is faster but uses a coarser approximation.
@@ -127,9 +168,11 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 # MIA evaluation
 --run-mia --mia-size 1000
 
-# Target specific layers
+# Target specific layers (Strict DP: other layers are frozen)
 --dp-layer "conv1,conv2"
 ```
+
+**Note**: When using `--dp-layer`, the specified layers are trained with DP on private data, while all other layers are **frozen** (pre-trained on public data). This ensures strict $(\epsilon, \delta)$-DP for the entire model.
 
 ## 🔬 **Research Applications**
 
