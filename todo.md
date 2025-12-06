@@ -6,7 +6,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 
 ### 0. Base Configuration (Reference)
 
-- [ ] **Base run (Fisher DP + Fisher DP-SAT, ε=2.0)**
+- [x] **Base run (Fisher DP + Fisher DP-SAT, ε=2.0)**
   - Command:
     ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
@@ -18,7 +18,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 
 ### 1. Clip Radius Sweep (ε = 2.0)
 
-- [ ] **clip_radius = 1.0**
+- [x] **clip_radius = 1.0**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -27,7 +27,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.001 --dp-sat-mode fisher
     ```
 
-- [ ] **clip_radius = 1.5**
+- [x] **clip_radius = 1.5**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -36,7 +36,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.001 --dp-sat-mode fisher
     ```
 
-- [ ] **clip_radius = 2.5**
+- [x] **clip_radius = 2.5**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -45,7 +45,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.001 --dp-sat-mode fisher
     ```
 
-- [ ] **clip_radius = 3.0**
+- [x] **clip_radius = 3.0**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -56,7 +56,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 
 ### 2. Fisher Rank k Sweep (ε = 2.0, lower k)
 
-- [ ] **k = 256**
+- [x] **k = 256**
   - ```bash
     uv run ablation.py --mps --k 256 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -65,7 +65,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.001 --dp-sat-mode fisher
     ```
 
-- [ ] **k = 512**
+- [x] **k = 512**
   - ```bash
     uv run ablation.py --mps --k 512 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -74,7 +74,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.001 --dp-sat-mode fisher
     ```
 
-- [ ] **k = 1024**
+- [x] **k = 1024**
   - ```bash
     uv run ablation.py --mps --k 1024 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -85,7 +85,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 
 ### 3. Epoch Sweep (ε = 2.0, change training length)
 
-- [ ] **epochs = 150**
+- [x] **epochs = 150**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 150 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -94,7 +94,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.001 --dp-sat-mode fisher
     ```
 
-- [ ] **epochs = 200**
+- [x] **epochs = 200**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 200 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -110,7 +110,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 
 ### 4. ρ_sat Sweep for Fisher DP-SAT (ε = 2.0)
 
-- [ ] **ρ_sat = 0.0005**
+- [x] **ρ_sat = 0.0005**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -119,7 +119,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.0005 --dp-sat-mode fisher
     ```
 
-- [ ] **ρ_sat = 0.002**
+- [x] **ρ_sat = 0.002**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -128,7 +128,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.002 --dp-sat-mode fisher
     ```
 
-- [ ] **ρ_sat = 0.005**
+- [x] **ρ_sat = 0.005**
   - ```bash
     uv run ablation.py --mps --k 2048 --epochs 300 --dataset-size 50000 \
       --target-epsilon 2.0 --delta 1e-5 \
@@ -150,7 +150,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 
 ### 6. Optional: Looser Privacy (ε = 4.0)
 
-- [ ] **ε = 4.0, k = 512, epochs = 300**
+- [x] **ε = 4.0, k = 512, epochs = 300**
   - ```bash
     uv run ablation.py --mps --k 512 --epochs 300 --dataset-size 50000 \
       --target-epsilon 4.0 --delta 1e-5 \
@@ -159,7 +159,7 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
       --rho_sat 0.001 --dp-sat-mode fisher
     ```
 
-- [ ] **ε = 8.0, k = 512, epochs = 300**
+- [x] **ε = 8.0, k = 512, epochs = 300**
   - ```bash
     uv run ablation.py --mps --k 512 --epochs 300 --dataset-size 50000 \
       --target-epsilon 8.0 --delta 1e-5 \
@@ -171,9 +171,9 @@ All commands below assume CIFAR-10, strict DP setup (frozen backbone + DP on `co
 ### Minimal Recommended Subset
 
 If time is limited, prioritise:
-- [ ] **k sweep**: `k = 256`, `k = 512`
-- [ ] **clip-radius sweep**: `clip_radius = 1.5`, `clip_radius = 2.5`
-- [ ] **ρ_sat tweaks**: `rho_sat = 0.0005`, `rho_sat = 0.002`
+- [x] **k sweep**: `k = 256`, `k = 512`
+- [x] **clip-radius sweep**: `clip_radius = 1.5`, `clip_radius = 2.5`
+- [x] **ρ_sat tweaks**: `rho_sat = 0.0005`, `rho_sat = 0.002`
 
 
 ## Notes

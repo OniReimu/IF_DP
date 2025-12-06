@@ -26,7 +26,7 @@ from dp_sat import train_with_dp_sat
 from privacy_accounting import (
     get_privacy_params_for_target_epsilon, 
 )
-from model import CNN
+from model import CNN, create_model
 from mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
 from influence_function import calibrate_model_research_protocol, get_evaluation_slice
 from config import set_random_seeds, get_random_seed
@@ -744,7 +744,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     print(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
     
     # Load baseline model for initialization
-    baseline = CNN().to(device)
+    baseline = create_model(args.model_type).to(device)
     opt_b = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=.9)
     
     print('\n⚙️  Training baseline on PUBLIC data (Strict DP Setup)...')
@@ -1345,6 +1345,11 @@ def main():
     parser.add_argument('--private-ratio', type=float, default=0.8)
     parser.add_argument('--epochs', type=int, default=10)
     
+    # Model arguments
+    parser.add_argument('--model-type', type=str, default='cnn',
+                       choices=['cnn', 'resnet18', 'resnet'],
+                       help='Model architecture: cnn (simple CNN) or resnet18 (ResNet-18)')
+    
     # Clean up
     parser.add_argument('--clean', action='store_true',
                        help='Remove all saved models before training')
@@ -1516,7 +1521,7 @@ def main():
     print('\n🔍 Computing Fisher matrix for ablation study…')
     
     # Train a baseline model for Fisher computation
-    fisher_baseline = CNN().to(device)
+    fisher_baseline = create_model(args.model_type).to(device)
     fisher_opt = torch.optim.SGD(fisher_baseline.parameters(), lr=1e-3, momentum=.9)
     
     for epoch in tqdm(range(5), desc="Training Fisher baseline"):  # Fewer epochs for Fisher

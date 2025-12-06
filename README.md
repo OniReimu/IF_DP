@@ -138,6 +138,10 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
                         # Default: None (uses all available samples from trainset, ~50,000 for CIFAR-10)
                         # Note: Public dataset size is fixed at 50% of testset (~5000 samples)
 
+# Model architecture
+--model-type cnn        # Simple CNN (default)
+--model-type resnet18   # ResNet-18 architecture
+
 # Fisher strategies
 --positively_correlated_noise   # More noise in high curvature (default)
 --negatively_correlated_noise   # Less noise in high curvature
@@ -169,10 +173,15 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 --run-mia --mia-size 1000
 
 # Target specific layers (Strict DP: other layers are frozen)
---dp-layer "conv1,conv2"
+--dp-layer "conv1,conv2"        # For CNN: conv1, conv2, conv3, fc1, fc2
+--dp-layer "layer1,layer2"      # For ResNet-18: layer1, layer2, layer3, layer4, conv1, fc
 ```
 
 **Note**: When using `--dp-layer`, the specified layers are trained with DP on private data, while all other layers are **frozen** (pre-trained on public data). This ensures strict $(\epsilon, \delta)$-DP for the entire model.
+
+**Layer naming**:
+- **CNN**: `conv1`, `conv2`, `conv3`, `fc1`, `fc2`
+- **ResNet-18**: `conv1`, `layer1`, `layer2`, `layer3`, `layer4`, `fc` (final classifier)
 
 ## 🔬 **Research Applications**
 

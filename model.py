@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import resnet18
 
 # 定义CNN模型
 class CNN(nn.Module):
@@ -49,3 +50,46 @@ class CNN(nn.Module):
         x = self.fc2(x)
         
         return x
+
+
+class ResNet18(nn.Module):
+    """
+    ResNet-18 model adapted for CIFAR-10 (10 classes).
+    Uses torchvision's ResNet-18 as backbone.
+    """
+    def __init__(self):
+        super(ResNet18, self).__init__()
+        # Load pretrained ResNet-18 and modify for CIFAR-10
+        resnet = resnet18(pretrained=False)
+        
+        # Modify first conv layer for CIFAR-10 (3 channels, 32x32 images)
+        # Original ResNet expects 224x224, but we'll keep the same kernel size
+        resnet.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        # Remove the maxpool since CIFAR-10 images are already small
+        resnet.maxpool = nn.Identity()
+        
+        # Modify final layer for 10 classes (CIFAR-10)
+        resnet.fc = nn.Linear(resnet.fc.in_features, 10)
+        
+        self.resnet = resnet
+    
+    def forward(self, x):
+        return self.resnet(x)
+
+
+def create_model(model_type='cnn'):
+    """
+    Factory function to create a model based on type.
+    
+    Args:
+        model_type: 'cnn' for simple CNN, 'resnet18' for ResNet-18
+    
+    Returns:
+        Model instance
+    """
+    if model_type.lower() == 'cnn':
+        return CNN()
+    elif model_type.lower() == 'resnet18' or model_type.lower() == 'resnet':
+        return ResNet18()
+    else:
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'cnn' or 'resnet18'")
