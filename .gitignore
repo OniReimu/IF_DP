@@ -38,6 +38,4 @@ data/
 *.ckpt
 *.log 
 
-validation_configs/
-validation_results/
-validation_plots/
+saved_models/

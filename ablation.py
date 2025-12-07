@@ -743,7 +743,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     print(f"✅ Fisher eigendecomposition complete: k={actual_k} eigenpairs")
     print(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
     
-    # Load baseline model for initialization
+    # Load baseline model for initialization (always train on PUBLIC data; no cache)
     baseline = create_model(args.model_type).to(device)
     opt_b = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=.9)
     
@@ -1025,7 +1025,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     
     dp_mode = "Sample-level" if args.sample_level else f"User-level ({args.users} users)"
     print(f"\n🎯 Accuracy Comparison ({dp_mode} DP):")
-    print(f"   • Baseline (Non-DP)               : {baseline_acc:6.2f}%")
+    print(f"   • Baseline (Public Only)          : {baseline_acc:6.2f}%")
     print(f"   • Vanilla DP-SGD                  : {vanilla_dp_acc:6.2f}%")
     print(f"   • Vanilla DP-SGD + DP-SAT          : {vanilla_dpsat_acc:6.2f}%")
     print(f"   • Fisher DP + Normal              : {fisher_normal_acc:6.2f}%")
@@ -1204,8 +1204,34 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         print(f"\n🛡️  Running comprehensive 4-way MIA evaluation on all ablation variants...")
         
         # Prepare all models for MIA evaluation
+        # Optional non-DP comparator (trained on private data WITHOUT DP) for AUC reference
+        non_dp_scope = "private"
+        non_dp_tag = f"Pretrain_{args.model_type}_{args.epochs}_{non_dp_scope}.pth"
+        non_dp_path = os.path.join(models_dir, non_dp_tag)
+        non_dp_private = create_model(args.model_type).to(device)
+        if os.path.exists(non_dp_path):
+            print(f"\n💾 Loading cached NON-DP private comparator: {non_dp_path}")
+            non_dp_private.load_state_dict(torch.load(non_dp_path, map_location=device))
+        else:
+            print("\n⚠️  Training NON-DP comparator on PRIVATE data for AUC reference (not DP-safe)...")
+            opt_non_dp = torch.optim.SGD(non_dp_private.parameters(), lr=1e-3, momentum=.9)
+            for epoch in tqdm(range(args.epochs), desc="Training NON-DP private comparator"):
+                non_dp_private.train()
+                for batch_data in priv_loader:
+                    if args.sample_level:
+                        x, y = batch_data
+                    else:
+                        x, y, _ = batch_data
+                    x, y = x.to(device), y.to(device)
+                    opt_non_dp.zero_grad()
+                    F.cross_entropy(non_dp_private(x), y).backward()
+                    opt_non_dp.step()
+            torch.save(non_dp_private.state_dict(), non_dp_path)
+            print(f"✅ Saved NON-DP private comparator to {non_dp_path}")
+
         models_to_evaluate = {
-            'Baseline (Non-DP)': baseline,
+            'Baseline (Public Only)': baseline,  # strictly public-pretrained
+            'Non-DP (Private, not DP-safe)': non_dp_private,  # reference AUC > 0.5 expected
             'Vanilla DP-SGD': vanilla_dp_model,
             'Vanilla DP-SGD + DP-SAT': vanilla_dpsat_model,
             'Fisher DP + Normal': fisher_normal_model,
@@ -1288,7 +1314,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         # Key comparisons only (remove redundant analysis)
         print(f"\n🔒 Key Privacy Effects:")
         
-        baseline_auc = shadow_aucs['Baseline (Non-DP)']
+        baseline_auc = shadow_aucs['Baseline (Public Only)']
+        non_dp_private_auc = shadow_aucs.get('Non-DP (Private, not DP-safe)', None)
         fisher_normal_auc = shadow_aucs['Fisher DP + Normal']
         fisher_dpsat_auc = shadow_aucs['Fisher DP + DP-SAT']
         calib_normal_auc = shadow_aucs['Fisher DP + Normal + Calib']
@@ -1305,6 +1332,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         
         # Final recommendation
         print(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
+        if non_dp_private_auc is not None:
+            print(f"   • Non-DP private comparator AUC: {non_dp_private_auc:.4f} (expected >0.5, not DP-safe)")
         
         # Store results for return
         ablation_results['mia_results'] = {
