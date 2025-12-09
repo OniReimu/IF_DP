@@ -15,14 +15,17 @@ from tqdm import tqdm
 # ============================================================
 def compute_fisher(model, dataloader, device,
                    target_layer="conv1",
-                   rho: float = 1e-2):
+                   rho: float = 1e-2,
+                   dp_param_count=None):
     """
-    Return F  =  (1/N) GᵀG + ρI   for the parameters in target_layer
+    Return F  =  (1/N) GᵀG + ρI   for the parameters in target_layer or dp_param_count
 
     target_layer:
         "conv1"            – single layer substring
         "conv1,conv2"      – comma-separated list
         "all"              – every parameter
+    dp_param_count:
+        If specified, select first N parameters in model order (overrides target_layer)
     """
     model.eval()
 
@@ -30,18 +33,48 @@ def compute_fisher(model, dataloader, device,
     def _match(name: str, layer: str) -> bool:
         # stricter prefix match to avoid accidental substring matches
         return name.startswith(layer)
-
-    if target_layer == "all":
-        tgt_names = [n for n, _ in model.named_parameters()]
-        print("🎯 computing Fisher for ALL layers")
-    elif "," in target_layer:
-        layers = [s.strip() for s in target_layer.split(",")]
-        tgt_names = [n for n, _ in model.named_parameters()
-                     if any(_match(n, l) for l in layers)]
-        print(f"🎯 computing Fisher for layers {layers}")
+    if dp_param_count is not None:
+        # DP parameter budget mode: smart selection to maximize parameter usage
+        print(f"🎯 computing Fisher for up to {dp_param_count} parameters")
+        all_params = list(model.named_parameters())
+        
+        # Build list of (name, param, size, index) for knapsack optimization
+        param_info = [(name, param, param.numel(), idx) 
+                      for idx, (name, param) in enumerate(all_params)]
+        
+        # Greedy knapsack: select parameters that fit within budget
+        selected_indices = []
+        total_selected = 0
+        
+        for name, param, size, idx in param_info:
+            if total_selected + size <= dp_param_count:
+                selected_indices.append(idx)
+                total_selected += size
+            elif total_selected < dp_param_count:
+                print(f"      ✗ {name}: {size} params (would exceed budget, skipping)")
+        
+        # Extract selected parameters
+        tgt_names = []
+        for idx in sorted(selected_indices):
+            name, param = all_params[idx]
+            tgt_names.append(name)
+        
+        unused = dp_param_count - total_selected
+        efficiency = (total_selected / dp_param_count) * 100
+        print(f"   ✅ Selected {len(tgt_names)} complete parameters")
+        print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
     else:
-        tgt_names = [n for n, _ in model.named_parameters()
-                     if _match(n, target_layer)]
+        if target_layer == "all":
+            tgt_names = [n for n, _ in model.named_parameters()]
+            print("🎯 computing Fisher for ALL layers")
+        elif "," in target_layer:
+            layers = [s.strip() for s in target_layer.split(",")]
+            tgt_names = [n for n, _ in model.named_parameters()
+                        if any(_match(n, l) for l in layers)]
+            print(f"🎯 computing Fisher for layers {layers}")
+        else:
+            tgt_names = [n for n, _ in model.named_parameters()
+                        if _match(n, target_layer)]
         print(f"🎯 computing Fisher for layer '{target_layer}'")
 
     if not tgt_names:

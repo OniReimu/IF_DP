@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet18
+from torchvision.models import resnet18, efficientnet_b0
 
 # 定义CNN模型
 class CNN(nn.Module):
@@ -77,12 +77,29 @@ class ResNet18(nn.Module):
         return self.resnet(x)
 
 
+class EfficientNetB0(nn.Module):
+    """
+    EfficientNet-B0 adapted for CIFAR-10 (10 classes).
+    Uses torchvision's EfficientNet-B0 as backbone.
+    """
+    def __init__(self):
+        super().__init__()
+        eff = efficientnet_b0(weights=None)
+        # Adjust classifier for 10 classes
+        in_features = eff.classifier[1].in_features
+        eff.classifier[1] = nn.Linear(in_features, 10)
+        self.efficientnet = eff
+
+    def forward(self, x):
+        return self.efficientnet(x)
+
+
 def create_model(model_type='cnn'):
     """
     Factory function to create a model based on type.
     
     Args:
-        model_type: 'cnn' for simple CNN, 'resnet18' for ResNet-18
+        model_type: 'cnn' for simple CNN, 'resnet18' for ResNet-18, 'efficientnet_b0' for EfficientNet-B0
     
     Returns:
         Model instance
@@ -91,5 +108,7 @@ def create_model(model_type='cnn'):
         return CNN()
     elif model_type.lower() == 'resnet18' or model_type.lower() == 'resnet':
         return ResNet18()
+    elif model_type.lower() in ['efficientnet_b0', 'efficientnet']:
+        return EfficientNetB0()
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Choose 'cnn' or 'resnet18'")
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'cnn', 'resnet18', or 'efficientnet_b0'")

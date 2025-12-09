@@ -321,7 +321,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                   use_dp_sat=False,
                                   optimizer_name="Normal", positive_noise_correlation=False,
                                   precomputed_lam=None, precomputed_U=None,
-                                  dp_sat_mode="none", rho_sat=0.001):
+                                  dp_sat_mode="none", rho_sat=0.001, dp_param_count=None):
     """
     TRICK 4: EXACT FISHER-AWARE DP-SAT
     Standard DP-SAT adds a gradient term, which is approximate. Here we implement 
@@ -398,17 +398,60 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         # stricter match: prefix match to avoid accidental substring matches across deeper blocks
         return name.startswith(layer)
 
-    if target_layer == "all":
-        names = [n for n,_ in model.named_parameters()]
-    elif "," in target_layer:
-        layers = [s.strip() for s in target_layer.split(",")]
-        names = [n for n,_ in model.named_parameters()
-                 if any(_match(n, l) for l in layers)]
+    # Gather parameter objects
+    if dp_param_count is not None:
+        # DP parameter budget mode: smart selection to maximize parameter usage
+        print(f"   🎯 DP Parameter Budget Mode: selecting up to {dp_param_count} parameters")
+        all_params = list(model.named_parameters())
+        
+        # Build list of (name, param, size, index) for knapsack optimization
+        param_info = [(name, param, param.numel(), idx) 
+                      for idx, (name, param) in enumerate(all_params)]
+        
+        # Greedy knapsack: select parameters that fit within budget
+        # Prioritize by order (to maintain some semantic ordering)
+        selected_indices = []
+        total_selected = 0
+        
+        for name, param, size, idx in param_info:
+            if total_selected + size <= dp_param_count:
+                selected_indices.append(idx)
+                total_selected += size
+                print(f"      • {name}: {size} params (total: {total_selected})")
+            elif total_selected < dp_param_count:
+                # Would exceed budget - skip this parameter
+                print(f"      ✗ {name}: {size} params (would exceed budget, skipping)")
+        
+        # Extract selected parameters
+        names = []
+        params = []
+        for idx in sorted(selected_indices):
+            name, param = all_params[idx]
+            names.append(name)
+            params.append(param)
+        
+        param_dim = total_selected
+        unused = dp_param_count - total_selected
+        efficiency = (total_selected / dp_param_count) * 100
+        
+        print(f"   ✅ Selected {len(names)} complete parameters")
+        print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
+        
+        dp_mask = None  # No masking needed - all complete parameters
     else:
-        names = [n for n,_ in model.named_parameters()
-                 if _match(n, target_layer)]
-    params = [dict(model.named_parameters())[n] for n in names]
-    param_dim = sum(p.numel() for p in params)
+        if target_layer == "all":
+            names = [n for n,_ in model.named_parameters()]
+        elif "," in target_layer:
+            layers = [s.strip() for s in target_layer.split(",")]
+            names = [n for n,_ in model.named_parameters()
+                    if any(_match(n, l) for l in layers)]
+        else:
+            names = [n for n,_ in model.named_parameters()
+                    if _match(n, target_layer)]
+        params = [dict(model.named_parameters())[n] for n in names]
+        param_dim = sum(p.numel() for p in params)
+
+        dp_mask = None  # No masking in layer mode
 
     # Strict DP: Freeze all other layers
     frozen_count = 0
@@ -811,7 +854,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         adaptive_clip=args.adaptive_clip,
         quantile=args.quantile,
         sample_level=args.sample_level,
-        epochs=args.epochs
+        epochs=args.epochs,
+        dp_param_count=args.dp_param_count
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -834,7 +878,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
-        rho_sat=args.rho_sat  # Use consistent perturbation radius
+        rho_sat=args.rho_sat,  # Use consistent perturbation radius
+        dp_param_count=args.dp_param_count
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -862,7 +907,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         optimizer_name="Normal",
         positive_noise_correlation=args.positive_noise_correlation,
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
-        precomputed_U=U
+        precomputed_U=U,
+        dp_param_count=args.dp_param_count
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -898,7 +944,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         optimizer_name="DP-SAT",
         positive_noise_correlation=args.positive_noise_correlation,
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
-        precomputed_U=U
+        precomputed_U=U,
+        dp_param_count=args.dp_param_count
     )
     
     # Create evaluation loader for critical slice extraction and final accuracy measurement
@@ -1380,8 +1427,15 @@ def main():
     
     # Model arguments
     parser.add_argument('--model-type', type=str, default='cnn',
-                       choices=['cnn', 'resnet18', 'resnet'],
-                       help='Model architecture: cnn (simple CNN) or resnet18 (ResNet-18)')
+                       choices=['cnn', 'resnet18', 'resnet', 'efficientnet_b0', 'efficientnet'],
+                       help='Model architecture: cnn (simple CNN), resnet18 (ResNet-18), or efficientnet_b0')
+    
+    # DP layer/parameter selection (mutually exclusive)
+    dp_selection = parser.add_mutually_exclusive_group()
+    dp_selection.add_argument('--dp-layer', type=str, default='conv1',
+                             help='Target layers for DP training (e.g., "conv1,conv2"). Mutually exclusive with --dp-param-count.')
+    dp_selection.add_argument('--dp-param-count', type=int, default=None,
+                             help='DP parameter budget: train first N parameters in model order. Mutually exclusive with --dp-layer.')
     
     # Clean up
     parser.add_argument('--clean', action='store_true',
@@ -1403,7 +1457,6 @@ def main():
     
     # Fisher DP arguments
     parser.add_argument('--k', type=int, default=64)
-    parser.add_argument('--dp-layer', type=str, default='conv1')
     parser.add_argument('--full-complement-noise', action='store_true',
                        help='Use full complement noise in orthogonal subspace')
     
@@ -1567,7 +1620,8 @@ def main():
             fisher_opt.step()
     
     Fmat, _ = compute_fisher(fisher_baseline, priv_loader, device,
-                            target_layer=args.dp_layer, rho=1e-2)
+                            target_layer=args.dp_layer, rho=1e-2,
+                            dp_param_count=args.dp_param_count)
     
     # ════════════════════════════════════════════════════════════════
     # Run ablation study

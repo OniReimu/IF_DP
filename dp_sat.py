@@ -16,7 +16,8 @@ from tqdm import tqdm
 def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                       clip_radius=10.0, device="cuda", target_layer="conv1",
                       adaptive_clip=True, quantile=0.95, sample_level=None,
-                      epochs=1, sigma=None, rho_sat=0.001, lambda_flatness=None):
+                      epochs=1, sigma=None, rho_sat=0.001, lambda_flatness=None,
+                      dp_param_count=None):
     """
     DP-SAT training: Vanilla DP-SGD + Sharpness-Aware flatness adjustment.
     
@@ -64,21 +65,61 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
         sigma = sigma_single_epoch / math.sqrt(epochs)  # Adjust for T epochs
         print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
-    
+
     # gather parameter objects based on target_layer
     def _match(name: str, layer: str) -> bool:
         return name.startswith(layer)
-
-    if target_layer == "all":
-        names = [n for n,_ in model.named_parameters()]
-    elif "," in target_layer:
-        layers = [s.strip() for s in target_layer.split(",")]
-        names  = [n for n,_ in model.named_parameters()
-                  if any(_match(n, l) for l in layers)]
+    
+    # gather parameter objects based on target_layer or dp_param_count
+    if dp_param_count is not None:
+        # DP parameter budget mode: smart selection to maximize parameter usage
+        print(f"   🎯 DP Parameter Budget Mode: selecting up to {dp_param_count} parameters")
+        all_params = list(model.named_parameters())
+        
+        # Build list of (name, param, size, index) for knapsack optimization
+        param_info = [(name, param, param.numel(), idx) 
+                      for idx, (name, param) in enumerate(all_params)]
+        
+        # Greedy knapsack: select parameters that fit within budget
+        selected_indices = []
+        total_selected = 0
+        
+        for name, param, size, idx in param_info:
+            if total_selected + size <= dp_param_count:
+                selected_indices.append(idx)
+                total_selected += size
+                print(f"      • {name}: {size} params (total: {total_selected})")
+            elif total_selected < dp_param_count:
+                print(f"      ✗ {name}: {size} params (would exceed budget, skipping)")
+        
+        # Extract selected parameters
+        names = []
+        params = []
+        for idx in sorted(selected_indices):
+            name, param = all_params[idx]
+            names.append(name)
+            params.append(param)
+        
+        unused = dp_param_count - total_selected
+        efficiency = (total_selected / dp_param_count) * 100
+        
+        print(f"   ✅ Selected {len(names)} complete parameters")
+        print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
+        
+        dp_mask = None  # No masking needed - all complete parameters
     else:
-        names = [n for n,_ in model.named_parameters()
-                 if _match(n, target_layer)]
-    params = [dict(model.named_parameters())[n] for n in names]
+        if target_layer == "all":
+            names = [n for n,_ in model.named_parameters()]
+        elif "," in target_layer:
+            layers = [s.strip() for s in target_layer.split(",")]
+            names  = [n for n,_ in model.named_parameters()
+                    if any(_match(n, l) for l in layers)]
+        else:
+            names = [n for n,_ in model.named_parameters()
+                    if _match(n, target_layer)]
+        params = [dict(model.named_parameters())[n] for n in names]
+        
+        dp_mask = None  # No masking in layer mode
     
     # Strict DP: Freeze all other layers
     frozen_count = 0

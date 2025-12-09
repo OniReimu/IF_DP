@@ -139,8 +139,9 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
                         # Note: Public dataset size is fixed at 50% of testset (~5000 samples)
 
 # Model architecture
---model-type cnn        # Simple CNN (default)
---model-type resnet18   # ResNet-18 architecture
+--model-type cnn              # Simple CNN (default)
+--model-type resnet18         # ResNet-18
+--model-type efficientnet_b0  # EfficientNet-B0
 
 # Fisher strategies (fixed default)
 --negatively_correlated_noise   # Less noise in high curvature (default; positive option removed)
@@ -176,13 +177,31 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 --dp-layer "resnet.conv1"              # ResNet-18 stem only (smallest)
 --dp-layer "resnet.conv1,resnet.bn1"   # ResNet-18 stem + BN
 --dp-layer "resnet.conv1,resnet.layer1"  # add first block; expand with layer2, layer3, layer4 as needed
+
+# OR: Use parameter budget (mutually exclusive with --dp-layer)
+--dp-param-count 20000                 # Train up to 20,000 parameters with DP (smart selection)
 ```
 
 **Note**: When using `--dp-layer`, the specified layers are trained with DP on private data, while all other layers are **frozen** (pre-trained on public data). This ensures strict $(\epsilon, \delta)$-DP for the entire model.
 
-**Layer naming**:
+When using `--dp-param-count N`, the code smartly selects **complete parameters** (no partial layers) that maximize parameter usage within budget `N`. It selects parameters in model order, skipping any that would exceed the budget. This ensures:
+- Only complete parameters are selected (no partial layer training)
+- Maximum utilization of the parameter budget
+- Predictable behavior across different architectures
+
+**Example**: With budget 20,000 and layers [conv1: 896, conv2: 18,496, conv3: 73,728]:
+- Selects: conv1 + conv2 = 19,392 parameters (96.96% efficiency)
+- Skips: conv3 (would exceed budget)
+
+**`--dp-layer` vs `--dp-param-count`**:
+- These options are **mutually exclusive**
+- `--dp-layer`: Select parameters by layer names (more semantic, substring matching)
+- `--dp-param-count`: Select parameters by budget (architecture-agnostic, greedy knapsack)
+
+**Layer naming (prefix match)**:
 - **CNN**: `conv1`, `conv2`, `conv3`, `fc1`, `fc2`
-- **ResNet-18**: `conv1`, `layer1`, `layer2`, `layer3`, `layer4`, `fc` (final classifier)
+- **ResNet-18**: `resnet.conv1`, `resnet.bn1`, `resnet.layer1`, `resnet.layer2`, `resnet.layer3`, `resnet.layer4`, `resnet.fc`
+- **EfficientNet-B0**: `efficientnet.features.0`, `efficientnet.features.1`, …, `efficientnet.features.8`, `efficientnet.classifier`
 
 ## 🔬 **Research Applications**
 
