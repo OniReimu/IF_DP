@@ -128,12 +128,8 @@ p.add_argument('--users', type=int,          default=10,
 p.add_argument('--full-complement-noise', action='store_true',
                help='Use full complement noise in orthogonal subspace')
 
-# Fisher DP noise scaling strategy
-noise_strategy_group = p.add_mutually_exclusive_group()
-noise_strategy_group.add_argument('--negatively_correlated_noise', action='store_true', default=True,
-                                 help='Fisher DP: noise inversely correlated with curvature (noise ∝ 1/√λ, less noise in high curvature directions, default)')
-noise_strategy_group.add_argument('--positively_correlated_noise', action='store_true',
-                                 help='Fisher DP: noise positively correlated with curvature (noise ∝ √λ, more noise in high curvature directions)')
+# Fisher DP noise scaling strategy (fixed to negatively correlated noise)
+p.set_defaults(negatively_correlated_noise=True)
 
 # MIA evaluation flags
 p.add_argument('--run-mia', action='store_true',

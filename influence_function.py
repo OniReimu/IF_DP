@@ -173,9 +173,9 @@ def compute_influence_vectors(model, public_loader, train_loader,
                     # ✨ MORE CONSERVATIVE: Scale by (1 + ||g||) instead of ||g|| alone for stability
                     g_norm = g.norm() + 1e-8
                     scaling_factor = 1.0 + g_norm  # More conservative scaling
-                    vec[n] = g / (scaling_factor * reg)  # Much more conservative update
+                    vec[n] = (g / (scaling_factor * reg)).cpu()  # store on CPU to avoid MPS/GPU OOM
                 else:
-                    vec[n] = torch.zeros_like(p)
+                    vec[n] = torch.zeros_like(p, device="cpu")
             infl_vecs.append(vec)
 
     elif method == "public-fisher":                       # -----------------
@@ -364,9 +364,13 @@ def calibrate_model_research_protocol(model,
     # Paper mapping — Step c(c): α(z) = - J^T v(z).
     # If J points to increasing loss and v(z) points to decreasing loss, then α(z) > 0 is helpful.
     # Note: α(z) depends on current θ̂, so it must be recomputed after each update in the refinement loop.
-    scores = np.array([ -torch.dot(J_flat,
-                   torch.cat([v[n].flatten() for n in J.keys()])).item()
-                        for v in infl_vecs ])
+    scores = np.array([
+        -torch.dot(
+            J_flat,
+            torch.cat([v[n].flatten() for n in J.keys()]).to(J_flat.device)
+        ).item()
+        for v in infl_vecs
+    ])
 
     # ---- d) choose η most helpful samples 
     # Paper mapping — Step d(i): Initial selection via sparse re-weighting
@@ -423,7 +427,7 @@ def calibrate_model_research_protocol(model,
     for i, weight in enumerate(w):
         if weight > 0:  # Only sum over helpful samples
             for n in delta:
-                delta[n] += infl_vecs[i][n] * weight / n_selected  # Average of helpful influence vectors
+                delta[n] += infl_vecs[i][n].to(delta[n].device) * weight / n_selected  # Average of helpful influence vectors
 
     # 🔍 DIAGNOSTIC: Check delta before trust region
     delta_norm_before = _frob_norm(delta)

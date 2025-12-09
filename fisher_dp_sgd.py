@@ -27,17 +27,21 @@ def compute_fisher(model, dataloader, device,
     model.eval()
 
     # ------------ choose parameters ------------
+    def _match(name: str, layer: str) -> bool:
+        # stricter prefix match to avoid accidental substring matches
+        return name.startswith(layer)
+
     if target_layer == "all":
         tgt_names = [n for n, _ in model.named_parameters()]
         print("🎯 computing Fisher for ALL layers")
     elif "," in target_layer:
         layers = [s.strip() for s in target_layer.split(",")]
         tgt_names = [n for n, _ in model.named_parameters()
-                     if any(l in n for l in layers)]
+                     if any(_match(n, l) for l in layers)]
         print(f"🎯 computing Fisher for layers {layers}")
     else:
         tgt_names = [n for n, _ in model.named_parameters()
-                     if target_layer in n]
+                     if _match(n, target_layer)]
         print(f"🎯 computing Fisher for layer '{target_layer}'")
 
     if not tgt_names:

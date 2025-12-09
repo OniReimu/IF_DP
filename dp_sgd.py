@@ -51,15 +51,18 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
         print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
     
     # gather parameter objects based on target_layer
+    def _match(name: str, layer: str) -> bool:
+        return name.startswith(layer)
+
     if target_layer == "all":
         names = [n for n,_ in model.named_parameters()]
     elif "," in target_layer:
         layers = [s.strip() for s in target_layer.split(",")]
         names  = [n for n,_ in model.named_parameters()
-                  if any(l in n for l in layers)]
+                  if any(_match(n, l) for l in layers)]
     else:
         names = [n for n,_ in model.named_parameters()
-                 if target_layer in n]
+                 if _match(n, target_layer)]
     params = [dict(model.named_parameters())[n] for n in names]
     
     # Strict DP: Freeze all other layers

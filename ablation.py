@@ -394,15 +394,19 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
 
     # Gather parameter objects
+    def _match(name: str, layer: str) -> bool:
+        # stricter match: prefix match to avoid accidental substring matches across deeper blocks
+        return name.startswith(layer)
+
     if target_layer == "all":
         names = [n for n,_ in model.named_parameters()]
     elif "," in target_layer:
         layers = [s.strip() for s in target_layer.split(",")]
         names = [n for n,_ in model.named_parameters()
-                 if any(l in n for l in layers)]
+                 if any(_match(n, l) for l in layers)]
     else:
         names = [n for n,_ in model.named_parameters()
-                 if target_layer in n]
+                 if _match(n, target_layer)]
     params = [dict(model.named_parameters())[n] for n in names]
     param_dim = sum(p.numel() for p in params)
 
@@ -1403,12 +1407,8 @@ def main():
     parser.add_argument('--full-complement-noise', action='store_true',
                        help='Use full complement noise in orthogonal subspace')
     
-    # Fisher DP noise scaling strategy  
-    noise_strategy_group = parser.add_mutually_exclusive_group()
-    noise_strategy_group.add_argument('--negatively_correlated_noise', action='store_true', default=True,
-                                     help='Fisher DP: noise inversely correlated with curvature (noise ∝ 1/√λ, less noise in high curvature directions, default)')
-    noise_strategy_group.add_argument('--positively_correlated_noise', action='store_true',
-                                     help='Fisher DP: noise positively correlated with curvature (noise ∝ √λ, more noise in high curvature directions)')
+    # Fisher DP noise scaling strategy (fixed to negatively correlated noise)
+    parser.set_defaults(negatively_correlated_noise=True)
     
     # DP-SAT arguments
     parser.add_argument('--rho-sat', type=float, default=0.001,
@@ -1457,7 +1457,8 @@ def main():
     args = parser.parse_args()
     
     # Map new argument names for consistency  
-    args.positive_noise_correlation = args.positively_correlated_noise
+    # Fixed noise strategy: negatively correlated noise (no positive option)
+    args.positive_noise_correlation = False
     
     # Parse target_class argument - can be "all" or integer
     if args.target_class == "all":

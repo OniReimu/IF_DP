@@ -36,8 +36,8 @@ uv run ablation.py --mps --target-epsilon 10.0 --k 64 --lambda-flatness 0.01 --r
 **Solution**: Shape noise according to Fisher information F = E[∇log p(y|x) ∇log p(y|x)ᵀ]
 
 **Noise Scaling Strategies**:
-- **Positively Correlated** (default): `noise ∝ √λ` - More noise in high curvature directions
-- **Negatively Correlated**: `noise ∝ 1/√λ` - Less noise in high curvature directions
+- **Positively Correlated**: `noise ∝ √λ` - More noise in high curvature directions
+- **Negatively Correlated** (default): `noise ∝ 1/√λ` - Less noise in high curvature directions
 
 ### DP-SAT: Flatter Minima
 **Problem**: Sharp loss landscapes cause DP-SGD to fail.
@@ -142,9 +142,8 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 --model-type cnn        # Simple CNN (default)
 --model-type resnet18   # ResNet-18 architecture
 
-# Fisher strategies
---positively_correlated_noise   # More noise in high curvature (default)
---negatively_correlated_noise   # Less noise in high curvature
+# Fisher strategies (fixed default)
+--negatively_correlated_noise   # Less noise in high curvature (default; positive option removed)
 
 # DP modes
 --sample-level          # Traditional DP
@@ -163,7 +162,7 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 
 ### Advanced Features
 ```bash
-# Adaptive clipping
+# Adaptive clipping (disabled by default)
 --adaptive-clip --quantile 0.95
 
 # DP-SAT flatness
@@ -173,8 +172,10 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 --run-mia --mia-size 1000
 
 # Target specific layers (Strict DP: other layers are frozen)
---dp-layer "conv1,conv2"        # For CNN: conv1, conv2, conv3, fc1, fc2
---dp-layer "layer1,layer2"      # For ResNet-18: layer1, layer2, layer3, layer4, conv1, fc
+--dp-layer "conv1,conv2"               # CNN: matches prefixes conv1, conv2, ...
+--dp-layer "resnet.conv1"              # ResNet-18 stem only (smallest)
+--dp-layer "resnet.conv1,resnet.bn1"   # ResNet-18 stem + BN
+--dp-layer "resnet.conv1,resnet.layer1"  # add first block; expand with layer2, layer3, layer4 as needed
 ```
 
 **Note**: When using `--dp-layer`, the specified layers are trained with DP on private data, while all other layers are **frozen** (pre-trained on public data). This ensures strict $(\epsilon, \delta)$-DP for the entire model.
@@ -187,7 +188,7 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 
 ### Compare Noise Strategies
 ```bash
-uv run main.py --positively_correlated_noise --target-epsilon 8.0 --compare-others --run-mia
+# (positively correlated noise option removed)
 uv run main.py --negatively_correlated_noise --target-epsilon 8.0 --compare-others --run-mia
 ```
 
