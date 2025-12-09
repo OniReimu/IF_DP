@@ -63,10 +63,13 @@ This repository implements **Option 1: Frozen Backbone + DP Finetuning** to prov
 
 **For CIFAR-10 ablation studies**, we simulate a "large public corpus + small private dataset" scenario:
 
-- **Public data (45k)**: Large subset of CIFAR-10 train → baseline pretraining
+- **Public pretraining data (40k)**: Large subset of CIFAR-10 train → baseline pretraining
+- **Public calibration data (5k)**: Small subset of CIFAR-10 train → influence function calibration
 - **Private data (5k)**: Small subset of CIFAR-10 train → DP finetuning  
   - Controlled by `--dataset-size` (default: 5,000)
 - **Evaluation data (10k)**: Full CIFAR-10 test → final accuracy measurement
+
+**Optimization**: The public data is split into pretraining (40k) and calibration (5k) subsets. This significantly speeds up influence function computation, as we only need to compute influences on 5k samples instead of 45k, while still maintaining strong baseline performance from 40k pretraining samples.
 
 **Note**: This treats most of the training set as "public" for simulation purposes. In real applications, public data would come from a genuinely public source (e.g., ImageNet pretraining, web-scraped images, etc.).
 
@@ -149,9 +152,10 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 
 # Dataset sizes (Simulation Setup - Option B)
 --dataset-size 5000     # Size of PRIVATE dataset (from CIFAR-10 trainset, default: 5,000)
-                        # Public dataset = remaining trainset samples (default: 45,000)
-                        # Evaluation dataset = full testset (10,000)
-                        # Example: --dataset-size 10000 → 40k public, 10k private, 10k eval
+                        # Public pretrain = 50k - dataset_size - 5k (default: 40,000)
+                        # Public calibration = fixed 5k (for efficient influence computation)
+                        # Evaluation = full testset (10,000)
+                        # Example: --dataset-size 10000 → 35k pretrain, 5k calib, 10k private, 10k eval
 
 # Model architecture
 --model-type cnn              # Simple CNN (default)

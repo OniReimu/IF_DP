@@ -750,7 +750,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
 # Ablation Study Main Function
 # ════════════════════════════════════════════════════════════════
 
-def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx, priv_ds, Fmat, pub_loader):
+def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx, priv_ds, Fmat, pub_loader, pub_loader_calib):
     """
     Run optimized ablation study on Fisher DP-SGD variants.
     
@@ -968,8 +968,9 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         before_stats = diagnose_calibration(fisher_normal_calibrated, critical_data, critical_targets, device)
         
         # Apply OPTIMIZED calibration (Line Search + Multi-Step)
+        # Use small calibration set for efficiency
         calib_normal = calibrate_with_combined_optimization(
-            fisher_normal_calibrated, pub_loader, priv_loader,
+            fisher_normal_calibrated, pub_loader_calib, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -987,8 +988,9 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     else:
         print(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply optimized calibration without diagnosis
+        # Use small calibration set for efficiency
         calib_normal = calibrate_with_combined_optimization(
-            fisher_normal_calibrated, pub_loader, priv_loader,
+            fisher_normal_calibrated, pub_loader_calib, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -1016,8 +1018,9 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         before_stats_dpsat = diagnose_calibration(fisher_dpsat_calibrated, critical_data, critical_targets, device)
         
         # Apply OPTIMIZED calibration (Line Search + Multi-Step)
+        # Use small calibration set for efficiency
         calib_dpsat = calibrate_with_combined_optimization(
-            fisher_dpsat_calibrated, pub_loader, priv_loader,
+            fisher_dpsat_calibrated, pub_loader_calib, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -1035,8 +1038,9 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     else:
         print(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply optimized calibration without diagnosis
+        # Use small calibration set for efficiency
         calib_dpsat = calibrate_with_combined_optimization(
-            fisher_dpsat_calibrated, pub_loader, priv_loader,
+            fisher_dpsat_calibrated, pub_loader_calib, priv_loader,
             critical_data, critical_targets, device=device,
             method=args.method,
             eta=args.calibration_k,
@@ -1560,57 +1564,70 @@ def main():
     # ════════════════════════════════════════════════════════════════
     # Simulates: Large public corpus + small private dataset scenario
     # 
-    # - pub_base: Large subset of trainset (45k) - used for public baseline training
-    # - priv_base: Small subset of trainset (5k) - used for DP finetuning (PRIVATE)
-    # - eval_base: Full testset (10k) - used for final evaluation
+    # - pub_base_pretrain: Large subset of trainset (40k) - for public baseline training
+    # - pub_base_calib: Small subset of trainset (5k) - for influence function calibration
+    # - priv_base: Small subset of trainset (5k) - for DP finetuning (PRIVATE)
+    # - eval_base: Full testset (10k) - for final evaluation
     # 
     # NOTE: This treats most of CIFAR-10 train as "public" for simulation purposes.
     #       In real applications, public data would come from a different source.
     # ════════════════════════════════════════════════════════════════
     
-    # Default split: 45k public, 5k private (from 50k trainset)
+    # Default split: 40k pretrain, 5k calibration, 5k private (from 50k trainset)
     default_private_size = 5000
-    default_public_size = 45000
+    default_calib_size = 5000
+    default_pretrain_size = 40000
     
     # Allow override via --dataset-size (controls private set size)
     private_size = args.dataset_size if args.dataset_size is not None else default_private_size
-    public_size = len(trainset) - private_size
+    calib_size = default_calib_size
+    pretrain_size = len(trainset) - private_size - calib_size
     
-    if public_size < 0:
-        print(f"❌ Error: --dataset-size {private_size} exceeds trainset size {len(trainset)}")
+    if pretrain_size < 0:
+        print(f"❌ Error: --dataset-size {private_size} + calibration {calib_size} exceeds trainset size {len(trainset)}")
         exit(1)
     
-    # Randomly split trainset into public and private
+    # Randomly split trainset into pretrain, calibration, and private
     perm_train = np.random.permutation(len(trainset))
-    pub_idx = perm_train[:public_size]      # Large public subset
-    priv_idx = perm_train[public_size:]     # Small private subset
+    pretrain_idx = perm_train[:pretrain_size]                           # Large pretraining subset (40k)
+    calib_idx = perm_train[pretrain_size:pretrain_size + calib_size]   # Calibration subset (5k)
+    priv_idx = perm_train[pretrain_size + calib_size:]                 # Small private subset (5k)
     
-    pub_base = Subset(trainset, pub_idx)    # Public baseline training (45k)
-    priv_base = Subset(trainset, priv_idx)  # Private DP training (5k)
+    pub_base_pretrain = Subset(trainset, pretrain_idx)  # Public baseline pretraining (40k)
+    pub_base_calib = Subset(trainset, calib_idx)        # Public calibration (5k)
+    priv_base = Subset(trainset, priv_idx)              # Private DP training (5k)
+    
+    # For backward compatibility: combine pretrain + calib for baseline training
+    pub_base = Subset(trainset, np.concatenate([pretrain_idx, calib_idx]))  # Combined public (45k)
     
     # Evaluation: use full testset (no split needed now)
     eval_base = testset  # Full testset for evaluation (10k)
     
     print(f'📊 Ablation Study Data (SIMULATION SETUP - Option B):')
-    print(f'   • Public data:  {len(pub_base):5d} samples from CIFAR-10 trainset (for baseline pretraining)')
-    print(f'   • Private data: {len(priv_base):5d} samples from CIFAR-10 trainset (for DP finetuning)')
-    print(f'   • Eval data:    {len(eval_base):5d} samples from CIFAR-10 testset (for final evaluation)')
+    print(f'   • Public pretrain:  {len(pub_base_pretrain):5d} samples from CIFAR-10 trainset (for baseline pretraining)')
+    print(f'   • Public calib:     {len(pub_base_calib):5d} samples from CIFAR-10 trainset (for influence calibration)')
+    print(f'   • Private data:     {len(priv_base):5d} samples from CIFAR-10 trainset (for DP finetuning)')
+    print(f'   • Eval data:        {len(eval_base):5d} samples from CIFAR-10 testset (for final evaluation)')
     print(f'   🔬 SIMULATION: Treats trainset as "large public + small private" for ablation study')
+    print(f'   ⚡ OPTIMIZATION: Small calibration set ({len(pub_base_calib)}) speeds up influence computation')
     
     # Setup data loaders based on DP mode
     if args.sample_level:
         print('📊 Using SAMPLE-level DP')
         priv_loader = DataLoader(priv_base, batch_size=128, shuffle=True)
         priv_ds = None
-        # Public loader for calibration (sample-level)
-        pub_loader = DataLoader(pub_base, batch_size=128, shuffle=False)
+        # Public loaders (sample-level)
+        pub_loader = DataLoader(pub_base, batch_size=128, shuffle=False)  # Combined for baseline training
+        pub_loader_calib = DataLoader(pub_base_calib, batch_size=128, shuffle=False)  # Small set for calibration
     else:
         print(f'👥 Using USER-level DP ({args.users} synthetic users)')
         priv_ds = SyntheticUserDataset(priv_base, args.users)
         priv_loader = DataLoader(priv_ds, batch_sampler=UserBatchSampler(priv_ds.uid))
-        # Public loader for calibration (user-level) - use same synthetic user structure
+        # Public loaders (user-level) - use same synthetic user structure
         pub_ds = SyntheticUserDataset(pub_base, args.users)
-        pub_loader = DataLoader(pub_ds, batch_size=128, shuffle=False)
+        pub_loader = DataLoader(pub_ds, batch_size=128, shuffle=False)  # Combined for baseline training
+        pub_ds_calib = SyntheticUserDataset(pub_base_calib, args.users)
+        pub_loader_calib = DataLoader(pub_ds_calib, batch_size=128, shuffle=False)  # Small set for calibration
     
     # ════════════════════════════════════════════════════════════════
     # Fisher matrix computation
@@ -1643,7 +1660,7 @@ def main():
     # ════════════════════════════════════════════════════════════════
     
     results = run_ablation_study(args, device, priv_loader, eval_base, priv_base, 
-                                priv_idx, priv_ds, Fmat, pub_loader)
+                                priv_idx, priv_ds, Fmat, pub_loader, pub_loader_calib)
     
     # ════════════════════════════════════════════════════════════════
     # Final summary
