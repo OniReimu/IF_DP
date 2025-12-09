@@ -1555,32 +1555,47 @@ def main():
     trainset = torchvision.datasets.CIFAR10('./data', train=True, download=True, transform=trans)
     testset = torchvision.datasets.CIFAR10('./data', train=False, download=True, transform=trans)
     
-    # Data partitioning for differential privacy (MATCHING main.py):
-    # - priv_base: From trainset - used for DP training (PRIVATE dataset, size controlled by --dataset-size)
-    # - pub_base: From testset subset - used for baseline training and calibration (PUBLIC data, ~50% of testset)
-    # - eval_base: From testset subset - used for evaluation (independent, ~50% of testset)
+    # ════════════════════════════════════════════════════════════════
+    # Data partitioning - SIMULATION SETUP (Option B)
+    # ════════════════════════════════════════════════════════════════
+    # Simulates: Large public corpus + small private dataset scenario
+    # 
+    # - pub_base: Large subset of trainset (45k) - used for public baseline training
+    # - priv_base: Small subset of trainset (5k) - used for DP finetuning (PRIVATE)
+    # - eval_base: Full testset (10k) - used for final evaluation
+    # 
+    # NOTE: This treats most of CIFAR-10 train as "public" for simulation purposes.
+    #       In real applications, public data would come from a different source.
+    # ════════════════════════════════════════════════════════════════
     
-    # Private data: use subset of trainset for training
-    # If dataset_size is None, use all available samples
-    effective_dataset_size = args.dataset_size if args.dataset_size is not None else len(trainset)
-    perm_train = np.random.permutation(min(effective_dataset_size, len(trainset)))
-    priv_idx = perm_train[:min(effective_dataset_size, len(trainset))]
-    priv_base = Subset(trainset, priv_idx)  # Training data from trainset
+    # Default split: 45k public, 5k private (from 50k trainset)
+    default_private_size = 5000
+    default_public_size = 45000
     
-    # Public data: use subset of testset for calibration
-    pub_ratio = 0.5  # Use 50% of testset for calibration, 50% for evaluation
-    perm_test = np.random.permutation(len(testset))
-    pub_split = int(len(testset) * pub_ratio)
-    pub_idx, eval_idx = perm_test[:pub_split], perm_test[pub_split:]
+    # Allow override via --dataset-size (controls private set size)
+    private_size = args.dataset_size if args.dataset_size is not None else default_private_size
+    public_size = len(trainset) - private_size
     
-    pub_base = Subset(testset, pub_idx)    # Calibration data from testset
-    eval_base = Subset(testset, eval_idx)  # Evaluation data from testset
+    if public_size < 0:
+        print(f"❌ Error: --dataset-size {private_size} exceeds trainset size {len(trainset)}")
+        exit(1)
     
-    print(f'📊 Ablation Study Data (FIXED - Matching main.py):')
-    print(f'   • Private data: {len(priv_base)} samples from CIFAR-10 trainset (for training)')
-    print(f'   • Public data: {len(pub_base)} samples from CIFAR-10 testset (for calibration)')
-    print(f'   • Evaluation data: {len(eval_base)} samples from CIFAR-10 testset (for evaluation)')
-    print(f'   🔧 FIXED: Proper 3-way split - no circularity, no domain mismatch!')
+    # Randomly split trainset into public and private
+    perm_train = np.random.permutation(len(trainset))
+    pub_idx = perm_train[:public_size]      # Large public subset
+    priv_idx = perm_train[public_size:]     # Small private subset
+    
+    pub_base = Subset(trainset, pub_idx)    # Public baseline training (45k)
+    priv_base = Subset(trainset, priv_idx)  # Private DP training (5k)
+    
+    # Evaluation: use full testset (no split needed now)
+    eval_base = testset  # Full testset for evaluation (10k)
+    
+    print(f'📊 Ablation Study Data (SIMULATION SETUP - Option B):')
+    print(f'   • Public data:  {len(pub_base):5d} samples from CIFAR-10 trainset (for baseline pretraining)')
+    print(f'   • Private data: {len(priv_base):5d} samples from CIFAR-10 trainset (for DP finetuning)')
+    print(f'   • Eval data:    {len(eval_base):5d} samples from CIFAR-10 testset (for final evaluation)')
+    print(f'   🔬 SIMULATION: Treats trainset as "large public + small private" for ablation study')
     
     # Setup data loaders based on DP mode
     if args.sample_level:

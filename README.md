@@ -53,31 +53,45 @@ This repository implements **Option 1: Frozen Backbone + DP Finetuning** to prov
 ### Architecture
 
 **Strict DP Setup**:
-1. **Baseline Training (Public Data)**: The baseline model is pre-trained on **public data only** (e.g., public subset of CIFAR-10 test set). This ensures the initial weights for frozen layers contain no private information.
-2. **DP Finetuning (Private Data)**: Only selected layers (specified via `--dp-layer`) are trained with DP-SGD on the **private dataset**. All other layers are **frozen** (`requires_grad=False`).
+1. **Baseline Training (Public Data)**: The baseline model is pre-trained on **public data only**. This ensures the initial weights for frozen layers contain no private information.
+2. **DP Finetuning (Private Data)**: Only selected layers (specified via `--dp-layer` or `--dp-param-count`) are trained with DP-SGD on the **private dataset**. All other layers are **frozen** (`requires_grad=False`).
 3. **Formal Guarantee**: The entire released model is $(\epsilon, \delta)$-DP with respect to the private dataset, because:
    - Frozen layers depend only on public data (no privacy leakage).
    - DP-trained layers use formal DP-SGD mechanisms (Fisher DP-SGD or Vanilla DP-SGD).
 
+### Data Splitting (Simulation Setup)
+
+**For CIFAR-10 ablation studies**, we simulate a "large public corpus + small private dataset" scenario:
+
+- **Public data (45k)**: Large subset of CIFAR-10 train → baseline pretraining
+- **Private data (5k)**: Small subset of CIFAR-10 train → DP finetuning  
+  - Controlled by `--dataset-size` (default: 5,000)
+- **Evaluation data (10k)**: Full CIFAR-10 test → final accuracy measurement
+
+**Note**: This treats most of the training set as "public" for simulation purposes. In real applications, public data would come from a genuinely public source (e.g., ImageNet pretraining, web-scraped images, etc.).
+
 ### Why This Approach?
 
 Computing Fisher information matrices for all parameters is computationally expensive. By:
-- Training the baseline on public data (free),
+- Training the baseline on large public data (strong pretrain),
 - Freezing most layers (no DP cost),
 - Applying Fisher DP-SGD only to selected layers (manageable cost),
 
-we achieve **strict DP** while maintaining computational feasibility.
+we achieve **strict DP** while maintaining computational feasibility and strong baseline performance.
 
 ### Implementation Details
 
-- **Baseline**: Trained on `pub_loader` (public data) in `ablation.py`.
-- **Freezing**: All parameters NOT in `--dp-layer` are automatically frozen during DP training.
+- **Baseline**: Trained on `pub_loader` (45k public samples) in `ablation.py`.
+- **Freezing**: All parameters NOT in `--dp-layer`/`--dp-param-count` are automatically frozen during DP training.
 - **Verification**: The code logs `🔒 Strict DP: Frozen N parameter groups` to confirm the setup.
 
 **Example**:
 ```bash
-# Train only conv1 and conv2 with DP, freeze all other layers
-uv run ablation.py --dp-layer "conv1,conv2" --target-epsilon 10.0
+# Default: 45k public, 5k private (from 50k trainset)
+uv run ablation.py --dp-layer "conv1,conv2" --target-epsilon 2.0
+
+# Custom split: 40k public, 10k private
+uv run ablation.py --dataset-size 10000 --dp-layer "conv1,conv2" --target-epsilon 2.0
 ```
 
 This ensures the final model has a formal $(\epsilon, \delta)$-DP guarantee w.r.t. the private training dataset.
@@ -133,10 +147,11 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 --target-epsilon 1.0    # High privacy
 --target-epsilon 10.0   # Moderate privacy
 
-# Dataset sizes
---dataset-size 10000    # Size of PRIVATE dataset (from CIFAR-10 trainset)
-                        # Default: None (uses all available samples from trainset, ~50,000 for CIFAR-10)
-                        # Note: Public dataset size is fixed at 50% of testset (~5000 samples)
+# Dataset sizes (Simulation Setup - Option B)
+--dataset-size 5000     # Size of PRIVATE dataset (from CIFAR-10 trainset, default: 5,000)
+                        # Public dataset = remaining trainset samples (default: 45,000)
+                        # Evaluation dataset = full testset (10,000)
+                        # Example: --dataset-size 10000 → 40k public, 10k private, 10k eval
 
 # Model architecture
 --model-type cnn              # Simple CNN (default)
