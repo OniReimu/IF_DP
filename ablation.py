@@ -417,10 +417,9 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             if total_selected + size <= dp_param_count:
                 selected_indices.append(idx)
                 total_selected += size
-                print(f"      • {name}: {size} params (total: {total_selected})")
             elif total_selected < dp_param_count:
-                # Would exceed budget - skip this parameter
-                print(f"      ✗ {name}: {size} params (would exceed budget, skipping)")
+                # Would exceed budget - silently skip for cleaner logs
+                continue
         
         # Extract selected parameters
         names = []
@@ -790,23 +789,64 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     print(f"✅ Fisher eigendecomposition complete: k={actual_k} eigenpairs")
     print(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
     
-    # Load baseline model for initialization (always train on PUBLIC data; no cache)
+    # Load baseline model for initialization
     baseline = create_model(args.model_type).to(device)
-    opt_b = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=.9)
     
-    print('\n⚙️  Training baseline on PUBLIC data (Strict DP Setup)...')
-    print(f"   • Public data size: {len(pub_loader.dataset)} samples")
-    print(f"   • Private data will ONLY be used for DP-training selected layers ({args.dp_layer})")
+    # Check for pretrained baseline model (saved for efficiency)
+    pretrain_path = os.path.join(models_dir, f'Pretrain_{args.model_type}_{args.epochs}_public.pth')
     
-    for epoch in tqdm(range(args.epochs)):
-        baseline.train()
-        for batch_data in pub_loader:
-            if len(batch_data) == 3:
-                x, y, _ = batch_data
-            else:
-                x, y = batch_data
-            x, y = x.to(device), y.to(device)
-            opt_b.zero_grad(); F.cross_entropy(baseline(x),y).backward(); opt_b.step()
+    if os.path.exists(pretrain_path) and not args.clean:
+        print(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
+        checkpoint = torch.load(pretrain_path, map_location=device)
+        baseline.load_state_dict(checkpoint['model_state_dict'])
+        baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
+        print(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
+    else:
+        print(f'\n⚙️  Training baseline on PUBLIC data (Strict DP Setup)...')
+        print(f"   • Public data size: {len(pub_loader.dataset)} samples")
+        print(f"   • Model: {args.model_type}")
+        print(f"   • Epochs: {args.epochs}")
+        print(f"   • Private data will ONLY be used for DP-training selected layers ({args.dp_layer if not args.dp_param_count else f'budget={args.dp_param_count}'})")
+        
+        # Stronger from-scratch recipe for public pretrain (no ImageNet weights)
+        base_lr = 0.1
+        weight_decay = 5e-4
+        momentum = 0.9
+        opt_b = torch.optim.SGD(baseline.parameters(), lr=base_lr, momentum=momentum, weight_decay=weight_decay)
+        
+        # Cosine schedule over public pretrain epochs
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=args.epochs)
+        
+        for epoch in tqdm(range(args.epochs), desc="Public baseline training"):
+            baseline.train()
+            for batch_data in pub_loader:
+                if len(batch_data) == 3:
+                    x, y, _ = batch_data
+                else:
+                    x, y = batch_data
+                x, y = x.to(device), y.to(device)
+                opt_b.zero_grad()
+                loss = F.cross_entropy(baseline(x), y)
+                loss.backward()
+                opt_b.step()
+            scheduler.step()
+        
+        # Evaluate baseline accuracy on eval set
+        baseline.eval()
+        eval_loader_baseline = DataLoader(eval_base, batch_size=128, shuffle=False)
+        baseline_acc = accuracy(baseline, eval_loader_baseline, device)
+        
+        # Save pretrained baseline
+        torch.save({
+            'model_state_dict': baseline.state_dict(),
+            'model_type': args.model_type,
+            'epochs': args.epochs,
+            'accuracy': baseline_acc,
+            'public_data_size': len(pub_loader.dataset),
+            'timestamp': __import__('time').strftime('%Y%m%d_%H%M%S')
+        }, pretrain_path)
+        print(f"\n💾 Saved pretrained baseline to {pretrain_path}")
+        print(f"   • Baseline accuracy: {baseline_acc:.2f}%")
 
     # Privacy accounting setup
     if not args.use_legacy_accounting:

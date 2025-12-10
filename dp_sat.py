@@ -88,9 +88,9 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
             if total_selected + size <= dp_param_count:
                 selected_indices.append(idx)
                 total_selected += size
-                print(f"      • {name}: {size} params (total: {total_selected})")
             elif total_selected < dp_param_count:
-                print(f"      ✗ {name}: {size} params (would exceed budget, skipping)")
+                # Would exceed budget - silently skip for cleaner logs
+                continue
         
         # Extract selected parameters
         names = []

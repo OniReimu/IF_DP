@@ -51,7 +51,8 @@ def compute_fisher(model, dataloader, device,
                 selected_indices.append(idx)
                 total_selected += size
             elif total_selected < dp_param_count:
-                print(f"      ✗ {name}: {size} params (would exceed budget, skipping)")
+                # Would exceed budget - silently skip for cleaner logs
+                continue
         
         # Extract selected parameters
         tgt_names = []

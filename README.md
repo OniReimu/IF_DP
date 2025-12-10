@@ -14,7 +14,7 @@ This repository provides a comprehensive comparison of three major DP-SGD enhanc
 
 ### Install Dependencies
 ```bash
-pip install torch torchvision numpy scipy scikit-learn tqdm opacus
+uv pip install torch torchvision numpy scipy scikit-learn tqdm opacus
 ```
 
 ### Run Single Experiments
@@ -22,11 +22,11 @@ pip install torch torchvision numpy scipy scikit-learn tqdm opacus
 # Compare all three methods (default: positively correlated noise)
 uv run main.py --mps --compare-others --target-epsilon 10.0 --run-mia
 
-# Try negatively correlated noise strategy
-uv run main.py --mps --compare-others --negatively_correlated_noise --target-epsilon 10.0
+# Noise strategy is fixed to negatively correlated (default); no flag needed
+uv run main.py --mps --compare-others --target-epsilon 10.0
 
 # Run ablation study with Fisher + DP-SAT synergy
-uv run ablation.py --mps --target-epsilon 10.0 --k 64 --lambda-flatness 0.01 --run-mia
+uv run ablation.py --mps --target-epsilon 10.0 --k 64 --run-mia
 ```
 
 ## 🎯 **Method Overview**
@@ -36,8 +36,7 @@ uv run ablation.py --mps --target-epsilon 10.0 --k 64 --lambda-flatness 0.01 --r
 **Solution**: Shape noise according to Fisher information F = E[∇log p(y|x) ∇log p(y|x)ᵀ]
 
 **Noise Scaling Strategies**:
-- **Positively Correlated**: `noise ∝ √λ` - More noise in high curvature directions
-- **Negatively Correlated** (default): `noise ∝ 1/√λ` - Less noise in high curvature directions
+- **Negatively Correlated**: `noise ∝ 1/√λ` - Less noise in high curvature directions
 
 ### DP-SAT: Flatter Minima
 **Problem**: Sharp loss landscapes cause DP-SGD to fail.
@@ -85,62 +84,33 @@ we achieve **strict DP** while maintaining computational feasibility and strong 
 ### Implementation Details
 
 - **Baseline**: Trained on `pub_loader` (45k public samples) in `ablation.py`.
+  - **Caching**: Pretrained baselines are automatically saved as `Pretrain_{model}_{epochs}_public.pth`
+  - Current recipe: strong-from-scratch SGD (lr=0.1, momentum=0.9, weight_decay=5e-4, cosine schedule)
+  - On subsequent runs with same model/epochs, the cached baseline is loaded (massive speedup!)
+  - Use `--clean` flag to force retraining from scratch
 - **Freezing**: All parameters NOT in `--dp-layer`/`--dp-param-count` are automatically frozen during DP training.
 - **Verification**: The code logs `🔒 Strict DP: Frozen N parameter groups` to confirm the setup.
 
 **Example**:
 ```bash
-# Default: 45k public, 5k private (from 50k trainset)
+# Default: 40k pretrain + 5k calib public, 5k private (from 50k trainset)
 uv run ablation.py --dp-layer "conv1,conv2" --target-epsilon 2.0
 
-# Custom split: 40k public, 10k private
+# Custom split: 35k pretrain + 5k calib, 10k private
 uv run ablation.py --dataset-size 10000 --dp-layer "conv1,conv2" --target-epsilon 2.0
+
+# Force retrain baseline (ignore cached pretrained model)
+uv run ablation.py --clean --dp-layer "conv1,conv2" --target-epsilon 2.0
+
+# Cached baseline: Second run is much faster (skips 300 epochs of pretraining!)
+uv run ablation.py --model-type resnet18 --epochs 300 --dp-layer "resnet.layer4" --target-epsilon 2.0
+# → Creates: Pretrain_resnet18_300_public.pth
+# Next run with same model+epochs will load this cached baseline
 ```
 
 This ensures the final model has a formal $(\epsilon, \delta)$-DP guarantee w.r.t. the private training dataset.
 
-## 📊 **Experimental Results (negatively related noise)**
 
-We use the following configuration:
-```bash
-uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 2.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 2.0 --run-mia --users 100 --calibration-k 200 --trust-tau 0.0005 --reg 10
-```
-
-### 100 Users
-```
-⚖️  Privacy vs Accuracy Tradeoff:
-   Model                          Accuracy  Privacy (1-AUC)
-   ────────────────────────────── ─────────  ──────────────
-   Vanilla DP-SGD                  48.3%     0.509
-   Vanilla DP-SGD + DP-SAT         50.2%     0.500
-   Fisher DP + Normal              65.7%     0.498
-   Fisher DP + DP-SAT              63.4%     0.493
-   Fisher DP + Normal + Calib      66.8%     0.491
-   Fisher DP + DP-SAT + Calib      64.2%     0.506
-```
-
-**Key Discovery**: Fisher DP-SGD shows significant improvements over vanilla DP-SGD, with Fisher DP + Normal + Calibration achieving the best accuracy of 66.8% while maintaining strong privacy protection (1-AUC = 0.491).
-
-### Sample-Level DP
-
-Using sample-level configuration:
-```bash
-uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-epsilon 5.0 --delta 1e-5 --dp-layer conv1,conv2 --clip-radius 1.0 --run-mia --sample-level --calibration-k 200 --trust-tau 0.0005 --reg 10
-```
-
-```
-⚖️  Privacy vs Accuracy Tradeoff:
-   Model                          Accuracy  Privacy (1-AUC)
-   ────────────────────────────── ─────────  ──────────────
-   Vanilla DP-SGD                  59.8%     0.473
-   Vanilla DP-SGD + DP-SAT         59.4%     0.477
-   Fisher DP + Normal              64.0%     0.464
-   Fisher DP + DP-SAT              65.7%     0.534
-   Fisher DP + Normal + Calib      64.6%     0.461
-   Fisher DP + DP-SAT + Calib      66.4%     0.536
-```
-
-**Sample-Level Discovery**: Fisher DP + DP-SAT + Calibration achieves the highest accuracy of 66.4% in sample-level DP, demonstrating the effectiveness of combining all three techniques.
 
 ## 🔧 **Configuration Options**
 
@@ -173,6 +143,31 @@ uv run ablation.py --mps --k 2048 --epochs 100 --dataset-size 50000 --target-eps
 --k 64                 # Smaller subspace (faster)
 --k 256                # Larger subspace (more accurate)
 ```
+
+### User-Level vs Sample-Level DP
+
+- **Sample-level DP (`--sample-level`)**  
+  - Each **training example** is one DP unit.  
+  - We compute and clip **per-sample gradients** and add noise at the sample level.  
+  - Intuitively, this is equivalent to “user-level DP with one sample per user” (i.e., \#users = \#samples).
+
+- **User-level DP (`--users K`, without `--sample-level`)**  
+  - The DP unit is an entire **synthetic user**, i.e., all samples belonging to that user.  
+  - In code, we create `K` synthetic users by assigning each training sample a user id in round-robin and clip **per-user gradients**.  
+  - The sampling rate for privacy accounting is approximately `1 / K` (one user per batch with `UserBatchSampler`), so:
+    - For fixed target \((\epsilon,\delta)\), changing `--users` changes the required noise multiplier.  
+    - Larger `K` → smaller per-step sample rate → Opacus can often use **smaller noise** for the same target ε, but each user also has fewer samples.
+
+**Important nuance in this repo**:
+- In practice, the **effective harshness** of DP-SGD depends on both:
+  - the sampling rate used in the RDP accountant (controls σ), and  
+  - the **scale of the clipped gradients** (per-sample vs per-user sums).
+- In our experiments:
+  - User-level with many users (e.g. `--users 100`) can require a **large σ** and has large per-user gradients → Vanilla DP-SGD accuracy can collapse (≈10%).  
+  - User-level with fewer users (e.g. `--users 10`) yields smaller σ and milder clipping → accuracy improves.  
+  - Sample-level DP uses much smaller sampling rate (batch_size / dataset_size) and per-sample gradients → the accountant chooses **smaller σ**, and accuracy can look closer to the “10-user” regime rather than the harsh 100-user case.
+
+Use **sample-level DP** if you care about individual examples, and **user-level DP** if you want to protect an entire user’s contribution (all their samples) as one DP unit.
 
 ### Parameter Relationship: `--k` vs `--dp-layer`
 - **`--dp-layer` (Scope)**: Selects which parameters (total count $P$) are trained with DP. **All other parameters are frozen** (trained on public data only), ensuring strict DP.
@@ -222,20 +217,7 @@ When using `--dp-param-count N`, the code smartly selects **complete parameters*
 - **ResNet-18**: `resnet.conv1`, `resnet.bn1`, `resnet.layer1`, `resnet.layer2`, `resnet.layer3`, `resnet.layer4`, `resnet.fc`
 - **EfficientNet-B0**: `efficientnet.features.0`, `efficientnet.features.1`, …, `efficientnet.features.8`, `efficientnet.classifier`
 
-## 🔬 **Research Applications**
 
-### Compare Noise Strategies
-```bash
-# (positively correlated noise option removed)
-uv run main.py --negatively_correlated_noise --target-epsilon 8.0 --compare-others --run-mia
-```
-
-### Privacy-Utility Tradeoffs
-```bash
-for eps in 1.0 5.0 10.0 20.0; do
-    uv run main.py --target-epsilon $eps --compare-others --run-mia
-done
-```
 
 ## 🏗️ **Core Files**
 
