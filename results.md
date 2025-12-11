@@ -311,4 +311,79 @@ uv run ablation.py --mps --k 2048 --epochs 100 --target-epsilon 4.0 --delta 1e-5
 | Fisher DP + Normal + Calib    |   72.2% |            0.478 |
 | Fisher DP + DP-SAT + Calib    |   71.9% |            0.495 |
 
+---
+
+## Why Vanilla DP-SGD Collapses While Fisher DP Remains Stable
+
+### Vanilla vs Fisher: Same Privacy, Different Geometry
+
+- **Vanilla DP-SGD**:
+  - Clip each (sample/user) gradient in **Euclidean norm** to radius \(C\).
+  - Add **isotropic Gaussian noise** \(z \sim \mathcal{N}(0, \sigma^2 I)\) to the clipped average.
+  - Every direction in parameter space gets the **same variance**; the DP guarantee depends on:
+    - the clipping radius \(C\) (sensitivity), and
+    - the noise scale \(\sigma\) (via the RDP accountant).
+
+- **Fisher DP-SGD**:
+  - Clip in a **Fisher/Mahalanobis norm**, based on a low-rank approximation of the Fisher information \(F\).
+  - Add **anisotropic noise** in the Fisher eigenspace, here with **negatively correlated** scaling (less noise in high-curvature directions).
+  - We use the **same RDP accountant and target \((\epsilon,\delta)\)** as vanilla; the difference is only **how** noise is shaped in parameter space, not how much privacy we get.
+
+So under matched \((\epsilon,\delta)\), **Fisher vs Vanilla differ in utility, not in formal privacy level**.
+
+### Why Decreasing ε or Increasing C Hurts Vanilla Much More
+
+Two key levers affect how “harsh” DP-SGD is:
+
+1. **Lower ε (stricter privacy)**  
+   - The RDP accountant returns a **larger noise multiplier**.
+   - For fixed \(C\), the per-coordinate noise standard deviation is \(\sigma C\); lowering ε increases \(\sigma\).
+
+2. **Larger clip radius C**  
+   - Sensitivity increases linearly with \(C\).
+   - Even if the noise multiplier is unchanged, the absolute noise scale grows as \(\sigma C\).
+
+In **Vanilla DP-SGD (user-level)**:
+
+- We saw in `debug_vanilla_dp.py` and the ablation runs:
+  - Median **user gradient norm after clipping**: on the order of a few hundred (e.g. \(\approx 432\)).
+  - **Noise ℓ₂ norm**: on the order of **tens of thousands** (e.g. \(\approx 27{,}000\)) for ε=4.0, C=2.0, 100 users.
+- That means the **signal-to-noise ratio** per DP step is extremely poor:
+  - Every update is dominated by isotropic noise.
+  - Starting from a strong public pretrain (≈79% accuracy), Vanilla DP-SGD rapidly “forgets” useful structure and collapses to ~10–30% accuracy.
+
+This is exactly what we see in the tables:
+
+- For stricter regimes (ε small, large C, many users, many DP parameters):
+  - **Vanilla DP-SGD** often falls to ~10–30% accuracy.
+  - **Fisher DP-SGD** stays in the 70–80% range.
+
+### Why Fisher DP-SGD Survives in the Same Regime
+
+Fisher DP-SGD **reweights directions** so that noise hurts much less where it matters:
+
+- Clipping is done in a **Mahalanobis norm** induced by the Fisher \(F\), not plain Euclidean norm.
+- Noise in the Fisher subspace is **negatively correlated with curvature**:
+  - Less noise in high-curvature directions (which strongly affect the loss).
+  - More noise in flatter directions (where the model is less sensitive).
+
+Consequences:
+
+1. **Effective sensitivity is smaller along important directions**  
+   - High-curvature eigendirections are tightly controlled by the Fisher norm.
+   - Gradients in those directions are clipped more consistently.
+
+2. **Noise is pushed into “less important” directions**  
+   - Anisotropic noise means we don’t waste budget on directions that the loss barely cares about.
+   - The useful part of the gradient (aligned with high-curvature directions) has much better SNR than in the isotropic case.
+
+3. **Same \((\epsilon,\delta)\), but much better geometry**  
+   - The RDP accountant sees the same sampling rate and training schedule, so the **total privacy budget is the same** as vanilla.
+   - Geometrically, however, Fisher’s clipping + noise shaping keeps the model near the good public-pretrained solution instead of wandering randomly.
+
+This explains the empirical pattern in all the tables above:
+
+- As **ε decreases** or **C increases** (or as we: increase \#users, increase Fisher rank k too much, or DP-train more parameters):
+  - **Vanilla DP-SGD** quickly collapses in accuracy.
+  - **Fisher DP-SGD (+ DP-SAT + IF-calibration)** remains **high and stable**, often 30–60 points above vanilla at the same \((\epsilon,\delta)\).
 
