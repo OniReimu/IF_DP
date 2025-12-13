@@ -29,6 +29,64 @@ uv run main.py --mps --compare-others --target-epsilon 10.0
 uv run ablation.py --mps --target-epsilon 10.0 --k 64 --run-mia
 ```
 
+## 🧱 Modular Architecture Overview
+
+To keep experiments decoupled and extensible, the refactor introduces first-class packages in the repo root:
+
+```
+models/               # Vision + language backbones implementing ModelBase
+data/                 # Dataset builders wrapping torchvision + HF datasets
+training/             # (future) composable pipelines
+core/registry.py      # Lightweight registries for models & datasets
+```
+
+- **ModelBase** (`models/base.py`) standardises the forward/loss interface and enables registry-based instantiation via `build_model`.
+- **DatasetBuilder** (`data/base.py`) encapsulates data loading, preprocessing, and split construction through a consistent `build()` API that returns `DatasetLoaders`.
+- Shared utilities (`data/common.py`) normalise batch structures (tensor tuples, Hugging Face dicts, user-level batches) so training, evaluation, and attacks can consume any modality transparently.
+
+Adding a new dataset or model now requires dropping a single module that registers itself through the registry decorators—no changes to the main training script.
+
+## ✅ Supported Models & Datasets
+
+| Modality | Models | Datasets |
+|----------|--------|----------|
+| Vision   | `cnn`, `resnet18`, `efficientnet_b0`, `vit_b16` | `cifar10`, `fashion_mnist`, `cifar100` |
+| Text / LLM | `bert`, `qwen`, `llama3.1-8b` | `ag_news`, `wildchat` |
+
+Use `--model <name>` and `--dataset <name>` when running `main.py`. The dataset builder exposes label mappings and feeds the requested number of labels into the model factory automatically.
+
+Example:
+
+```bash
+uv run main.py \
+  --dataset ag_news \
+  --model bert \
+  --tokenizer-name bert-base-uncased \
+  --batch-size 32 \
+  --target-epsilon 8.0 \
+  --compare-others
+```
+
+## 🛠 Singularity-First Execution
+
+All validation and testing are containerised. A typical LUMI command looks like:
+
+```bash
+singularity exec ${SIF} \
+  bash -lc "
+    source ${ENV} && \
+    python main.py \
+      --dataset cifar10 \
+      --model vit \
+      --batch-size 256 \
+      --target-epsilon 6.0 \
+      --compare-others \
+      --run-mia
+  "
+```
+
+The provided `run_on_lumi.sh` script shows a complete SLURM submission that uses the same pattern. Swap out the python entry point (e.g., `ablation.py`) or pass a config file as needed—no direct `python` invocation outside Singularity is required.
+
 ## 🎯 **Method Overview**
 
 ### Fisher DP-SGD: Curvature-Aware Noise

@@ -9,27 +9,37 @@
 #    * Fisher DP + DP-SAT + OPTIMIZED Calibration (Line Search + Multi-Step)
 # ================================================================
 
-import os, glob, argparse, copy, math
+import os, glob, argparse, copy, math, sys
+from collections import defaultdict
+from pathlib import Path
 import numpy as np
-import torch, torch.nn as nn
+import torch
 import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as T
-from torch.utils.data import DataLoader, Subset, Sampler
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from torch.autograd import grad  # Required for per-sample gradients
 
+# Ensure project root on sys.path for direct script execution
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 # Project-specific helpers
-from fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip
-from dp_sgd import train_with_vanilla_dp
-from dp_sat import train_with_dp_sat
-from privacy_accounting import (
+from core.fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip
+from core.dp_sgd import train_with_vanilla_dp
+from core.dp_sat import train_with_dp_sat
+from core.privacy_accounting import (
     get_privacy_params_for_target_epsilon, 
 )
-from model import CNN, create_model
-from mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
-from influence_function import calibrate_model_research_protocol, get_evaluation_slice
-from config import set_random_seeds, get_random_seed
+from models import available_models, create_model
+from data import DATASET_REGISTRY, DatasetConfig, build_dataset_builder
+from core.mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
+from core.influence_function import calibrate_model_research_protocol
+from core.config import set_random_seeds, get_random_seed, get_dataset_location
+from data.common import prepare_batch, SyntheticUserDataset, UserBatchSampler, move_to_device
+
+AVAILABLE_DATASETS = tuple(DATASET_REGISTRY.keys())
+AVAILABLE_MODELS = tuple(available_models())
 
 set_random_seeds()  # Set reproducible random seeds
 np.random.seed(get_random_seed())
@@ -44,20 +54,22 @@ def diagnose_calibration(model, critical_data, critical_targets, device):
     Simple diagnostic function to measure critical slice performance.
     Replacement for the removed function in influence_function.py.
     """
-    if len(critical_data) == 0:
+    if critical_targets is None or critical_targets.numel() == 0:
         return {'loss': float('inf'), 'accuracy': 0.0, 'num_samples': 0}
     
     model.eval()
     with torch.no_grad():
-        output = model(critical_data)
-        loss = F.cross_entropy(output, critical_targets)
+        features = move_to_device(critical_data, device)
+        targets = critical_targets.to(device)
+        output = model(features)
+        loss = F.cross_entropy(output, targets)
         predictions = output.argmax(dim=1)
-        accuracy = (predictions == critical_targets).float().mean()
+        accuracy = (predictions == targets).float().mean()
     
     return {
         'loss': loss.item(),
         'accuracy': accuracy.item() * 100,
-        'num_samples': len(critical_data)
+        'num_samples': targets.size(0)
     }
 
 def print_calibration_effect(before_stats, after_stats, target_class="all"):
@@ -88,6 +100,165 @@ def print_calibration_effect(before_stats, after_stats, target_class="all"):
     else:
         print(f"   ⚠️  WARNING: Calibration reduced evaluation slice accuracy")
 
+
+def count_samples(loader):
+    dataset = getattr(loader, "dataset", None)
+    if dataset is not None:
+        return len(dataset)
+    batch_size = getattr(loader, "batch_size", None)
+    if batch_size:
+        return len(loader) * batch_size
+    return len(loader)
+
+
+def ensure_model_dataset_compatibility(model, dataset_task_type, dataset_name, model_type):
+    """Ensure a model matches the modality expected by the dataset."""
+    if dataset_task_type is None:
+        return
+    model_task_type = getattr(model, "task_type", None)
+    if model_task_type is None:
+        return
+    if model_task_type != dataset_task_type:
+        raise ValueError(
+            f"Model '{model_type}' is a {model_task_type} architecture but dataset "
+            f"'{dataset_name}' expects task type '{dataset_task_type}'. "
+            f"Please pick a compatible model."
+        )
+
+
+def build_calibration_loader(public_loader, args):
+    dataset = getattr(public_loader, "dataset", None)
+    if dataset is None:
+        return public_loader
+    total = len(dataset)
+    take = min(args.calibration_subset, total)
+    if take <= 0 or take >= total:
+        return public_loader
+    indices = torch.randperm(total)[:take].tolist()
+    if isinstance(dataset, SyntheticUserDataset):
+        base_subset = Subset(dataset.base, indices)
+        synthetic = SyntheticUserDataset(base_subset, args.users)
+        sampler = UserBatchSampler(synthetic.uid)
+        return DataLoader(synthetic, batch_sampler=sampler)
+    subset = Subset(dataset, indices)
+    return DataLoader(subset, batch_size=args.batch_size, shuffle=True)
+
+# ════════════════════════════════════════════════════════════════
+# Critical slice helpers (support both vision and language inputs)
+# ════════════════════════════════════════════════════════════════
+
+def _index_select_features(features, indices):
+    if torch.is_tensor(features):
+        if features.dim() == 0:
+            expanded = features.unsqueeze(0)
+            return expanded.index_select(0, indices)
+        return features.index_select(0, indices)
+    if isinstance(features, dict):
+        return {k: _index_select_features(v, indices) for k, v in features.items()}
+    if isinstance(features, tuple):
+        return tuple(_index_select_features(v, indices) for v in features)
+    if isinstance(features, list):
+        as_list = indices.tolist()
+        return [features[i] for i in as_list]
+    raise TypeError(f"Unsupported feature type for slicing: {type(features)}")
+
+
+def _concat_feature_chunks(chunks):
+    if not chunks:
+        return None
+    first = chunks[0]
+    if torch.is_tensor(first):
+        return torch.cat(chunks, dim=0)
+    if isinstance(first, dict):
+        return {k: _concat_feature_chunks([chunk[k] for chunk in chunks]) for k in first}
+    if isinstance(first, tuple):
+        transposed = list(zip(*chunks))
+        return tuple(_concat_feature_chunks(list(items)) for items in transposed)
+    if isinstance(first, list):
+        transposed = list(zip(*chunks))
+        return [_concat_feature_chunks(list(items)) for items in transposed]
+    raise TypeError(f"Unsupported feature type for concatenation: {type(first)}")
+
+
+def build_critical_slice(eval_loader, target_class="all", label_mapping=None, max_samples_per_class=200):
+    """
+    Collect a balanced critical slice from the evaluation loader that works for
+    both tensor (vision) and dictionary (language) features.
+    """
+    cpu = torch.device("cpu")
+    use_all_classes = target_class == "all"
+    target_value = None if use_all_classes else int(target_class)
+    class_chunks = defaultdict(list)
+    label_chunks = defaultdict(list)
+    class_counts = defaultdict(int)
+
+    for batch_data in eval_loader:
+        features, labels, _ = prepare_batch(batch_data, cpu)
+        if labels.ndim == 0:
+            labels = labels.unsqueeze(0)
+
+        candidate_labels = torch.unique(labels).tolist() if use_all_classes else [target_value]
+        for cls in candidate_labels:
+            if cls is None:
+                continue
+            mask = (labels == cls)
+            if not mask.any():
+                continue
+
+            idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
+            if idx.numel() == 0:
+                continue
+            if use_all_classes:
+                remaining = max_samples_per_class - class_counts[cls]
+                if remaining <= 0:
+                    continue
+                if remaining < idx.numel():
+                    idx = idx[:remaining]
+
+            selected = _index_select_features(features, idx)
+            selected_labels = labels.index_select(0, idx)
+            class_chunks[cls].append(selected)
+            label_chunks[cls].append(selected_labels)
+            class_counts[cls] += idx.numel()
+
+
+    def _describe(cls, count):
+        if label_mapping and cls in label_mapping:
+            return f"Class {cls} ({label_mapping[cls]}): {count} samples"
+        return f"Class {cls}: {count} samples"
+
+    if use_all_classes:
+        if not class_counts:
+            print("⚠️  No samples found in evaluation data")
+            return None, torch.empty(0, dtype=torch.long)
+
+        ordered = sorted(class_counts.keys())
+        combined_features = []
+        combined_labels = []
+        total_samples = 0
+        print("🎯 Using ALL CLASSES for calibration (general utility improvement)")
+        for cls in ordered:
+            combined_features.append(_concat_feature_chunks(class_chunks[cls]))
+            combined_labels.append(torch.cat(label_chunks[cls], dim=0))
+            total_samples += class_counts[cls]
+            print(f"   • {_describe(cls, class_counts[cls])}")
+
+        crit_features = _concat_feature_chunks(combined_features)
+        crit_labels = torch.cat(combined_labels, dim=0)
+        print(f"✅ Evaluation slice: {total_samples} samples across {len(ordered)} classes")
+        return crit_features, crit_labels
+
+    collected = class_counts.get(target_value, 0)
+    if collected == 0:
+        print(f"⚠️  No samples of class {target_value}")
+        return None, torch.empty(0, dtype=torch.long)
+
+    print(f"🎯 Using SINGLE CLASS {target_value} for calibration (targeted improvement)")
+    print(f"   • {_describe(target_value, collected)}")
+    crit_features = _concat_feature_chunks(class_chunks[target_value])
+    crit_labels = torch.cat(label_chunks[target_value], dim=0)
+    return crit_features, crit_labels
+
 # ════════════════════════════════════════════════════════════════
 # Optimized Calibration Functions (Line Search + Multi-Step)
 # ════════════════════════════════════════════════════════════════
@@ -96,15 +267,15 @@ def _eval_slice_loss(model, critical_data, critical_targets, device):
     """Helper function to evaluate loss on critical slice.
     Paper mapping — used to compute L_crit(θ) for back-tracking line search (Step d(iii)).
     """
-    if len(critical_data) == 0:
+    if critical_targets is None or critical_targets.numel() == 0 or critical_data is None:
         return float('inf')
     
     model.eval()
     with torch.no_grad():
-        critical_data = critical_data.to(device)
-        critical_targets = critical_targets.to(device)
-        output = model(critical_data)
-        loss = F.cross_entropy(output, critical_targets)
+        features = move_to_device(critical_data, device)
+        targets = critical_targets.to(device)
+        output = model(features)
+        loss = F.cross_entropy(output, targets)
     return loss.item()
 
 def _add_delta(model, delta, scale=1.0):
@@ -252,33 +423,6 @@ def calibrate_with_combined_optimization(model, pub_loader, priv_loader, critica
 # ════════════════════════════════════════════════════════════════
 # Synthetic users + batch sampler (reused from main.py)
 # ════════════════════════════════════════════════════════════════
-class SyntheticUserDataset(torch.utils.data.Dataset):
-    """Assigns each sample a user_id ∈ {0,…,K-1} (round-robin)."""
-    def __init__(self, base_ds, num_users, perm=None):
-        self.base = base_ds
-        if perm is None: perm = np.arange(len(base_ds))
-        self.uid = torch.tensor(perm % num_users, dtype=torch.long)
-    def __len__(self): return len(self.base)
-    def __getitem__(self, idx):
-        x,y = self.base[idx]
-        return x, y, self.uid[idx].item()
-
-class UserBatchSampler(Sampler):
-    """Yield all indices of exactly ONE user per iteration."""
-    def __init__(self, user_ids, shuffle=True):
-        self.by_user = {}
-        for idx,u in enumerate(user_ids):
-            u_key = int(u)  # Convert to Python int to avoid numpy int64 issues
-            self.by_user.setdefault(u_key, []).append(idx)
-        self.uids = list(self.by_user.keys())
-        self.shuffle = shuffle
-    def __iter__(self):
-        order = np.random.permutation(self.uids) if self.shuffle else self.uids
-        for u in order: 
-            u_key = int(u)  # Convert to Python int
-            yield self.by_user[u_key]
-    def __len__(self): return len(self.uids)
-
 # ════════════════════════════════════════════════════════════════
 # Helper functions
 # ════════════════════════════════════════════════════════════════
@@ -291,21 +435,13 @@ def get_device(args):
         print(f'Using CUDA:{idx}'); return torch.device(f'cuda:{idx}')
     print('Using CPU'); return torch.device('cpu')
 
-def unpack_batch(batch_data):
-    """Helper function to handle both (x, y) and (x, y, user_id) formats"""
-    if len(batch_data) == 3:
-        return batch_data[0], batch_data[1], batch_data[2]  # x, y, user_id
-    else:
-        return batch_data[0], batch_data[1], None  # x, y, None
-
 def accuracy(model, loader, device):
     model.eval(); tot=correct=0
     with torch.no_grad():
         for batch_data in loader:
-            x, y, _ = unpack_batch(batch_data)
-            x,y = x.to(device), y.to(device)
-            correct += (model(x).argmax(1)==y).sum().item()
-            tot += y.size(0)
+            features, labels, _ = prepare_batch(batch_data, device)
+            correct += (model(features).argmax(1)==labels).sum().item()
+            tot += labels.size(0)
     return 100*correct/tot
 
 # ════════════════════════════════════════════════════════════════
@@ -512,13 +648,8 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     g_fisher_priv_prev = None
 
     for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP + {opt_type} ({mode_str})")):
-        # Accept (x,y) OR (x,y,uid)
-        if len(batch_data) == 3:
-            x, y, user_ids = batch_data
-        else:
-            x, y = batch_data
-            user_ids = None
-        x, y = x.to(device), y.to(device)
+        features, labels, user_ids = prepare_batch(batch_data, device)
+        batch_size = labels.size(0)
 
         # ============================================================
         # DP-SAT Exact Mode: Weight Perturbation (Start of Step)
@@ -544,12 +675,12 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                  current_idx += n
 
         model.zero_grad()
-        losses = F.cross_entropy(model(x), y, reduction="none")
+        losses = F.cross_entropy(model(features), labels, reduction="none")
 
         if sample_level:
             # SAMPLE-LEVEL DP: Compute per-sample gradients
             per_g = []
-            for i in range(x.size(0)):
+            for i in range(batch_size):
                 gi = grad(losses[i], params, retain_graph=True)
                 per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
             per_g = torch.stack(per_g)
@@ -749,7 +880,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
 # Ablation Study Main Function
 # ════════════════════════════════════════════════════════════════
 
-def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx, priv_ds, Fmat, pub_loader, pub_loader_calib):
+def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_idx, priv_ds, Fmat, pub_loader, pub_loader_calib, model_kwargs, dataset_task_type=None, label_mapping=None):
     """
     Run optimized ablation study on Fisher DP-SGD variants.
     
@@ -790,7 +921,8 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     print(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
     
     # Load baseline model for initialization
-    baseline = create_model(args.model_type).to(device)
+    baseline = create_model(args.model_type, **model_kwargs).to(device)
+    ensure_model_dataset_compatibility(baseline, dataset_task_type, args.dataset_name, args.model_type)
     
     # Check for pretrained baseline model (saved for efficiency)
     pretrain_path = os.path.join(models_dir, f'Pretrain_{args.model_type}_{args.epochs}_public.pth')
@@ -820,21 +952,16 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         for epoch in tqdm(range(args.epochs), desc="Public baseline training"):
             baseline.train()
             for batch_data in pub_loader:
-                if len(batch_data) == 3:
-                    x, y, _ = batch_data
-                else:
-                    x, y = batch_data
-                x, y = x.to(device), y.to(device)
+                features, labels, _ = prepare_batch(batch_data, device)
                 opt_b.zero_grad()
-                loss = F.cross_entropy(baseline(x), y)
+                loss = F.cross_entropy(baseline(features), labels)
                 loss.backward()
                 opt_b.step()
             scheduler.step()
         
         # Evaluate baseline accuracy on eval set
         baseline.eval()
-        eval_loader_baseline = DataLoader(eval_base, batch_size=128, shuffle=False)
-        baseline_acc = accuracy(baseline, eval_loader_baseline, device)
+        baseline_acc = accuracy(baseline, eval_loader, device)
         
         # Save pretrained baseline
         torch.save({
@@ -988,11 +1115,16 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         dp_param_count=args.dp_param_count
     )
     
-    # Create evaluation loader for critical slice extraction and final accuracy measurement
-    eval_loader = DataLoader(eval_base, batch_size=128, shuffle=False)
-    
     # Get critical slice using EVALUATION data (eval_loader) for the slice-gradient
-    critical_data, critical_targets = get_evaluation_slice(eval_loader, args.target_class, device=device)
+    critical_data, critical_targets = build_critical_slice(
+        eval_loader,
+        args.target_class,
+        label_mapping=label_mapping,
+    )
+    if critical_data is not None:
+        critical_data = move_to_device(critical_data, device)
+    if critical_targets is not None:
+        critical_targets = critical_targets.to(device)
     
     # ════════════════════════════════════════════════════════════════
     # Variant 5: Fisher DP + Normal + OPTIMIZED Calibration
@@ -1004,7 +1136,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     
     fisher_normal_calibrated = copy.deepcopy(fisher_normal_model)
     
-    if len(critical_data) > 0:
+    if critical_targets is not None and critical_targets.numel() > 0:
         before_stats = diagnose_calibration(fisher_normal_calibrated, critical_data, critical_targets, device)
         
         # Apply OPTIMIZED calibration (Line Search + Multi-Step)
@@ -1054,7 +1186,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
     fisher_dpsat_calibrated = copy.deepcopy(fisher_dpsat_model)
     
     # Diagnose before optimized calibration for DP-SAT variant (reuse critical slice from evaluation data)
-    if len(critical_data) > 0:
+    if critical_targets is not None and critical_targets.numel() > 0:
         before_stats_dpsat = diagnose_calibration(fisher_dpsat_calibrated, critical_data, critical_targets, device)
         
         # Apply OPTIMIZED calibration (Line Search + Multi-Step)
@@ -1303,7 +1435,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         non_dp_scope = "private"
         non_dp_tag = f"Pretrain_{args.model_type}_{args.epochs}_{non_dp_scope}.pth"
         non_dp_path = os.path.join(models_dir, non_dp_tag)
-        non_dp_private = create_model(args.model_type).to(device)
+        non_dp_private = create_model(args.model_type, **model_kwargs).to(device)
         if os.path.exists(non_dp_path):
             print(f"\n💾 Loading cached NON-DP private comparator: {non_dp_path}")
             non_dp_private.load_state_dict(torch.load(non_dp_path, map_location=device))
@@ -1313,13 +1445,9 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
             for epoch in tqdm(range(args.epochs), desc="Training NON-DP private comparator"):
                 non_dp_private.train()
                 for batch_data in priv_loader:
-                    if args.sample_level:
-                        x, y = batch_data
-                    else:
-                        x, y, _ = batch_data
-                    x, y = x.to(device), y.to(device)
+                    features, labels, _ = prepare_batch(batch_data, device)
                     opt_non_dp.zero_grad()
-                    F.cross_entropy(non_dp_private(x), y).backward()
+                    F.cross_entropy(non_dp_private(features), labels).backward()
                     opt_non_dp.step()
             torch.save(non_dp_private.state_dict(), non_dp_path)
             print(f"✅ Saved NON-DP private comparator to {non_dp_path}")
@@ -1335,13 +1463,16 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
             'Fisher DP + DP-SAT + Calib': calib_dpsat
         }
         
+        eval_source = eval_dataset
+        if eval_source is None:
+            raise RuntimeError("Evaluation dataset is required for MIA sampling. Ensure dataset builder provides it.")
         # Prepare member and non-member datasets
         if args.sample_level:
             print("📊 Sample-level MIA: Using actual private training samples as members")
-            member_set, non_member_set = prepare_mia_data_sample_level(priv_base, eval_base, priv_idx, args.mia_size)
+            member_set, non_member_set = prepare_mia_data_sample_level(priv_base, eval_source, priv_idx, args.mia_size)
         else:
             print("👥 User-level MIA: Using actual private users as members")
-            member_set, non_member_set = prepare_mia_data_user_level(priv_ds, eval_base, args.users, args.mia_size)
+            member_set, non_member_set = prepare_mia_data_user_level(priv_ds, eval_source, args.users, args.mia_size)
         
         member_loader = DataLoader(member_set, batch_size=64, shuffle=False)
         non_member_loader = DataLoader(non_member_set, batch_size=64, shuffle=False)
@@ -1357,7 +1488,7 @@ def run_ablation_study(args, device, priv_loader, eval_base, priv_base, priv_idx
         
         for model_name, model in models_to_evaluate.items():
             print(f"   Evaluating {model_name}...")
-            shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_base)
+            shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_source)
             mia_results[model_name] = {
                 'shadow_auc': shadow_result['auc'],
                 'shadow_acc': shadow_result['accuracy']
@@ -1464,15 +1595,29 @@ def main():
     parser.add_argument('--cpu', action='store_true')
     
     # Data arguments
+    parser.add_argument('--dataset', '--dataset-name', dest='dataset_name',
+                       choices=AVAILABLE_DATASETS, default='cifar10',
+                       help='Dataset identifier registered in the data package (vision or language)')
     parser.add_argument('--dataset-size', type=int, default=None,
-                       help='Size of private dataset (default: use all available samples from trainset)')
-    parser.add_argument('--private-ratio', type=float, default=0.8)
+                       help='Number of private samples to draw from the dataset (default: full training split)')
+    parser.add_argument('--public-ratio', type=float, default=0.5,
+                       help='Fraction of the remaining data reserved for the public split')
+    parser.add_argument('--batch-size', type=int, default=128,
+                       help='Mini-batch size for private/public loaders')
+    parser.add_argument('--eval-batch-size', type=int, default=256,
+                       help='Batch size for evaluation loaders')
+    parser.add_argument('--critical-label', type=int, default=None,
+                       help='Optional class index for targeted calibration slices')
+    parser.add_argument('--tokenizer-name', type=str, default='bert-base-uncased',
+                       help='Tokenizer checkpoint for language datasets')
+    parser.add_argument('--max-seq-length', type=int, default=512,
+                       help='Maximum sequence length for language datasets')
     parser.add_argument('--epochs', type=int, default=10)
     
     # Model arguments
     parser.add_argument('--model-type', type=str, default='cnn',
-                       choices=['cnn', 'resnet18', 'resnet', 'efficientnet_b0', 'efficientnet'],
-                       help='Model architecture: cnn (simple CNN), resnet18 (ResNet-18), or efficientnet_b0')
+                       choices=AVAILABLE_MODELS,
+                       help='Model architecture registered in the models package')
     
     # DP layer/parameter selection (mutually exclusive)
     dp_selection = parser.add_mutually_exclusive_group()
@@ -1528,6 +1673,8 @@ def main():
     parser.add_argument('--method', type=str, default='linear',
                        choices=['linear', 'public-fisher'],
                        help='Calibration method: linear (fast regularization) or public-fisher (uses public data Fisher matrix)')
+    parser.add_argument('--calibration-subset', type=int, default=5000,
+                       help='Number of public samples used to build the calibration loader')
     parser.add_argument('--calibration-k', type=int, default=100,
                        help='Number of top-k samples to use for calibration')
     parser.add_argument('--trust-tau', type=float, default=0.005,
@@ -1592,82 +1739,55 @@ def main():
             os.remove(f); print('  removed',f)
     
     # ════════════════════════════════════════════════════════════════
-    # Data preparation - FIXED: Match main.py's proper 3-way split
+    # Data preparation (vision + language)
     # ════════════════════════════════════════════════════════════════
     
-    trans = T.Compose([T.ToTensor(), T.Normalize((.5,.5,.5),(.5,.5,.5))])
-    trainset = torchvision.datasets.CIFAR10('./data', train=True, download=True, transform=trans)
-    testset = torchvision.datasets.CIFAR10('./data', train=False, download=True, transform=trans)
+    dataset_root, allow_download = get_dataset_location(dataset_key=args.dataset_name)
+    dataset_builder = build_dataset_builder(args.dataset_name)
+    dataset_task_type = getattr(dataset_builder, "task_type", None)
+    dataset_num_labels = getattr(dataset_builder, "num_labels", None)
+    if not dataset_num_labels:
+        raise ValueError(f"Dataset '{args.dataset_name}' did not specify num_labels; cannot build model.")
+    model_kwargs = {'num_labels': dataset_num_labels}
+    label_mapping = dataset_builder.get_label_mapping()
+    dataset_config = DatasetConfig(
+        dataset_root=dataset_root,
+        allow_download=allow_download,
+        dataset_size=args.dataset_size,
+        public_ratio=args.public_ratio,
+        batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
+        sample_level=args.sample_level,
+        num_users=args.users,
+        critical_label=args.critical_label,
+        tokenizer_name=args.tokenizer_name,
+        max_seq_length=args.max_seq_length,
+        seed=get_random_seed(),
+    )
+    loaders = dataset_builder.build(dataset_config)
+    priv_loader = loaders.private
+    pub_loader = loaders.public
+    eval_loader = loaders.evaluation
+    crit_loader = loaders.critical_eval
+    priv_base = loaders.private_base
+    priv_idx = loaders.private_indices
+    priv_ds = None if args.sample_level else getattr(priv_loader, "dataset", None)
+    eval_dataset = getattr(eval_loader, "dataset", None)
     
-    # ════════════════════════════════════════════════════════════════
-    # Data partitioning - SIMULATION SETUP (Option B)
-    # ════════════════════════════════════════════════════════════════
-    # Simulates: Large public corpus + small private dataset scenario
-    # 
-    # - pub_base_pretrain: Large subset of trainset (40k) - for public baseline training
-    # - pub_base_calib: Small subset of trainset (5k) - for influence function calibration
-    # - priv_base: Small subset of trainset (5k) - for DP finetuning (PRIVATE)
-    # - eval_base: Full testset (10k) - for final evaluation
-    # 
-    # NOTE: This treats most of CIFAR-10 train as "public" for simulation purposes.
-    #       In real applications, public data would come from a different source.
-    # ════════════════════════════════════════════════════════════════
+    pub_loader_calib = build_calibration_loader(pub_loader, args)
     
-    # Default split: 40k pretrain, 5k calibration, 5k private (from 50k trainset)
-    default_private_size = 5000
-    default_calib_size = 5000
-    default_pretrain_size = 40000
+    public_samples = count_samples(pub_loader)
+    eval_samples = count_samples(eval_loader)
+    print(f'📊 Ablation data overview for {args.dataset_name}:')
+    print(f'   • Private samples : {len(priv_base)}')
+    print(f'   • Public samples  : {public_samples}')
+    print(f'   • Eval samples    : {eval_samples}')
+    print(f'   • Calibration subset: {min(args.calibration_subset, public_samples)} samples')
     
-    # Allow override via --dataset-size (controls private set size)
-    private_size = args.dataset_size if args.dataset_size is not None else default_private_size
-    calib_size = default_calib_size
-    pretrain_size = len(trainset) - private_size - calib_size
-    
-    if pretrain_size < 0:
-        print(f"❌ Error: --dataset-size {private_size} + calibration {calib_size} exceeds trainset size {len(trainset)}")
-        exit(1)
-    
-    # Randomly split trainset into pretrain, calibration, and private
-    perm_train = np.random.permutation(len(trainset))
-    pretrain_idx = perm_train[:pretrain_size]                           # Large pretraining subset (40k)
-    calib_idx = perm_train[pretrain_size:pretrain_size + calib_size]   # Calibration subset (5k)
-    priv_idx = perm_train[pretrain_size + calib_size:]                 # Small private subset (5k)
-    
-    pub_base_pretrain = Subset(trainset, pretrain_idx)  # Public baseline pretraining (40k)
-    pub_base_calib = Subset(trainset, calib_idx)        # Public calibration (5k)
-    priv_base = Subset(trainset, priv_idx)              # Private DP training (5k)
-    
-    # For backward compatibility: combine pretrain + calib for baseline training
-    pub_base = Subset(trainset, np.concatenate([pretrain_idx, calib_idx]))  # Combined public (45k)
-    
-    # Evaluation: use full testset (no split needed now)
-    eval_base = testset  # Full testset for evaluation (10k)
-    
-    print(f'📊 Ablation Study Data (SIMULATION SETUP - Option B):')
-    print(f'   • Public pretrain:  {len(pub_base_pretrain):5d} samples from CIFAR-10 trainset (for baseline pretraining)')
-    print(f'   • Public calib:     {len(pub_base_calib):5d} samples from CIFAR-10 trainset (for influence calibration)')
-    print(f'   • Private data:     {len(priv_base):5d} samples from CIFAR-10 trainset (for DP finetuning)')
-    print(f'   • Eval data:        {len(eval_base):5d} samples from CIFAR-10 testset (for final evaluation)')
-    print(f'   🔬 SIMULATION: Treats trainset as "large public + small private" for ablation study')
-    print(f'   ⚡ OPTIMIZATION: Small calibration set ({len(pub_base_calib)}) speeds up influence computation')
-    
-    # Setup data loaders based on DP mode
     if args.sample_level:
         print('📊 Using SAMPLE-level DP')
-        priv_loader = DataLoader(priv_base, batch_size=128, shuffle=True)
-        priv_ds = None
-        # Public loaders (sample-level)
-        pub_loader = DataLoader(pub_base, batch_size=128, shuffle=False)  # Combined for baseline training
-        pub_loader_calib = DataLoader(pub_base_calib, batch_size=128, shuffle=False)  # Small set for calibration
     else:
         print(f'👥 Using USER-level DP ({args.users} synthetic users)')
-        priv_ds = SyntheticUserDataset(priv_base, args.users)
-        priv_loader = DataLoader(priv_ds, batch_sampler=UserBatchSampler(priv_ds.uid))
-        # Public loaders (user-level) - use same synthetic user structure
-        pub_ds = SyntheticUserDataset(pub_base, args.users)
-        pub_loader = DataLoader(pub_ds, batch_size=128, shuffle=False)  # Combined for baseline training
-        pub_ds_calib = SyntheticUserDataset(pub_base_calib, args.users)
-        pub_loader_calib = DataLoader(pub_ds_calib, batch_size=128, shuffle=False)  # Small set for calibration
     
     # ════════════════════════════════════════════════════════════════
     # Fisher matrix computation
@@ -1676,19 +1796,16 @@ def main():
     print('\n🔍 Computing Fisher matrix for ablation study…')
     
     # Train a baseline model for Fisher computation
-    fisher_baseline = create_model(args.model_type).to(device)
+    fisher_baseline = create_model(args.model_type, **model_kwargs).to(device)
+    ensure_model_dataset_compatibility(fisher_baseline, dataset_task_type, args.dataset_name, args.model_type)
     fisher_opt = torch.optim.SGD(fisher_baseline.parameters(), lr=1e-3, momentum=.9)
     
     for epoch in tqdm(range(5), desc="Training Fisher baseline"):  # Fewer epochs for Fisher
         fisher_baseline.train()
         for batch_data in priv_loader:
-            if args.sample_level:
-                x, y = batch_data
-            else:
-                x, y, _ = batch_data
-            x, y = x.to(device), y.to(device)
+            features, labels, _ = prepare_batch(batch_data, device)
             fisher_opt.zero_grad()
-            F.cross_entropy(fisher_baseline(x),y).backward()
+            F.cross_entropy(fisher_baseline(features), labels).backward()
             fisher_opt.step()
     
     Fmat, _ = compute_fisher(fisher_baseline, priv_loader, device,
@@ -1699,8 +1816,21 @@ def main():
     # Run ablation study
     # ════════════════════════════════════════════════════════════════
     
-    results = run_ablation_study(args, device, priv_loader, eval_base, priv_base, 
-                                priv_idx, priv_ds, Fmat, pub_loader, pub_loader_calib)
+    results = run_ablation_study(
+        args,
+        device,
+        priv_loader,
+        eval_loader,
+        priv_base,
+        priv_idx,
+        priv_ds,
+        Fmat,
+        pub_loader,
+        pub_loader_calib,
+        model_kwargs,
+        dataset_task_type=dataset_task_type,
+        label_mapping=label_mapping,
+    )
     
     # ════════════════════════════════════════════════════════════════
     # Final summary

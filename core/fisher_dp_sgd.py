@@ -10,6 +10,9 @@ from torch.autograd import grad
 from scipy.linalg import eigh
 from tqdm import tqdm
 
+from data.common import prepare_batch
+from models.utils import compute_loss
+
 # ============================================================
 # 1.  Fisher estimation (damped) on chosen layer set
 # ============================================================
@@ -94,15 +97,11 @@ def compute_fisher(model, dataloader, device,
     # ------------ accumulate per-sample grads ------------
     grads = []
     for batch_data in tqdm(dataloader, desc=f"Fisher pass ({target_layer})"):
-        # support (x,y) OR (x,y,user_id)
-        if len(batch_data) == 3:
-            x, y, _ = batch_data
-        else:
-            x, y    = batch_data
-        x, y = x.to(device), y.to(device)
+        features, labels, _ = prepare_batch(batch_data, device)
 
         model.zero_grad()
-        loss = F.cross_entropy(model(x), y)
+        logits = model(features)
+        loss = compute_loss(model, logits, labels)
         g = grad(loss,
                  [dict(model.named_parameters())[n] for n in tgt_names],
                  retain_graph=False, create_graph=False)
@@ -249,15 +248,13 @@ def train_with_dp(model, train_loader, fisher,
 
     # Auto-detect DP mode if not specified
     if sample_level is None:
-        # Check first batch to determine mode
         first_batch = next(iter(train_loader))
-        if len(first_batch) == 3:
-            # Has user_id, check if all samples in batch have same user_id
-            _, _, user_ids = first_batch
-            unique_users = torch.unique(user_ids)
-            sample_level = len(unique_users) > 1  # Multiple users = sample-level
+        _, _, first_user_ids = prepare_batch(first_batch, device)
+        if first_user_ids is None:
+            sample_level = True
         else:
-            sample_level = True  # No user_id = sample-level
+            unique_users = torch.unique(first_user_ids)
+            sample_level = unique_users.numel() > 1
     
     mode_str = "Sample-level" if sample_level else "User-level"
     print(f"\n🎯 Fisher DP-SGD config: {mode_str} DP  layers={target_layer}  ε={epsilon}")
@@ -295,13 +292,8 @@ def train_with_dp(model, train_loader, fisher,
     g_prev_priv = None
 
     for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP-SGD ({mode_str})")):
-        # accept (x,y) OR (x,y,uid)
-        if len(batch_data) == 3:
-            x, y, user_ids = batch_data
-        else:
-            x, y = batch_data
-            user_ids = None
-        x, y = x.to(device), y.to(device)
+        features, labels, user_ids = prepare_batch(batch_data, device)
+        batch_size = labels.size(0)
 
         # ============================================================
         # DP-SAT Exact Mode: Weight Perturbation (Start of Step)
@@ -331,12 +323,13 @@ def train_with_dp(model, train_loader, fisher,
                      current_idx += n
 
         model.zero_grad()
-        losses = F.cross_entropy(model(x), y, reduction="none")
+        logits = model(features)
+        losses = F.cross_entropy(logits, labels, reduction="none")
 
         if sample_level:
             # SAMPLE-LEVEL DP: Compute per-sample gradients
             per_g = []
-            for i in range(x.size(0)):
+            for i in range(batch_size):
                 gi = grad(losses[i], params, retain_graph=True)
                 per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
             per_g = torch.stack(per_g)

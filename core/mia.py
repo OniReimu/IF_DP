@@ -16,23 +16,21 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_recall_curve
 
-from model import CNN
+from data.common import prepare_batch
+from models.model import CNN
 
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # Set reproducible random seeds for consistent MIA evaluation
-from config import set_random_seeds
+from .config import set_random_seeds, get_dataset_location
 set_random_seeds()
+dataset_root, allow_download = get_dataset_location(
+    dataset_key='cifar10',
+    required_subdir='cifar-10-batches-py'
+)
 
 NUM_RUNS = 5 
-
-def unpack_batch(batch_data):
-    """Helper function to handle both (x, y) and (x, y, user_id) formats"""
-    if len(batch_data) == 3:
-        return batch_data[0], batch_data[1], batch_data[2]  # x, y, user_id
-    else:
-        return batch_data[0], batch_data[1], None  # x, y, None
 
 # ════════════════════════════════════════════════════════════════
 # MIA Data Preparation Functions
@@ -72,7 +70,17 @@ def prepare_mia_data_user_level(priv_ds, eval_data, num_users, mia_size):
     # Collect samples per user
     user_samples = {}
     for idx in range(len(priv_ds)):
-        x, y, uid = priv_ds[idx]
+        sample = priv_ds[idx]
+        if isinstance(sample, dict):
+            uid_value = sample.get("user_ids", sample.get("user_id"))
+            if isinstance(uid_value, torch.Tensor):
+                uid = int(uid_value.item())
+            else:
+                uid = int(uid_value)
+        elif isinstance(sample, (list, tuple)) and len(sample) >= 3:
+            uid = int(sample[2])
+        else:
+            uid = 0
         user_samples.setdefault(uid, []).append(idx)
     
     # Select member users (from training) and randomly sample from them
@@ -118,14 +126,12 @@ def confidence_attack(model, member_loader, non_member_loader, device):
     # Collect confidences for member samples
     with torch.no_grad():
         for batch_data in tqdm(member_loader, desc="Processing members", leave=False):
-            x, y, _ = unpack_batch(batch_data)
-            x, y = x.to(device), y.to(device)
-            
-            output = model(x)
+            features, labels, _ = prepare_batch(batch_data, device)
+            output = model(features)
             probs = F.softmax(output, dim=1)
             
             # Use probability of the correct class (more standard for MIA)
-            correct_class_probs = probs.gather(1, y.unsqueeze(1)).squeeze(1)
+            correct_class_probs = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
             member_confidences.extend(correct_class_probs.cpu().numpy())
             
             # Also track max probabilities for comparison
@@ -135,14 +141,12 @@ def confidence_attack(model, member_loader, non_member_loader, device):
     # Collect confidences for non-member samples
     with torch.no_grad():
         for batch_data in tqdm(non_member_loader, desc="Processing non-members", leave=False):
-            x, y, _ = unpack_batch(batch_data)
-            x, y = x.to(device), y.to(device)
-            
-            output = model(x)
+            features, labels, _ = prepare_batch(batch_data, device)
+            output = model(features)
             probs = F.softmax(output, dim=1)
             
             # Use probability of the correct class
-            correct_class_probs = probs.gather(1, y.unsqueeze(1)).squeeze(1)
+            correct_class_probs = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
             non_member_confidences.extend(correct_class_probs.cpu().numpy())
             
             # Also track max probabilities for comparison
@@ -195,12 +199,10 @@ def train_shadow_models(shadow_trainset, num_shadows=3, epochs=5, device='cpu'):
         shadow_model.train()
         for epoch in range(epochs):
             for batch_data in shadow_loader:
-                x, y, _ = unpack_batch(batch_data)
-                x, y = x.to(device), y.to(device)
-                
+                features, labels, _ = prepare_batch(batch_data, device)
                 optimizer.zero_grad()
-                output = shadow_model(x)
-                loss = F.cross_entropy(output, y)
+                output = shadow_model(features)
+                loss = F.cross_entropy(output, labels)
                 loss.backward()
                 optimizer.step()
         
@@ -215,10 +217,8 @@ def extract_attack_features(model, data_loader, device):
     
     with torch.no_grad():
         for batch_data in data_loader:
-            x, y, _ = unpack_batch(batch_data)
-            x, y = x.to(device), y.to(device)
-            
-            output = model(x)
+            features, _, _ = prepare_batch(batch_data, device)
+            output = model(features)
             probs = F.softmax(output, dim=1)
             
             # Clip probabilities to avoid numerical issues
@@ -754,8 +754,8 @@ def main():
     
     # Load data
     trans = T.Compose([T.ToTensor(), T.Normalize((.5,.5,.5),(.5,.5,.5))])
-    trainset = torchvision.datasets.CIFAR10('./data', train=True, download=True, transform=trans)
-    testset = torchvision.datasets.CIFAR10('./data', train=False, download=True, transform=trans)
+    trainset = torchvision.datasets.CIFAR10(dataset_root, train=True, download=allow_download, transform=trans)
+    testset = torchvision.datasets.CIFAR10(dataset_root, train=False, download=allow_download, transform=trans)
     
     # Load trained models (you need to train them first using main.py)
     models_dir = './saved_models'
