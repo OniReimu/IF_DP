@@ -19,7 +19,7 @@ ENV=${RESOURCE_DIR}/ifdp-venv/bin/activate
 singularity exec "${SIF}" \
     bash -lc  "\$WITH_CONDA  &&\
         source ${ENV} &&\
-             python ablation.py --dataset cifar100 --model-type resnet \
-            --k 512 --epochs 200 --target-epsilon 8.0 --delta 1e-5 \
-            --dp-param-count 20000 --clip-radius 2.0 \
+             python ablation.py --dataset dbpedia --model-type qwen \
+            --k 2048 --epochs 100 --target-epsilon 4.0 --delta 1e-5 \
+            --dp-param-count 40000 --clip-radius 2.0 \
             --run-mia --users 60 --calibration-k 200 --dp-sat-mode fisher"
