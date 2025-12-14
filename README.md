@@ -142,7 +142,7 @@ we achieve **strict DP** while maintaining computational feasibility and strong 
 ### Implementation Details
 
 - **Baseline**: Trained on `pub_loader` (45k public samples) in `ablation.py`.
-  - **Caching**: Pretrained baselines are automatically saved as `Pretrain_{model}_{epochs}_public.pth`
+  - **Caching**: Pretrained baselines are automatically saved as `Pretrain_{dataset}_{model}_{epochs}_public.pth`
   - Current recipe: strong-from-scratch SGD (lr=0.1, momentum=0.9, weight_decay=5e-4, cosine schedule)
   - On subsequent runs with same model/epochs, the cached baseline is loaded (massive speedup!)
   - Use `--clean` flag to force retraining from scratch
@@ -162,7 +162,7 @@ uv run ablation.py --clean --dp-layer "conv1,conv2" --target-epsilon 2.0
 
 # Cached baseline: Second run is much faster (skips 300 epochs of pretraining!)
 uv run ablation.py --model-type resnet18 --epochs 300 --dp-layer "resnet.layer4" --target-epsilon 2.0
-# → Creates: Pretrain_resnet18_300_public.pth
+# → Creates: Pretrain_cifar10_resnet18_300_public.pth
 # Next run with same model+epochs will load this cached baseline
 ```
 

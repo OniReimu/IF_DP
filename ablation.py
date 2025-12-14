@@ -46,6 +46,23 @@ np.random.seed(get_random_seed())
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════
+# Cache helpers
+# ════════════════════════════════════════════════════════════════
+
+def _sanitize_cache_key(value: str) -> str:
+    """Make a string safe for filenames (best-effort, stable)."""
+    return str(value).replace("/", "_").replace(" ", "_")
+
+
+def build_pretrain_cache_path(models_dir: str, dataset_name: str, model_type: str, epochs: int, scope: str) -> str:
+    """
+    Cache naming scheme (dataset-scoped to avoid accidental reuse across datasets):
+      Pretrain_{dataset}_{model}_{epochs}_{scope}.pth
+    """
+    ds = _sanitize_cache_key(dataset_name)
+    return os.path.join(models_dir, f"Pretrain_{ds}_{model_type}_{int(epochs)}_{scope}.pth")
+
+# ════════════════════════════════════════════════════════════════
 # Diagnostic functions (moved from influence_function.py)
 # ════════════════════════════════════════════════════════════════
 
@@ -962,16 +979,46 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     ensure_model_dataset_compatibility(baseline, dataset_task_type, args.dataset_name, args.model_type)
     
     # Check for pretrained baseline model (saved for efficiency)
-    pretrain_path = os.path.join(models_dir, f'Pretrain_{args.model_type}_{args.epochs}_public.pth')
-    
-    if os.path.exists(pretrain_path) and not args.clean:
+    # NOTE: Cache is dataset-scoped to avoid accidental reuse across datasets.
+    pretrain_path = build_pretrain_cache_path(
+        models_dir=models_dir,
+        dataset_name=args.dataset_name,
+        model_type=args.model_type,
+        epochs=args.epochs,
+        scope="public",
+    )
+    legacy_pretrain_path = os.path.join(models_dir, f"Pretrain_{args.model_type}_{args.epochs}_public.pth")
+
+    loaded_baseline = False
+    if not args.clean and os.path.exists(pretrain_path):
         print(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
         checkpoint = safe_torch_load(pretrain_path, map_location=device)
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline")
-        baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
-        print(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
-    else:
+        ck_dataset = checkpoint.get("dataset_name") if isinstance(checkpoint, dict) else None
+        if ck_dataset is not None and ck_dataset != args.dataset_name:
+            print(f"   ⚠️  Cache dataset mismatch: checkpoint={ck_dataset} vs requested={args.dataset_name}. Retraining baseline.")
+        else:
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline")
+            baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
+            print(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
+            loaded_baseline = True
+    elif not args.clean and os.path.exists(legacy_pretrain_path):
+        # Legacy cache naming (no dataset in filename). Load only if metadata matches.
+        print(f"\n📥 Found legacy pretrained baseline cache: {legacy_pretrain_path}")
+        legacy_ckpt = safe_torch_load(legacy_pretrain_path, map_location=device)
+        legacy_dataset = legacy_ckpt.get("dataset_name") if isinstance(legacy_ckpt, dict) else None
+        if legacy_dataset is None:
+            print("   ⚠️  Legacy cache has no dataset metadata; skipping to avoid cross-dataset reuse.")
+        elif legacy_dataset != args.dataset_name:
+            print(f"   ⚠️  Legacy cache dataset mismatch: checkpoint={legacy_dataset} vs requested={args.dataset_name}. Skipping.")
+        else:
+            state_dict = legacy_ckpt.get("model_state_dict", legacy_ckpt)
+            load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline (legacy cache)")
+            baseline_acc_cached = legacy_ckpt.get("accuracy", "N/A")
+            print(f"   ✅ Loaded baseline from legacy cache (eval accuracy: {baseline_acc_cached})")
+            loaded_baseline = True
+
+    if not loaded_baseline:
         print(f'\n⚙️  Training baseline on PUBLIC data (Strict DP Setup)...')
         print(f"   • Public data size: {len(pub_loader.dataset)} samples")
         print(f"   • Model: {args.model_type}")
@@ -1001,10 +1048,11 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         baseline.eval()
         baseline_acc = accuracy(baseline, eval_loader, device)
         
-        # Save pretrained baseline
+        # Save pretrained baseline (dataset-scoped cache filename)
         torch.save({
             'model_state_dict': baseline.state_dict(),
             'model_type': args.model_type,
+            'dataset_name': args.dataset_name,
             'epochs': args.epochs,
             'accuracy': baseline_acc,
             'public_data_size': len(pub_loader.dataset),
@@ -1363,12 +1411,14 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # ════════════════════════════════════════════════════════════════
     
     print(f"\n💾 Saving ablation study models...")
+    ds_tag = _sanitize_cache_key(args.dataset_name)
     
     # Save Vanilla DP-SGD
-    vanilla_dp_path = os.path.join(models_dir, 'Vanilla_DP_Ablation.pth')
+    vanilla_dp_path = os.path.join(models_dir, f'Vanilla_DP_{ds_tag}_Ablation.pth')
     torch.save({
         'model_state_dict': vanilla_dp_model.state_dict(),
         'model_type': 'vanilla_dp',
+        'dataset_name': args.dataset_name,
         'accuracy': vanilla_dp_acc,
         'epsilon': display_epsilon,
         'clip_radius': args.clip_radius,
@@ -1377,10 +1427,11 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     print(f"✅ Saved Vanilla DP-SGD to {vanilla_dp_path}")
     
     # Save Vanilla DP-SGD + DP-SAT
-    vanilla_dpsat_path = os.path.join(models_dir, 'Vanilla_DPSAT_Ablation.pth')
+    vanilla_dpsat_path = os.path.join(models_dir, f'Vanilla_DPSAT_{ds_tag}_Ablation.pth')
     torch.save({
         'model_state_dict': vanilla_dpsat_model.state_dict(),
         'model_type': 'vanilla_dp_dpsat',
+        'dataset_name': args.dataset_name,
         'accuracy': vanilla_dpsat_acc,
         'epsilon': display_epsilon,
         'clip_radius': args.clip_radius,
@@ -1391,10 +1442,11 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     print(f"✅ Saved Vanilla DP-SGD + DP-SAT to {vanilla_dpsat_path}")
     
     # Save Fisher DP + Normal
-    fisher_normal_path = os.path.join(models_dir, 'Fisher_Normal_Ablation.pth')
+    fisher_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Ablation.pth')
     torch.save({
         'model_state_dict': fisher_normal_model.state_dict(),
         'model_type': 'fisher_dp_normal',
+        'dataset_name': args.dataset_name,
         'accuracy': fisher_normal_acc,
         'epsilon': display_epsilon,
         'clip_radius': args.clip_radius,
@@ -1405,10 +1457,11 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     print(f"✅ Saved Fisher DP + Normal to {fisher_normal_path}")
     
     # Save Fisher DP + DP-SAT
-    fisher_dpsat_path = os.path.join(models_dir, 'Fisher_DPSAT_Ablation.pth')
+    fisher_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Ablation.pth')
     torch.save({
         'model_state_dict': fisher_dpsat_model.state_dict(),
         'model_type': 'fisher_dp_dpsat',
+        'dataset_name': args.dataset_name,
         'accuracy': fisher_dpsat_acc,
         'epsilon': display_epsilon,
         'clip_radius': args.clip_radius,
@@ -1423,10 +1476,11 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     print(f"✅ Saved Fisher DP + DP-SAT ({effective_sat_mode}) to {fisher_dpsat_path}")
     
     # Save Fisher DP + Normal + Calibration
-    calib_normal_path = os.path.join(models_dir, 'Fisher_Normal_Calibrated_Ablation.pth')
+    calib_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Calibrated_Ablation.pth')
     torch.save({
         'model_state_dict': calib_normal.state_dict(),
         'model_type': 'fisher_dp_normal_calibrated',
+        'dataset_name': args.dataset_name,
         'accuracy': calib_normal_acc,
         'epsilon': display_epsilon,
         'clip_radius': args.clip_radius,
@@ -1440,10 +1494,11 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     print(f"✅ Saved Fisher DP + Normal + Calibration to {calib_normal_path}")
     
     # Save Fisher DP + DP-SAT + Calibration
-    calib_dpsat_path = os.path.join(models_dir, 'Fisher_DPSAT_Calibrated_Ablation.pth')
+    calib_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Calibrated_Ablation.pth')
     torch.save({
         'model_state_dict': calib_dpsat.state_dict(),
         'model_type': 'fisher_dp_dpsat_calibrated',
+        'dataset_name': args.dataset_name,
         'accuracy': calib_dpsat_acc,
         'epsilon': display_epsilon,
         'clip_radius': args.clip_radius,
@@ -1471,15 +1526,39 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         # Prepare all models for MIA evaluation
         # Optional non-DP comparator (trained on private data WITHOUT DP) for AUC reference
         non_dp_scope = "private"
-        non_dp_tag = f"Pretrain_{args.model_type}_{args.epochs}_{non_dp_scope}.pth"
-        non_dp_path = os.path.join(models_dir, non_dp_tag)
+        non_dp_path = build_pretrain_cache_path(
+            models_dir=models_dir,
+            dataset_name=args.dataset_name,
+            model_type=args.model_type,
+            epochs=args.epochs,
+            scope=non_dp_scope,
+        )
+        legacy_non_dp_path = os.path.join(models_dir, f"Pretrain_{args.model_type}_{args.epochs}_{non_dp_scope}.pth")
         non_dp_private = create_model(args.model_type, **model_kwargs).to(device)
         if os.path.exists(non_dp_path):
             print(f"\n💾 Loading cached NON-DP private comparator: {non_dp_path}")
             comparator_state = safe_torch_load(non_dp_path, map_location=device)
-            if isinstance(comparator_state, dict) and 'model_state_dict' in comparator_state:
-                comparator_state = comparator_state['model_state_dict']
-            load_state_dict_forgiving(non_dp_private, comparator_state, description="NON-DP comparator")
+            ck_dataset = comparator_state.get("dataset_name") if isinstance(comparator_state, dict) else None
+            if ck_dataset is not None and ck_dataset != args.dataset_name:
+                print(f"   ⚠️  Cache dataset mismatch: checkpoint={ck_dataset} vs requested={args.dataset_name}. Retraining comparator.")
+            else:
+                if isinstance(comparator_state, dict) and 'model_state_dict' in comparator_state:
+                    comparator_state = comparator_state['model_state_dict']
+                load_state_dict_forgiving(non_dp_private, comparator_state, description="NON-DP comparator")
+                comparator_state = None
+        elif os.path.exists(legacy_non_dp_path):
+            print(f"\n💾 Found legacy NON-DP private comparator cache: {legacy_non_dp_path}")
+            comparator_state = safe_torch_load(legacy_non_dp_path, map_location=device)
+            legacy_dataset = comparator_state.get("dataset_name") if isinstance(comparator_state, dict) else None
+            if legacy_dataset is None:
+                print("   ⚠️  Legacy comparator cache has no dataset metadata; skipping to avoid cross-dataset reuse.")
+            elif legacy_dataset != args.dataset_name:
+                print(f"   ⚠️  Legacy comparator cache dataset mismatch: checkpoint={legacy_dataset} vs requested={args.dataset_name}. Skipping.")
+            else:
+                if isinstance(comparator_state, dict) and 'model_state_dict' in comparator_state:
+                    comparator_state = comparator_state['model_state_dict']
+                load_state_dict_forgiving(non_dp_private, comparator_state, description="NON-DP comparator (legacy cache)")
+                comparator_state = None
         else:
             print("\n⚠️  Training NON-DP comparator on PRIVATE data for AUC reference (not DP-safe)...")
             opt_non_dp = torch.optim.SGD(non_dp_private.parameters(), lr=1e-3, momentum=.9)
@@ -1490,7 +1569,14 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
                     opt_non_dp.zero_grad()
                     F.cross_entropy(non_dp_private(features), labels).backward()
                     opt_non_dp.step()
-            torch.save(non_dp_private.state_dict(), non_dp_path)
+            torch.save({
+                "model_state_dict": non_dp_private.state_dict(),
+                "model_type": args.model_type,
+                "dataset_name": args.dataset_name,
+                "epochs": args.epochs,
+                "scope": non_dp_scope,
+                "timestamp": __import__("time").strftime("%Y%m%d_%H%M%S"),
+            }, non_dp_path)
             print(f"✅ Saved NON-DP private comparator to {non_dp_path}")
 
         models_to_evaluate = {
