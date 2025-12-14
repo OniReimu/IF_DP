@@ -6,13 +6,84 @@
 import torch, numpy as np, cvxpy as cp, copy
 import torch.nn.functional as F
 from tqdm import tqdm
+from data.common import move_to_device
 
 # --------------------------------------------------------------
 # 0.  Small helpers
 # --------------------------------------------------------------
 def unpack_batch(batch_data):
-    """Accept (x,y) or (x,y,user_id) batches and return x,y,(user_id|None)."""
-    return (batch_data + (None,))[:3]
+    """
+    Accept dict/tuple/list batches and return (x, y, user_id or None).
+    Mirrors data.common.unpack_batch so calibration works with text loaders.
+    """
+    if isinstance(batch_data, dict):
+        labels = batch_data.get("labels")
+        if labels is None and "label" in batch_data:
+            labels = batch_data["label"]
+        user_ids = batch_data.get("user_ids")
+        feature_keys = [k for k in batch_data.keys() if k not in {"labels", "label", "user_ids"}]
+        if not feature_keys:
+            raise ValueError("Dictionary batch must contain feature fields")
+        if len(feature_keys) == 1:
+            features = batch_data[feature_keys[0]]
+        else:
+            features = {k: batch_data[k] for k in feature_keys}
+        return features, labels, user_ids
+
+    if isinstance(batch_data, (tuple, list)):
+        if len(batch_data) < 2:
+            raise ValueError("Batch must contain at least (x, y)")
+        batch_tuple = tuple(batch_data) + (None,)
+        return batch_tuple[0], batch_tuple[1], batch_tuple[2]
+
+    raise ValueError(f"Unsupported batch type: {type(batch_data)}")
+
+
+def _infer_batch_size(features):
+    """Best-effort batch size detection for tensor/dict/list feature containers."""
+    if torch.is_tensor(features):
+        return features.size(0)
+    if isinstance(features, dict):
+        for value in features.values():
+            return _infer_batch_size(value)
+        raise ValueError("Dictionary batch must contain at least one feature tensor")
+    if isinstance(features, (list, tuple)):
+        if not features:
+            raise ValueError("Empty feature container")
+        first = features[0]
+        if torch.is_tensor(first) or isinstance(first, (dict, list, tuple)):
+            return _infer_batch_size(first)
+        return len(features)
+    raise ValueError(f"Cannot infer batch size from type {type(features)}")
+
+
+def _slice_feature(features, idx):
+    """Return idx-th sample from tensor/dict/list feature container."""
+    if torch.is_tensor(features):
+        return features[idx:idx+1]
+    if isinstance(features, dict):
+        return {k: _slice_feature(v, idx) for k, v in features.items()}
+    if isinstance(features, list):
+        if not features:
+            raise ValueError("Empty feature list")
+        first = features[0]
+        if torch.is_tensor(first) or isinstance(first, (dict, list, tuple)):
+            return [_slice_feature(v, idx) for v in features]
+        return features[idx]
+    if isinstance(features, tuple):
+        if not features:
+            raise ValueError("Empty feature tuple")
+        first = features[0]
+        if torch.is_tensor(first) or isinstance(first, (dict, list, tuple)):
+            return tuple(_slice_feature(v, idx) for v in features)
+        return features[idx]
+    raise ValueError(f"Unsupported feature type for slicing: {type(features)}")
+
+
+def _ensure_tensor(values):
+    if torch.is_tensor(values):
+        return values
+    return torch.as_tensor(values)
 
 # --------------------------------------------------------------
 # 1.  Critical slice extraction + gradients
@@ -37,11 +108,7 @@ def get_evaluation_slice(eval_loader, target_class="all", max_samples_per_class=
         class_samples = {}
         
         for batch_data in eval_loader:
-            # Handle both (x, y) and (x, y, user_id) formats
-            if len(batch_data) == 3:
-                x, y, _ = batch_data  # x, y, user_id
-            else:
-                x, y = batch_data     # x, y only
+            x, y, _ = unpack_batch(batch_data)
             
             for i in range(len(x)):
                 class_id = y[i].item()
@@ -81,11 +148,7 @@ def get_evaluation_slice(eval_loader, target_class="all", max_samples_per_class=
         
         eval_x, eval_y = [], []
         for batch_data in eval_loader:
-            # Handle both (x, y) and (x, y, user_id) formats
-            if len(batch_data) == 3:
-                x, y, _ = batch_data  # x, y, user_id
-            else:
-                x, y = batch_data     # x, y only
+            x, y, _ = unpack_batch(batch_data)
                 
             m = y == target_class
             if m.any():
@@ -149,15 +212,17 @@ def compute_influence_vectors(model, public_loader, train_loader,
     # flatten public data to list[(x,y)]
     public_samples = []
     for batch_data in public_loader:
-        # Handle both (x, y) and (x, y, user_id) formats
-        if len(batch_data) == 3:
-            x, y, _ = batch_data  # x, y, user_id
-        else:
-            x, y = batch_data     # x, y only
-            
-        for i in range(x.size(0)):
-            public_samples.append((x[i:i+1].to(device),
-                                   y[i:i+1].to(device)))
+        x, y, _ = unpack_batch(batch_data)
+        batch_size = _infer_batch_size(x)
+        labels = _ensure_tensor(y)
+
+        for i in range(batch_size):
+            sample_x = _slice_feature(x, i)
+            sample_y = labels[i:i+1]
+            public_samples.append((
+                move_to_device(sample_x, device),
+                move_to_device(sample_y, device),
+            ))
 
     infl_vecs = []
 

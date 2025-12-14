@@ -126,6 +126,43 @@ def ensure_model_dataset_compatibility(model, dataset_task_type, dataset_name, m
         )
 
 
+def safe_torch_load(path, map_location=None):
+    """
+    Load checkpoints with weights_only=True when available to avoid pickle warnings.
+    Falls back to legacy behavior on older PyTorch versions.
+    """
+    load_kwargs = {'map_location': map_location}
+    try:
+        return torch.load(path, weights_only=True, **load_kwargs)
+    except TypeError:
+        return torch.load(path, **load_kwargs)
+
+
+def load_state_dict_forgiving(model, state_dict, description="model"):
+    """
+    Load a checkpoint while skipping parameters whose shapes do not match.
+    Returns the list of skipped parameter keys.
+    """
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped = []
+    for key, value in state_dict.items():
+        target = model_state.get(key)
+        if target is None:
+            continue
+        if value.shape != target.shape:
+            skipped.append(key)
+            continue
+        compatible_state[key] = value
+    model.load_state_dict(compatible_state, strict=False)
+    if skipped:
+        print(f"   ⚠️  Skipped {len(skipped)} incompatible parameters when loading {description}:")
+        for name in skipped:
+            print(f"      • {name}")
+        print("      (This is expected when switching between datasets such as CIFAR-10 and CIFAR-100.)")
+    return skipped
+
+
 def build_calibration_loader(public_loader, args):
     dataset = getattr(public_loader, "dataset", None)
     if dataset is None:
@@ -880,7 +917,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
 # Ablation Study Main Function
 # ════════════════════════════════════════════════════════════════
 
-def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_idx, priv_ds, Fmat, pub_loader, pub_loader_calib, model_kwargs, dataset_task_type=None, label_mapping=None):
+def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_idx, priv_ds, Fmat, pub_loader, pub_loader_calib, model_kwargs, dataset_task_type=None, label_mapping=None, eval_dataset=None):
     """
     Run optimized ablation study on Fisher DP-SGD variants.
     
@@ -929,8 +966,9 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     
     if os.path.exists(pretrain_path) and not args.clean:
         print(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
-        checkpoint = torch.load(pretrain_path, map_location=device)
-        baseline.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = safe_torch_load(pretrain_path, map_location=device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline")
         baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
         print(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
     else:
@@ -1438,7 +1476,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         non_dp_private = create_model(args.model_type, **model_kwargs).to(device)
         if os.path.exists(non_dp_path):
             print(f"\n💾 Loading cached NON-DP private comparator: {non_dp_path}")
-            non_dp_private.load_state_dict(torch.load(non_dp_path, map_location=device))
+            comparator_state = safe_torch_load(non_dp_path, map_location=device)
+            if isinstance(comparator_state, dict) and 'model_state_dict' in comparator_state:
+                comparator_state = comparator_state['model_state_dict']
+            load_state_dict_forgiving(non_dp_private, comparator_state, description="NON-DP comparator")
         else:
             print("\n⚠️  Training NON-DP comparator on PRIVATE data for AUC reference (not DP-safe)...")
             opt_non_dp = torch.optim.SGD(non_dp_private.parameters(), lr=1e-3, momentum=.9)
@@ -1463,7 +1504,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             'Fisher DP + DP-SAT + Calib': calib_dpsat
         }
         
-        eval_source = eval_dataset
+        eval_source = eval_dataset if eval_dataset is not None else getattr(eval_loader, "dataset", None)
         if eval_source is None:
             raise RuntimeError("Evaluation dataset is required for MIA sampling. Ensure dataset builder provides it.")
         # Prepare member and non-member datasets
@@ -1598,10 +1639,10 @@ def main():
     parser.add_argument('--dataset', '--dataset-name', dest='dataset_name',
                        choices=AVAILABLE_DATASETS, default='cifar10',
                        help='Dataset identifier registered in the data package (vision or language)')
-    parser.add_argument('--dataset-size', type=int, default=None,
-                       help='Number of private samples to draw from the dataset (default: full training split)')
-    parser.add_argument('--public-ratio', type=float, default=0.5,
-                       help='Fraction of the remaining data reserved for the public split')
+    parser.add_argument('--dataset-size', type=int, default=5000,
+                       help='Number of private samples to draw from the dataset (default: 5k, matching legacy ablation)')
+    parser.add_argument('--public-ratio', type=float, default=1.0,
+                       help='Fraction of the remaining training data reserved for the public split (default: all remaining samples)')
     parser.add_argument('--batch-size', type=int, default=128,
                        help='Mini-batch size for private/public loaders')
     parser.add_argument('--eval-batch-size', type=int, default=256,
@@ -1830,6 +1871,7 @@ def main():
         model_kwargs,
         dataset_task_type=dataset_task_type,
         label_mapping=label_mapping,
+        eval_dataset=eval_dataset,
     )
     
     # ════════════════════════════════════════════════════════════════

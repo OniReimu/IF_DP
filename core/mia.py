@@ -183,13 +183,19 @@ def confidence_attack(model, member_loader, non_member_loader, device):
         'non_member_conf_mean': np.mean(non_member_confidences)
     }
 
-def train_shadow_models(shadow_trainset, num_shadows=3, epochs=5, device='cpu'):
-    """Train shadow models for Shokri attack"""
+def _reset_module_parameters(module):
+    reset_fn = getattr(module, "reset_parameters", None)
+    if callable(reset_fn):
+        reset_fn()
+
+
+def train_shadow_models(shadow_trainset, target_model, num_shadows=3, epochs=5, device='cpu'):
+    """Train shadow models for Shokri attack using the target model architecture"""
     shadow_models = []
     
     for i in tqdm(range(num_shadows), desc="Training shadow models"):
-        # Create shadow model with same architecture as target
-        shadow_model = CNN().to(device)
+        shadow_model = copy.deepcopy(target_model).to(device)
+        shadow_model.apply(_reset_module_parameters)
         optimizer = torch.optim.SGD(shadow_model.parameters(), lr=1e-3, momentum=0.9)
         
         # Create data loader for this shadow model
@@ -213,12 +219,12 @@ def train_shadow_models(shadow_trainset, num_shadows=3, epochs=5, device='cpu'):
 def extract_attack_features(model, data_loader, device):
     """Extract features for shadow model attack"""
     model.eval()
-    features = []
+    feature_rows = []
     
     with torch.no_grad():
         for batch_data in data_loader:
-            features, _, _ = prepare_batch(batch_data, device)
-            output = model(features)
+            batch_inputs, _, _ = prepare_batch(batch_data, device)
+            output = model(batch_inputs)
             probs = F.softmax(output, dim=1)
             
             # Clip probabilities to avoid numerical issues
@@ -250,9 +256,9 @@ def extract_attack_features(model, data_loader, device):
                 print("⚠️  Warning: NaN or inf values detected in features, skipping batch")
                 continue
                 
-            features.append(batch_features.cpu().numpy())
+            feature_rows.append(batch_features.cpu().numpy())
     
-    return np.vstack(features) if features else np.array([])
+    return np.vstack(feature_rows) if feature_rows else np.array([])
 
 def validate_and_clean_features(features, labels, name="features"):
     """Validate and clean feature arrays for numerical stability"""
@@ -309,7 +315,7 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
         print(f"⚠️  Shadow attack: Using train_data for non-members (may be inaccurate)")
     
     # Train shadow models
-    shadow_models = train_shadow_models(shadow_trainset, num_shadows=3, epochs=3, device=device)
+    shadow_models = train_shadow_models(shadow_trainset, target_model, num_shadows=3, epochs=3, device=device)
     
     # Generate attack training data using shadow models
     shadow_features = []
