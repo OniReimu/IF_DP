@@ -152,10 +152,10 @@ we achieve **strict DP** while maintaining computational feasibility and strong 
 **Example**:
 ```bash
 # Default: 40k pretrain + 5k calib public, 5k private (from 50k trainset)
-uv run ablation.py --dp-layer "conv1,conv2" --target-epsilon 2.0
+uv run ablation.py --dp-param-count 20000 --target-epsilon 2.0
 
 # Custom split: 35k pretrain + 5k calib, 10k private
-uv run ablation.py --dataset-size 10000 --dp-layer "conv1,conv2" --target-epsilon 2.0
+uv run ablation.py --dataset-size 10000 --dp-param-count 20000 --target-epsilon 2.0
 
 # Force retrain baseline (ignore cached pretrained model)
 uv run ablation.py --clean --dp-layer "conv1,conv2" --target-epsilon 2.0
