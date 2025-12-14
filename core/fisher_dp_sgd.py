@@ -85,12 +85,12 @@ def compute_fisher(model, dataloader, device,
         raise ValueError(f"No parameters match '{target_layer}'")
 
     P = sum(dict(model.named_parameters())[n].numel() for n in tgt_names)
-    print(f"目标参数: {tgt_names}")
-    print(f"参数总数: {P}")
-    print(f"阻尼系数 ρ = {rho}")
+    print(f"Target parameters: {tgt_names}")
+    print(f"Total parameters: {P}")
+    print(f"Damping coefficient ρ = {rho}")
 
     mem_gb = P**2 * 4 / 1e9
-    print(f"Fisher矩阵大小: {P}×{P} ≈ {mem_gb:.2f} GB")
+    print(f"Fisher matrix size: {P}×{P} ≈ {mem_gb:.2f} GB")
     if mem_gb > 2:
         print("⚠️  Fisher matrix is large; eigendecomp may be slow.")
 
@@ -108,19 +108,19 @@ def compute_fisher(model, dataloader, device,
         grads.append(torch.cat([v.flatten() for v in g]).detach())
 
     G = torch.vstack(grads)                     # [N_rows, P]
-    print(f"梯度矩阵形状: {G.shape}")
+    print(f"Gradient matrix shape: {G.shape}")
 
     fisher = (G.T @ G) / len(G) + rho * torch.eye(P, device=device)
-    print(f"Fisher矩阵形状: {fisher.shape}")
+    print(f"Fisher matrix shape: {fisher.shape}")
 
     # ------------ condition-number (CPU fallback on MPS) ------------
     try:
         eigvals = torch.linalg.eigvals(fisher.cpu() if fisher.device.type=="mps" else fisher).real
         cond    = (eigvals.max() / eigvals.min()).item()
         rank_est= (eigvals > eigvals.max()*1e-10).sum().item()
-        print(f"条件数≈ {cond:.2e}   估计rank {rank_est}/{P}")
+        print(f"Condition number ≈ {cond:.2e}   Estimated rank {rank_est}/{P}")
     except Exception as e:
-        print(f"⚠️  条件数计算失败 (ignored): {e}")
+        print(f"⚠️  Condition-number computation failed (ignored): {e}")
 
     return fisher, tgt_names
 
@@ -153,7 +153,7 @@ def topk_eigh_with_floor(mat: torch.Tensor,
     if actual_returned_k != actual_k:
         print(f"⚠️  Note: Returned {actual_returned_k} eigenpairs instead of requested {actual_k}")
     
-    print(f"特征值范围: [{lam[-1]:.3f}, {lam[0]:.3f}] (got {len(lam)} eigenpairs)")
+    print(f"Eigenvalue range: [{lam[-1]:.3f}, {lam[0]:.3f}] (got {len(lam)} eigenpairs)")
     return torch.from_numpy(lam).float(), torch.from_numpy(U).float()
 
 # ============================================================
