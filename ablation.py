@@ -979,7 +979,6 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     ensure_model_dataset_compatibility(baseline, dataset_task_type, args.dataset_name, args.model_type)
     
     # Check for pretrained baseline model (saved for efficiency)
-    # NOTE: Cache is dataset-scoped to avoid accidental reuse across datasets.
     pretrain_path = build_pretrain_cache_path(
         models_dir=models_dir,
         dataset_name=args.dataset_name,
@@ -990,7 +989,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     legacy_pretrain_path = os.path.join(models_dir, f"Pretrain_{args.model_type}_{args.epochs}_public.pth")
 
     loaded_baseline = False
-    if not args.clean and os.path.exists(pretrain_path):
+    if os.path.exists(pretrain_path) and not args.clean:
         print(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
         checkpoint = safe_torch_load(pretrain_path, map_location=device)
         ck_dataset = checkpoint.get("dataset_name") if isinstance(checkpoint, dict) else None
@@ -1002,19 +1001,18 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
             print(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
             loaded_baseline = True
-    elif not args.clean and os.path.exists(legacy_pretrain_path):
-        # Legacy cache naming (no dataset in filename). Load only if metadata matches.
+    elif os.path.exists(legacy_pretrain_path) and not args.clean:
         print(f"\n📥 Found legacy pretrained baseline cache: {legacy_pretrain_path}")
-        legacy_ckpt = safe_torch_load(legacy_pretrain_path, map_location=device)
-        legacy_dataset = legacy_ckpt.get("dataset_name") if isinstance(legacy_ckpt, dict) else None
+        checkpoint = safe_torch_load(legacy_pretrain_path, map_location=device)
+        legacy_dataset = checkpoint.get("dataset_name") if isinstance(checkpoint, dict) else None
         if legacy_dataset is None:
             print("   ⚠️  Legacy cache has no dataset metadata; skipping to avoid cross-dataset reuse.")
         elif legacy_dataset != args.dataset_name:
             print(f"   ⚠️  Legacy cache dataset mismatch: checkpoint={legacy_dataset} vs requested={args.dataset_name}. Skipping.")
         else:
-            state_dict = legacy_ckpt.get("model_state_dict", legacy_ckpt)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
             load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline (legacy cache)")
-            baseline_acc_cached = legacy_ckpt.get("accuracy", "N/A")
+            baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
             print(f"   ✅ Loaded baseline from legacy cache (eval accuracy: {baseline_acc_cached})")
             loaded_baseline = True
 
