@@ -1887,7 +1887,6 @@ def main():
         allow_download=allow_download,
         dataset_size=args.dataset_size,
         public_ratio=args.public_ratio,
-        calibration_size=args.calibration_subset,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         sample_level=args.sample_level,
@@ -1902,7 +1901,7 @@ def main():
     pub_loader = loaders.public
     eval_loader = loaders.evaluation
     crit_loader = loaders.critical_eval
-    calibration_loader = loaders.calibration
+    calibration_loader = getattr(loaders, "calibration", None)
     priv_base = loaders.private_base
     priv_idx = loaders.private_indices
     priv_ds = None if args.sample_level else getattr(priv_loader, "dataset", None)
