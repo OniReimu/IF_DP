@@ -35,7 +35,7 @@ DS_Store
 *.swo
 
 # Project specific
-data/
+
 *.pth
 *.pt
 *.ckpt

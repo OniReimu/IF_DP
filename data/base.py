@@ -1,0 +1,91 @@
+"""Dataset builder abstractions used by training scripts."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+import numpy as np
+
+from torch.utils.data import DataLoader, Dataset
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    dataset_root: str
+    allow_download: bool = True
+    dataset_size: int = 5000  # number of private samples (simulation setup)
+    public_ratio: float = 1.0  # fraction of remaining samples used as public
+    calibration_size: int = 5000  # number of public samples reserved for calibration
+    batch_size: int = 128
+    eval_batch_size: int = 256
+    sample_level: bool = True
+    num_users: int = 10
+    critical_label: Optional[int] = None
+    tokenizer_name: str = "bert-base-uncased"
+    max_seq_length: int = 512
+    seed: int = 0
+
+
+@dataclass
+class DatasetLoaders:
+    private: DataLoader
+    public: DataLoader
+    calibration: DataLoader
+    evaluation: DataLoader
+    critical_eval: DataLoader
+    private_base: Dataset
+    private_indices: Any
+
+
+class DatasetBuilder:
+    """Base class for datasets supporting a consistent split/build API."""
+
+    task_type: str = "vision"
+    num_labels: int = 0
+
+    def get_label_mapping(self) -> Optional[Dict[int, str]]:
+        return None
+
+    def build(self, config: DatasetConfig) -> DatasetLoaders:  # pragma: no cover
+        raise NotImplementedError
+
+
+def split_private_public_calibration_indices(
+    total_size: int,
+    private_size: int,
+    calibration_size: int,
+    public_ratio: float,
+    seed: int,
+):
+    """Split dataset indices into disjoint private/public/calibration subsets."""
+
+    private_size = int(private_size)
+    if private_size <= 0:
+        raise ValueError("--dataset-size must be > 0 (number of private samples)")
+    if private_size >= total_size:
+        raise ValueError(f"--dataset-size ({private_size}) must be < training set size ({total_size})")
+
+    calibration_size = int(calibration_size)
+    if calibration_size < 0:
+        raise ValueError("--calibration-size must be >= 0")
+    if private_size + calibration_size >= total_size:
+        raise ValueError(
+            f"private ({private_size}) + calibration ({calibration_size}) must be < training set size ({total_size})"
+        )
+
+    public_ratio = float(public_ratio)
+    if not (0.0 <= public_ratio <= 1.0):
+        raise ValueError("--public-ratio must be in [0, 1]")
+
+    rng = np.random.RandomState(int(seed))
+    perm = rng.permutation(total_size)
+    cursor = 0
+    priv_idx = perm[cursor : cursor + private_size]
+    cursor += private_size
+    calib_idx = perm[cursor : cursor + calibration_size]
+    cursor += calibration_size
+    remaining = perm[cursor:]
+    public_take = int(round(len(remaining) * public_ratio))
+    pub_idx = remaining[:public_take]
+    return priv_idx, pub_idx, calib_idx
