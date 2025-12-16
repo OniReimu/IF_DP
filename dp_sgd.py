@@ -47,8 +47,7 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
         # Legacy privacy accounting for multi-epoch training
         # Use simple composition bound: σ_total = σ_single / √T for T epochs
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
-        sigma = sigma_single_epoch / math.sqrt(epochs)  # Adjust for T epochs
-        print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+        # defer adjustment until dp_epochs is defined
 
     # gather parameter objects based on target_layer
     def _match(name: str, layer: str) -> bool:
@@ -149,14 +148,24 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
     adaptive_radius_computed = False
     actual_radius = clip_radius  # Start with provided radius
     
-    for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Vanilla DP-SGD ({mode_str})")):
-        # accept (x,y) OR (x,y,uid)
-        if len(batch_data) == 3:
-            x, y, user_ids = batch_data
-        else:
-            x, y = batch_data
-            user_ids = None
-        x, y = x.to(device), y.to(device)
+    # Use 1/10th of requested epochs for DP finetuning (at least 1)
+    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
+
+    # If using legacy sigma calculation, adjust now with actual dp_epochs
+    if sigma is None:
+        sigma = sigma_single_epoch / math.sqrt(dp_epochs)
+        print(f"   • Legacy accounting: T={dp_epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+
+    for epoch in range(dp_epochs):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Vanilla DP-SGD ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
+            # accept (x,y) OR (x,y,uid)
+            if len(batch_data) == 3:
+                x, y, user_ids = batch_data
+            else:
+                x, y = batch_data
+                user_ids = None
+            x, y = x.to(device), y.to(device)
         
         model.zero_grad()
         losses = F.cross_entropy(model(x), y, reduction="none")
