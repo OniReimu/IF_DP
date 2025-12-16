@@ -57,16 +57,16 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     
-    # Privacy accounting (same as vanilla DP-SGD)
+    # Privacy accounting (same as vanilla DP-SGD) — note dp_epochs below
     if sigma is not None:
         # Use provided sigma (proper privacy accounting)
         print(f"   • Using provided sigma: {sigma:.4f}")
     else:
         # Legacy privacy accounting for multi-epoch training
         # Use simple composition bound: σ_total = σ_single / √T for T epochs
+        # (We will set dp_epochs below to be a fraction of the requested epochs.)
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
-        sigma = sigma_single_epoch / math.sqrt(epochs)  # Adjust for T epochs
-        print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+        # defer sigma adjustment until dp_epochs is defined
 
     # gather parameter objects based on target_layer
     def _match(name: str, layer: str) -> bool:
@@ -168,10 +168,18 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     
     # Initialize previous step's noisy gradient for DP-SAT
     g_prev_priv = None
+
+    # Use 1/10th of requested epochs for DP finetuning (at least 1)
+    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    if sigma is None:
+        sigma = sigma_single_epoch / math.sqrt(dp_epochs)
+        print(f"   • Legacy accounting: T={dp_epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
     
-    for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"DP-SAT ({mode_str})")):
-        features, labels, user_ids = prepare_batch(batch_data, device)
-        batch_size = labels.size(0)
+    for epoch in range(dp_epochs):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"DP-SAT ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
+            features, labels, user_ids = prepare_batch(batch_data, device)
+            batch_size = labels.size(0)
         
         # ============================================================
         # DP-SAT EXACT: 1. Perturb weights

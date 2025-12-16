@@ -50,8 +50,7 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
         # Legacy privacy accounting for multi-epoch training
         # Use simple composition bound: σ_total = σ_single / √T for T epochs
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
-        sigma = sigma_single_epoch / math.sqrt(epochs)  # Adjust for T epochs
-        print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+        # defer adjustment until dp_epochs is defined
 
     # gather parameter objects based on target_layer
     def _match(name: str, layer: str) -> bool:
@@ -149,10 +148,18 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
     noise_l2, grad_norm = [], []
     adaptive_radius_computed = False
     actual_radius = clip_radius  # Start with provided radius
+
+    # Use 1/10th of requested epochs for DP finetuning (at least 1)
+    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    if sigma is None:
+        sigma = sigma_single_epoch / math.sqrt(dp_epochs)
+        print(f"   • Legacy accounting: T={dp_epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
     
-    for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Vanilla DP-SGD ({mode_str})")):
-        features, labels, user_ids = prepare_batch(batch_data, device)
-        batch_size = labels.size(0)
+    for epoch in range(dp_epochs):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Vanilla DP-SGD ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
+            features, labels, user_ids = prepare_batch(batch_data, device)
+            batch_size = labels.size(0)
         
         model.zero_grad()
         logits = model(features)

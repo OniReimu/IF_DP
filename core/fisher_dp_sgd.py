@@ -82,7 +82,7 @@ def compute_fisher(model, dataloader, device,
         print(f"🎯 computing Fisher for layer '{target_layer}'")
 
     if not tgt_names:
-        raise ValueError(f"No parameters match '{target_layer}'")
+        raise ValueError(f"No parameters match selection (layer='{target_layer}', dp_param_count={dp_param_count})")
 
     P = sum(dict(model.named_parameters())[n].numel() for n in tgt_names)
     print(f"Target parameters: {tgt_names}")
@@ -96,7 +96,8 @@ def compute_fisher(model, dataloader, device,
 
     # ------------ accumulate per-sample grads ------------
     grads = []
-    for batch_data in tqdm(dataloader, desc=f"Fisher pass ({target_layer})"):
+    desc_label = f"dp-param-count={dp_param_count}" if dp_param_count is not None else target_layer
+    for batch_data in tqdm(dataloader, desc=f"Fisher pass ({desc_label})"):
         features, labels, _ = prepare_batch(batch_data, device)
 
         model.zero_grad()
@@ -291,9 +292,14 @@ def train_with_dp(model, train_loader, fisher,
     # Initialize previous step's noisy gradient for DP-SAT
     g_prev_priv = None
 
-    for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP-SGD ({mode_str})")):
-        features, labels, user_ids = prepare_batch(batch_data, device)
-        batch_size = labels.size(0)
+    # Use 1/10th of requested epochs for DP finetuning (at least 1) to mirror dp_sat
+    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
+
+    for epoch in range(dp_epochs):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP-SGD ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
+            features, labels, user_ids = prepare_batch(batch_data, device)
+            batch_size = labels.size(0)
 
         # ============================================================
         # DP-SAT Exact Mode: Weight Perturbation (Start of Step)
