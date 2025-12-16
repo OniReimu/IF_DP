@@ -24,26 +24,26 @@ submit_job() {
     echo "${tag} -> ${job_output}"
 }
 
-EPSILONS=(1.0 2.0 4.0 8.0)
-USERS=(60 80 100)
-CLIP_RADII=(1.0 1.5 2.0)
+EPSILONS=(0.5 1.0 2.0 4.0)
+USERS=(80 100 120)
+CLIP_RADII=(1.0 2.0 3.0)
 DP_SAT_MODES=(fisher euclidean)
 
 
-for mode in "${DP_SAT_MODES[@]}"; do
-    submit_job 8.0 100 2.0 "${mode}" "epsilon_8.0-users_100-clip_2.0_mode-${mode}"
-    submit_job 4.0 60 2.0 "${mode}" "epsilon_4.0-users_60-clip_2.0_mode-${mode}"
-    submit_job 4.0 100 1.5 "${mode}" "epsilon_4.0-users_100-clip_1.5_mode-${mode}"
-done
+# for mode in "${DP_SAT_MODES[@]}"; do
+#     submit_job 8.0 100 2.0 "${mode}" "epsilon_8.0-users_100-clip_2.0_mode-${mode}"
+#     submit_job 4.0 60 2.0 "${mode}" "epsilon_4.0-users_60-clip_2.0_mode-${mode}"
+#     submit_job 4.0 100 1.5 "${mode}" "epsilon_4.0-users_100-clip_1.5_mode-${mode}"
+# done
 
 for eps in "${EPSILONS[@]}"; do
     submit_job "${eps}" 100 2.0 fisher "epsilon-${eps}_mode-fisher"
 done
 
 for user_count in "${USERS[@]}"; do
-    submit_job 4.0 "${user_count}" 2.0 fisher "users-${user_count}_mode-fisher"
+    submit_job 2.0 "${user_count}" 2.0 fisher "users-${user_count}_mode-fisher"
 done
 
 for clip in "${CLIP_RADII[@]}"; do
-    submit_job 4.0 100 "${clip}" fisher "clip-${clip}_mode-fisher"
+    submit_job 2.0 100 "${clip}" fisher "clip-${clip}_mode-fisher"
 done
