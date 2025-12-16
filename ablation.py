@@ -32,6 +32,7 @@ from core.privacy_accounting import (
     get_privacy_params_for_target_epsilon, 
 )
 from models import available_models, create_model
+from core.device_utils import resolve_device, maybe_wrap_model_for_multi_gpu
 from data import DATASET_REGISTRY, DatasetConfig, build_dataset_builder
 from core.mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
 from core.influence_function import calibrate_model_research_protocol
@@ -119,6 +120,8 @@ def print_calibration_effect(before_stats, after_stats, target_class="all"):
 
 
 def count_samples(loader):
+    if loader is None:
+        return 0
     dataset = getattr(loader, "dataset", None)
     if dataset is not None:
         return len(dataset)
@@ -481,13 +484,13 @@ def calibrate_with_combined_optimization(model, pub_loader, priv_loader, critica
 # Helper functions
 # ════════════════════════════════════════════════════════════════
 def get_device(args):
-    if args.cpu: return torch.device('cpu')
-    if args.mps and torch.backends.mps.is_available():
-        print('Using MPS'); return torch.device('mps')
-    if torch.cuda.is_available():
-        idx = 0 if args.cuda_id is None else args.cuda_id
-        print(f'Using CUDA:{idx}'); return torch.device(f'cuda:{idx}')
-    print('Using CPU'); return torch.device('cpu')
+    return resolve_device(args)
+
+
+def build_model_for_device(model_type, model_kwargs, args, device):
+    model = create_model(model_type, **model_kwargs)
+    model = maybe_wrap_model_for_multi_gpu(model, args)
+    return model.to(device)
 
 def accuracy(model, loader, device):
     model.eval(); tot=correct=0
@@ -975,7 +978,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     print(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
     
     # Load baseline model for initialization
-    baseline = create_model(args.model_type, **model_kwargs).to(device)
+    baseline = build_model_for_device(args.model_type, model_kwargs, args, device)
     ensure_model_dataset_compatibility(baseline, dataset_task_type, args.dataset_name, args.model_type)
     
     # Check for pretrained baseline model (saved for efficiency)
@@ -1532,7 +1535,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             scope=non_dp_scope,
         )
         legacy_non_dp_path = os.path.join(models_dir, f"Pretrain_{args.model_type}_{args.epochs}_{non_dp_scope}.pth")
-        non_dp_private = create_model(args.model_type, **model_kwargs).to(device)
+        non_dp_private = build_model_for_device(args.model_type, model_kwargs, args, device)
         if os.path.exists(non_dp_path):
             print(f"\n💾 Loading cached NON-DP private comparator: {non_dp_path}")
             comparator_state = safe_torch_load(non_dp_path, map_location=device)
@@ -1718,6 +1721,10 @@ def main():
     parser.add_argument('--mps', action='store_true')
     parser.add_argument('--cuda-id', type=int)
     parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--cuda-devices', type=str, default=None,
+                       help='Comma-separated CUDA device ids for multi-GPU execution (e.g., "0,1,2")')
+    parser.add_argument('--multi-gpu', action='store_true',
+                       help='Enable torch.nn.DataParallel across the requested CUDA devices')
     
     # Data arguments
     parser.add_argument('--dataset', '--dataset-name', dest='dataset_name',
@@ -1880,6 +1887,7 @@ def main():
         allow_download=allow_download,
         dataset_size=args.dataset_size,
         public_ratio=args.public_ratio,
+        calibration_size=args.calibration_subset,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         sample_level=args.sample_level,
@@ -1894,20 +1902,24 @@ def main():
     pub_loader = loaders.public
     eval_loader = loaders.evaluation
     crit_loader = loaders.critical_eval
+    calibration_loader = loaders.calibration
     priv_base = loaders.private_base
     priv_idx = loaders.private_indices
     priv_ds = None if args.sample_level else getattr(priv_loader, "dataset", None)
     eval_dataset = getattr(eval_loader, "dataset", None)
     
-    pub_loader_calib = build_calibration_loader(pub_loader, args)
+    if calibration_loader is None:
+        calibration_loader = build_calibration_loader(pub_loader, args)
+    pub_loader_calib = calibration_loader
     
     public_samples = count_samples(pub_loader)
     eval_samples = count_samples(eval_loader)
+    calibration_samples = count_samples(pub_loader_calib)
     print(f'📊 Ablation data overview for {args.dataset_name}:')
     print(f'   • Private samples : {len(priv_base)}')
     print(f'   • Public samples  : {public_samples}')
     print(f'   • Eval samples    : {eval_samples}')
-    print(f'   • Calibration subset: {min(args.calibration_subset, public_samples)} samples')
+    print(f'   • Calibration subset: {calibration_samples} samples')
     
     if args.sample_level:
         print('📊 Using SAMPLE-level DP')
@@ -1921,7 +1933,7 @@ def main():
     print('\n🔍 Computing Fisher matrix for ablation study…')
     
     # Train a baseline model for Fisher computation
-    fisher_baseline = create_model(args.model_type, **model_kwargs).to(device)
+    fisher_baseline = build_model_for_device(args.model_type, model_kwargs, args, device)
     ensure_model_dataset_compatibility(fisher_baseline, dataset_task_type, args.dataset_name, args.model_type)
     fisher_opt = torch.optim.SGD(fisher_baseline.parameters(), lr=1e-3, momentum=.9)
     

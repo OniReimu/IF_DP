@@ -27,6 +27,7 @@ from core.privacy_accounting import (
     validate_privacy_comparison,
 )
 from core.config import RANDOM_SEED, get_dataset_location, set_random_seeds
+from core.device_utils import resolve_device, maybe_wrap_model_for_multi_gpu
 
 
 AVAILABLE_DATASETS = tuple(DATASET_REGISTRY.keys())
@@ -36,17 +37,7 @@ HF_SEQUENCE_MODELS = {"bert", "qwen", "llama", "llama3.1-8b"}
 
 
 def get_device(args: argparse.Namespace) -> torch.device:
-    if args.cpu:
-        return torch.device("cpu")
-    if args.mps and torch.backends.mps.is_available():
-        print("Using MPS")
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        idx = 0 if args.cuda_id is None else args.cuda_id
-        print(f"Using CUDA:{idx}")
-        return torch.device(f"cuda:{idx}")
-    print("Using CPU")
-    return torch.device("cpu")
+    return resolve_device(args)
 
 
 def accuracy(model: torch.nn.Module, loader, device: torch.device) -> float:
@@ -70,7 +61,8 @@ def build_model_from_args(args: argparse.Namespace, num_labels: int) -> torch.nn
         kwargs["pretrained"] = True
     if args.model_checkpoint and model_name in HF_SEQUENCE_MODELS:
         kwargs["checkpoint"] = args.model_checkpoint
-    return build_model(model_name, **kwargs)
+    model = build_model(model_name, **kwargs)
+    return maybe_wrap_model_for_multi_gpu(model, args)
 
 
 def log_data_split(dataset_name: str, loaders) -> None:
@@ -88,6 +80,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mps", action="store_true")
     parser.add_argument("--cuda-id", type=int, default=None)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument(
+        "--cuda-devices",
+        type=str,
+        default=None,
+        help='Comma-separated CUDA device ids for multi-GPU execution (e.g., "0,1,2")',
+    )
+    parser.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        help="Enable torch.nn.DataParallel across the requested CUDA devices",
+    )
 
     parser.add_argument(
         "--dataset",

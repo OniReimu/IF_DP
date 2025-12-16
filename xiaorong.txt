@@ -1,0 +1,51 @@
+uv run ablation.py --mps --k 2048 --epochs 100 --target-epsilon 8.0 --delta 1e-5 \
+  --dp-param-count 20000 --model-type efficientnet --clip-radius 2.0 \
+  --run-mia --users 100 --calibration-k 200 --dp-sat-mode fisher
+
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  61.0%     0.497
+   Vanilla DP-SGD + DP-SAT         61.4%     0.485
+   Fisher DP + Normal              74.3%     0.505
+   Fisher DP + DP-SAT              75.7%     0.500
+   Fisher DP + Normal + Calib      75.5%     0.488
+   Fisher DP + DP-SAT + Calib      76.1%     0.509
+
+
+uv run ablation.py --mps --k 2048 --epochs 100 --target-epsilon 4.0 --delta 1e-5 \
+  --dp-param-count 20000 --model-type efficientnet --clip-radius 2.0 \
+  --run-mia --users 60 --calibration-k 200 --dp-sat-mode fisher
+
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  71.7%     0.506
+   Vanilla DP-SGD + DP-SAT         72.2%     0.504
+   Fisher DP + Normal              76.4%     0.493
+   Fisher DP + DP-SAT              76.7%     0.504
+   Fisher DP + Normal + Calib      76.7%     0.491
+   Fisher DP + DP-SAT + Calib      77.3%     0.503
+
+
+uv run ablation.py --mps --k 2048 --epochs 100 --target-epsilon 4.0 --delta 1e-5 \
+  --dp-param-count 20000 --model-type efficientnet --clip-radius 1.5 \
+  --run-mia --users 100 --calibration-k 200 --dp-sat-mode fisher
+
+⚖️  Privacy vs Accuracy Tradeoff:
+   Model                          Accuracy  Privacy (1-AUC)
+   ────────────────────────────── ─────────  ──────────────
+   Vanilla DP-SGD                  63.8%     0.472
+   Vanilla DP-SGD + DP-SAT         63.6%     0.490
+   Fisher DP + Normal              74.7%     0.498
+   Fisher DP + DP-SAT              76.0%     0.500
+   Fisher DP + Normal + Calib      75.9%     0.488
+   Fisher DP + DP-SAT + Calib      76.5%     0.511
+
+
+
+我的想法是吧，固定cifar-10+efficientnet，然后控制变量：
+1）用上面例子里的第一个，固定其他，改epsilon [1,2,4,8]
+2）用上面例子里的第二个，固定其他，改users [60, 80, 100]
+3）用上面例子里的第三个，固定其他，改clip-radius [1.0, 1.5, 2.0]
+4）直接套用上面三个例子，每个跑dp-sat-mode [euclidean,fisher]就好了

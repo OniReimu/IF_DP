@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --account=project_462001050  # project account to bill 
 #SBATCH --partition=standard-g         # other options are small-g and standard-g
-#SBATCH --gpus-per-node=1            # Number of GPUs per node (max of 8)
-#SBATCH --ntasks-per-node=1          # Use one task for one GPU
-#SBATCH --cpus-per-task=7            # Use 1/8 of all available 56 CPUs on LUMI-G nodes
+#SBATCH --gpus-per-node=2            # Use all available GPUs on the node
+#SBATCH --ntasks-per-node=1          # Single task controlling multiple GPUs
+#SBATCH --cpus-per-task=56           # Allocate full CPU socket per node for 8 GPUs
 #SBATCH --mem-per-gpu=60G            # CPU RAM per GPU (GPU memory is always 64GB per GPU)
 #SBATCH --time=8:00:00               # time limit
 
@@ -19,7 +19,18 @@ ENV=${RESOURCE_DIR}/ifdp-venv/bin/activate
 singularity exec "${SIF}" \
     bash -lc  "\$WITH_CONDA  &&\
         source ${ENV} &&\
-             python ablation.py --dataset dbpedia --model-type qwen \
-            --k 2048 --epochs 100 --target-epsilon 4.0 --delta 1e-5 \
-            --dp-param-count 40000 --clip-radius 2.0 \
-            --run-mia --users 60 --calibration-k 200 --dp-sat-mode fisher"
+        python ablation.py \
+            --dataset  cifar10  \
+            --model-type efficientnet \
+            --k 2048 \
+            --epochs 100 \
+            --target-epsilon 8.0 \
+            --delta 1e-5 \
+            --dp-param-count 20000 \
+            --clip-radius 2.0 \
+            --run-mia \
+            --users 100 \
+            --calibration-k 200 \
+            --dp-sat-mode fisher \
+            --multi-gpu \
+            --cuda-devices 0,1"

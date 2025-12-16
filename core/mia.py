@@ -24,6 +24,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # Set reproducible random seeds for consistent MIA evaluation
 from .config import set_random_seeds, get_dataset_location
+from .device_utils import resolve_device
 set_random_seeds()
 dataset_root, allow_download = get_dataset_location(
     dataset_key='cifar10',
@@ -719,17 +720,11 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
 
 def get_device(args):
     """Get the appropriate device based on command line arguments"""
-    if args.cpu: 
-        return torch.device('cpu')
-    if args.mps and torch.backends.mps.is_available():
-        print('Using MPS')
-        return torch.device('mps')
-    if torch.cuda.is_available():
-        idx = 0 if args.cuda_id is None else args.cuda_id
-        print(f'Using CUDA:{idx}')
-        return torch.device(f'cuda:{idx}')
-    print('Using CPU')
-    return torch.device('cpu')
+    if not hasattr(args, 'cuda_devices'):
+        args.cuda_devices = None
+    if not hasattr(args, 'multi_gpu'):
+        args.multi_gpu = False
+    return resolve_device(args)
 
 def prepare_standalone_mia_data(trainset, testset, member_size=5000, non_member_size=5000):
     """Prepare member and non-member datasets for standalone MIA evaluation"""
@@ -750,6 +745,10 @@ def main():
     parser.add_argument('--mps', action='store_true')
     parser.add_argument('--cuda-id', type=int)
     parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--cuda-devices', type=str, default=None,
+                       help='Comma-separated CUDA device ids for multi-GPU execution')
+    parser.add_argument('--multi-gpu', action='store_true',
+                       help='Enable torch.nn.DataParallel across the requested CUDA devices')
     parser.add_argument('--member-size', type=int, default=2000,
                        help='Number of member samples for MIA')
     parser.add_argument('--non-member-size', type=int, default=2000,
