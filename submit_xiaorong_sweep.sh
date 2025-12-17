@@ -25,7 +25,7 @@ submit_job() {
 }
 
 EPSILONS=(0.5 1.0 2.0 4.0)
-USERS=(80 100 120 150)
+USERS=(60 80 100 120)
 CLIP_RADII=(1.0 2.0 3.0)
 DP_SAT_MODES=(fisher euclidean)
 
