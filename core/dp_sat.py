@@ -19,7 +19,7 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                       clip_radius=10.0, device="cuda", target_layer="conv1",
                       adaptive_clip=True, quantile=0.95, sample_level=None,
                       epochs=1, sigma=None, rho_sat=0.001, lambda_flatness=None,
-                      dp_param_count=None):
+                      dp_param_count=None, dp_epochs=None):
     """
     DP-SAT training: Vanilla DP-SGD + Sharpness-Aware flatness adjustment.
     
@@ -169,8 +169,9 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     # Initialize previous step's noisy gradient for DP-SAT
     g_prev_priv = None
 
-    # Use 1/10th of requested epochs for DP finetuning (at least 1)
-    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    # Determine DP fine-tuning epochs
+    if dp_epochs is None:
+        dp_epochs = max(1, int(math.ceil(epochs / 10)))
     if sigma is None:
         sigma = sigma_single_epoch / math.sqrt(dp_epochs)
         print(f"   • Legacy accounting: T={dp_epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")

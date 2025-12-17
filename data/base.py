@@ -78,14 +78,28 @@ def split_private_public_calibration_indices(
     if not (0.0 <= public_ratio <= 1.0):
         raise ValueError("--public-ratio must be in [0, 1]")
 
-    rng = np.random.RandomState(int(seed))
-    perm = rng.permutation(total_size)
+    # rng = np.random.RandomState(int(seed))
+    # perm = rng.permutation(total_size)
+    # cursor = 0
+    # priv_idx = perm[cursor : cursor + private_size]
+    # cursor += private_size
+    # calib_idx = perm[cursor : cursor + calibration_size]
+    # cursor += calibration_size
+    # remaining = perm[cursor:]
+    # public_take = int(round(len(remaining) * public_ratio))
+    # pub_idx = remaining[:public_take]
+
     cursor = 0
-    priv_idx = perm[cursor : cursor + private_size]
+
+    priv_idx = np.arange(cursor, cursor + private_size)
     cursor += private_size
-    calib_idx = perm[cursor : cursor + calibration_size]
+
+    calib_idx = np.arange(cursor, cursor + calibration_size)
     cursor += calibration_size
-    remaining = perm[cursor:]
+
+    remaining = np.arange(cursor, total_size)
+
     public_take = int(round(len(remaining) * public_ratio))
     pub_idx = remaining[:public_take]
+
     return priv_idx, pub_idx, calib_idx

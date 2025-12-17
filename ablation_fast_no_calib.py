@@ -512,7 +512,8 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                   use_dp_sat=False,
                                   optimizer_name="Normal", positive_noise_correlation=False,
                                   precomputed_lam=None, precomputed_U=None,
-                                  dp_sat_mode="none", rho_sat=0.001, dp_param_count=None):
+                                  dp_sat_mode="none", rho_sat=0.001, dp_param_count=None,
+                                  dp_epochs=None):
     """
     TRICK 4: EXACT FISHER-AWARE DP-SAT
     Standard DP-SAT adds a gradient term, which is approximate. Here we implement 
@@ -702,219 +703,225 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     # Initialize previous step's Fisher-noisy gradient for DP-SAT
     g_fisher_priv_prev = None
 
-    for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP + {opt_type} ({mode_str})")):
-        features, labels, user_ids = prepare_batch(batch_data, device)
-        batch_size = labels.size(0)
+    # Determine DP fine-tuning epochs
+    if dp_epochs is None:
+        dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
 
-        # ============================================================
-        # DP-SAT Exact Mode: Weight Perturbation (Start of Step)
-        # ============================================================
-        perturbation = None
-        if dp_sat_mode != "none" and g_fisher_priv_prev is not None:
-             if dp_sat_mode == "euclidean":
-                 # Euclidean perturbation: δ = ρ * g / ||g||₂
-                 g_norm = g_fisher_priv_prev.norm() + 1e-8
-                 perturbation = rho_sat * g_fisher_priv_prev / g_norm
-             elif dp_sat_mode == "fisher":
-                 # Fisher perturbation: δ = ρ * F⁻¹g / ||F⁻¹g||_F
-                 alpha = U.T @ g_fisher_priv_prev
-                 alpha_white = alpha * inv_sqrt_lam
-                 alpha_white_norm = alpha_white.norm() + 1e-8
-                 perturbation = rho_sat * (U @ (alpha_white / alpha_white_norm * inv_sqrt_lam))
+    for epoch in range(dp_epochs):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP + {opt_type} ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
+            features, labels, user_ids = prepare_batch(batch_data, device)
+            batch_size = labels.size(0)
 
-             # Apply perturbation
-             current_idx = 0
-             for p in params:
-                 n = p.numel()
-                 p.data.add_(perturbation[current_idx:current_idx+n].view_as(p))
-                 current_idx += n
+            # ============================================================
+            # DP-SAT Exact Mode: Weight Perturbation (Start of Step)
+            # ============================================================
+            perturbation = None
+            if dp_sat_mode != "none" and g_fisher_priv_prev is not None:
+                if dp_sat_mode == "euclidean":
+                    # Euclidean perturbation: δ = ρ * g / ||g||₂
+                    g_norm = g_fisher_priv_prev.norm() + 1e-8
+                    perturbation = rho_sat * g_fisher_priv_prev / g_norm
+                elif dp_sat_mode == "fisher":
+                    # Fisher perturbation: δ = ρ * F⁻¹g / ||F⁻¹g||_F
+                    alpha = U.T @ g_fisher_priv_prev
+                    alpha_white = alpha * inv_sqrt_lam
+                    alpha_white_norm = alpha_white.norm() + 1e-8
+                    perturbation = rho_sat * (U @ (alpha_white / alpha_white_norm * inv_sqrt_lam))
 
-        model.zero_grad()
-        losses = F.cross_entropy(model(features), labels, reduction="none")
+                # Apply perturbation
+                current_idx = 0
+                for p in params:
+                    n = p.numel()
+                    p.data.add_(perturbation[current_idx:current_idx+n].view_as(p))
+                    current_idx += n
 
-        if sample_level:
-            # SAMPLE-LEVEL DP: Compute per-sample gradients
-            per_g = []
-            for i in range(batch_size):
-                gi = grad(losses[i], params, retain_graph=True)
-                per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
-            per_g = torch.stack(per_g)
+            model.zero_grad()
+            losses = F.cross_entropy(model(features), labels, reduction="none")
 
-            # Calibration or adaptive clipping: collect EUCLIDEAN norms (like vanilla DP-SGD)
-            if (adaptive_clip and not adaptive_radius_computed) or not calibration_computed:
-                batch_euclidean_norms = []
-                batch_mahalanobis_norms = []
-                
-                for i in range(per_g.size(0)):
-                    # Compute both norms for calibration
-                    euclidean_norm = per_g[i].norm().item()
-                    proj = (U.T @ per_g[i]) * clip_scaling
-                    mahalanobis_norm = proj.norm().item()
-                    
-                    batch_euclidean_norms.append(euclidean_norm)
-                    batch_mahalanobis_norms.append(mahalanobis_norm)
-                
-                euclidean_norms.extend(batch_euclidean_norms)
-                
-                # Adaptive clipping: use Euclidean norms (like vanilla DP-SGD)
-                if adaptive_clip and not adaptive_radius_computed:
-                    if len(euclidean_norms) >= 100 or batch_idx == 0:
-                        euclidean_adaptive_radius = np.quantile(euclidean_norms, quantile)
-                        euclidean_target = euclidean_adaptive_radius  # Update target
-                        adaptive_radius_computed = True
-                        
-                        print(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} samples (EUCLIDEAN norms):")
-                        print(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
-                        print(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
-                        print(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
-                
-                # Calibration: find Mahalanobis threshold that matches Euclidean sensitivity
-                if not calibration_computed and len(euclidean_norms) >= 50:
-                    # Find what Mahalanobis threshold gives similar clipping behavior as Euclidean target
-                    euclidean_clip_rate = np.mean(np.array(batch_euclidean_norms) > euclidean_target)
-                    
-                    # Binary search for Mahalanobis threshold that gives similar clip rate
-                    maha_norms = np.array(batch_mahalanobis_norms)
-                    maha_low, maha_high = maha_norms.min(), maha_norms.max()
-                    
-                    for _ in range(10):  # Binary search iterations
-                        maha_mid = (maha_low + maha_high) / 2
-                        maha_clip_rate = np.mean(maha_norms > maha_mid)
-                        
-                        if maha_clip_rate > euclidean_clip_rate:
-                            maha_low = maha_mid
-                        else:
-                            maha_high = maha_mid
-                    
-                    actual_radius = (maha_low + maha_high) / 2
-                    calibration_computed = True
-                    
-                    print(f"🎯 Ablation norm calibration completed:")
-                    print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
-                    print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                    print(f"   • Euclidean clip rate: {euclidean_clip_rate:.1%}")
-                    print(f"   • Mahalanobis clip rate: {np.mean(maha_norms > actual_radius):.1%}")
-                    print(f"   → Fair comparison: same effective sensitivity bound Δ₂\n")
-                    
-                    euclidean_norms = []  # Reset for actual training statistics
+            if sample_level:
+                # SAMPLE-LEVEL DP: Compute per-sample gradients
+                per_g = []
+                for i in range(batch_size):
+                    gi = grad(losses[i], params, retain_graph=True)
+                    per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
+                per_g = torch.stack(per_g)
 
-            # Mahalanobis clipping with calibrated threshold
-            for i in range(per_g.size(0)):
-                per_g[i], nrm = maha_clip(per_g[i], U, clip_scaling, actual_radius)
-                grad_norm.append(nrm)
-            g_bar = per_g.mean(0)
-
-        else:
-            # USER-LEVEL DP: Compute gradient per user
-            user_gradients = []
-            unique_users = torch.unique(user_ids) if user_ids is not None else [0]
-            
-            for uid in unique_users:
-                if user_ids is not None:
-                    mask = (user_ids == uid)
-                    user_losses = losses[mask]
-                else:
-                    user_losses = losses
-                    mask = torch.ones_like(losses, dtype=torch.bool)
-                
-                user_total_loss = user_losses.sum()
-                user_grad = grad(user_total_loss, params, retain_graph=True)
-                user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
-                user_gradients.append(user_grad_flat)
-                
-                # Calibration or adaptive clipping: collect EUCLIDEAN norms
+                # Calibration or adaptive clipping: collect EUCLIDEAN norms (like vanilla DP-SGD)
                 if (adaptive_clip and not adaptive_radius_computed) or not calibration_computed:
-                    euclidean_norm = user_grad_flat.norm().item()
-                    euclidean_norms.append(euclidean_norm)
+                    batch_euclidean_norms = []
+                    batch_mahalanobis_norms = []
                     
+                    for i in range(per_g.size(0)):
+                        # Compute both norms for calibration
+                        euclidean_norm = per_g[i].norm().item()
+                        proj = (U.T @ per_g[i]) * clip_scaling
+                        mahalanobis_norm = proj.norm().item()
+                        
+                        batch_euclidean_norms.append(euclidean_norm)
+                        batch_mahalanobis_norms.append(mahalanobis_norm)
+                    
+                    euclidean_norms.extend(batch_euclidean_norms)
+                    
+                    # Adaptive clipping: use Euclidean norms (like vanilla DP-SGD)
                     if adaptive_clip and not adaptive_radius_computed:
-                        if len(euclidean_norms) >= min(10, len(train_loader)) or batch_idx == 0:
+                        if len(euclidean_norms) >= 100 or batch_idx == 0:
                             euclidean_adaptive_radius = np.quantile(euclidean_norms, quantile)
-                            euclidean_target = euclidean_adaptive_radius
+                            euclidean_target = euclidean_adaptive_radius  # Update target
                             adaptive_radius_computed = True
                             
-                            print(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} users (EUCLIDEAN norms):")
+                            print(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} samples (EUCLIDEAN norms):")
                             print(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
                             print(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
                             print(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
                     
-                    # Calibration for user-level
-                    if not calibration_computed and len(euclidean_norms) >= 5:
-                        # Simple heuristic: use median ratio for calibration
-                        proj = (U.T @ user_grad_flat) * inv_sqrt_lam
-                        mahalanobis_norm = proj.norm().item()
-                        ratio = euclidean_norm / (mahalanobis_norm + 1e-8)
-                        actual_radius = euclidean_target / (ratio + 1e-8)
+                    # Calibration: find Mahalanobis threshold that matches Euclidean sensitivity
+                    if not calibration_computed and len(euclidean_norms) >= 50:
+                        # Find what Mahalanobis threshold gives similar clipping behavior as Euclidean target
+                        euclidean_clip_rate = np.mean(np.array(batch_euclidean_norms) > euclidean_target)
+                        
+                        # Binary search for Mahalanobis threshold that gives similar clip rate
+                        maha_norms = np.array(batch_mahalanobis_norms)
+                        maha_low, maha_high = maha_norms.min(), maha_norms.max()
+                        
+                        for _ in range(10):  # Binary search iterations
+                            maha_mid = (maha_low + maha_high) / 2
+                            maha_clip_rate = np.mean(maha_norms > maha_mid)
+                            
+                            if maha_clip_rate > euclidean_clip_rate:
+                                maha_low = maha_mid
+                            else:
+                                maha_high = maha_mid
+                        
+                        actual_radius = (maha_low + maha_high) / 2
                         calibration_computed = True
                         
-                        print(f"🎯 Ablation user-level norm calibration:")
+                        print(f"🎯 Ablation norm calibration completed:")
                         print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
                         print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                        print(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}\n")
+                        print(f"   • Euclidean clip rate: {euclidean_clip_rate:.1%}")
+                        print(f"   • Mahalanobis clip rate: {np.mean(maha_norms > actual_radius):.1%}")
+                        print(f"   → Fair comparison: same effective sensitivity bound Δ₂\n")
                         
-                        euclidean_norms = []  # Reset
-            
-            # Mahalanobis clipping for each user gradient
-            clipped_user_grads = []
-            for user_grad_flat in user_gradients:
-                clipped_grad, user_norm = maha_clip(user_grad_flat, U, clip_scaling, actual_radius)
-                grad_norm.append(user_norm)
-                clipped_user_grads.append(clipped_grad)
-            
-            g_bar = torch.stack(clipped_user_grads).mean(0)
+                        euclidean_norms = []  # Reset for actual training statistics
 
-        # ============================================================
-        # FISHER-INFORMED NOISE (Two-component)
-        # ============================================================
-        
-        # 1. Low-rank noise in Fisher subspace (anisotropic)
-        z_fisher = torch.randn(actual_k, device=device)
-        fisher_noise = U @ (z_fisher * noise_scaling) * sigma * euclidean_target  # Use Euclidean target for noise scale
-        
-        if full_complement_noise:
-            # 2. Complement noise in orthogonal subspace (isotropic)
-            z_full = torch.randn_like(g_bar)
-            z_complement = z_full - U @ (U.T @ z_full)  # Project to complement
-            complement_noise = z_complement * sigma * euclidean_target  # Use Euclidean target
-            total_noise = fisher_noise + complement_noise
-            complement_noise_norm = complement_noise.norm().item()
-        else:
-            # Only Fisher subspace noise (preserves curvature-aware benefits)
-            total_noise = fisher_noise
-            complement_noise_norm = 0.0
-        
-        g_fisher_priv = g_bar + total_noise
-        
-        # Track noise components
-        fisher_noise_norm = fisher_noise.norm().item()
-        total_noise_norm = total_noise.norm().item()
-        noise_l2.append(total_noise_norm)
+                # Mahalanobis clipping with calibrated threshold
+                for i in range(per_g.size(0)):
+                    per_g[i], nrm = maha_clip(per_g[i], U, clip_scaling, actual_radius)
+                    grad_norm.append(nrm)
+                g_bar = per_g.mean(0)
 
-        # ============================================================
-        # OPTIONAL: DP-SAT OPTIMIZATION (Sharpness-Aware) - CORRECTED
-        # ============================================================
-        
-        g_final = g_fisher_priv
-        
-        # 1. Restore weights if using Exact Mode
-        if perturbation is not None:
-            current_idx = 0
+            else:
+                # USER-LEVEL DP: Compute gradient per user
+                user_gradients = []
+                unique_users = torch.unique(user_ids) if user_ids is not None else [0]
+                
+                for uid in unique_users:
+                    if user_ids is not None:
+                        mask = (user_ids == uid)
+                        user_losses = losses[mask]
+                    else:
+                        user_losses = losses
+                        mask = torch.ones_like(losses, dtype=torch.bool)
+                    
+                    user_total_loss = user_losses.sum()
+                    user_grad = grad(user_total_loss, params, retain_graph=True)
+                    user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
+                    user_gradients.append(user_grad_flat)
+                    
+                    # Calibration or adaptive clipping: collect EUCLIDEAN norms
+                    if (adaptive_clip and not adaptive_radius_computed) or not calibration_computed:
+                        euclidean_norm = user_grad_flat.norm().item()
+                        euclidean_norms.append(euclidean_norm)
+                        
+                        if adaptive_clip and not adaptive_radius_computed:
+                            if len(euclidean_norms) >= min(10, len(train_loader)) or batch_idx == 0:
+                                euclidean_adaptive_radius = np.quantile(euclidean_norms, quantile)
+                                euclidean_target = euclidean_adaptive_radius
+                                adaptive_radius_computed = True
+                                
+                                print(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} users (EUCLIDEAN norms):")
+                                print(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
+                                print(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
+                                print(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
+                        
+                        # Calibration for user-level
+                        if not calibration_computed and len(euclidean_norms) >= 5:
+                            # Simple heuristic: use median ratio for calibration
+                            proj = (U.T @ user_grad_flat) * inv_sqrt_lam
+                            mahalanobis_norm = proj.norm().item()
+                            ratio = euclidean_norm / (mahalanobis_norm + 1e-8)
+                            actual_radius = euclidean_target / (ratio + 1e-8)
+                            calibration_computed = True
+                            
+                            print(f"🎯 Ablation user-level norm calibration:")
+                            print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
+                            print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
+                            print(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}\n")
+                            
+                            euclidean_norms = []  # Reset
+                
+                # Mahalanobis clipping for each user gradient
+                clipped_user_grads = []
+                for user_grad_flat in user_gradients:
+                    clipped_grad, user_norm = maha_clip(user_grad_flat, U, clip_scaling, actual_radius)
+                    grad_norm.append(user_norm)
+                    clipped_user_grads.append(clipped_grad)
+                
+                g_bar = torch.stack(clipped_user_grads).mean(0)
+
+            # ============================================================
+            # FISHER-INFORMED NOISE (Two-component)
+            # ============================================================
+            
+            # 1. Low-rank noise in Fisher subspace (anisotropic)
+            z_fisher = torch.randn(actual_k, device=device)
+            fisher_noise = U @ (z_fisher * noise_scaling) * sigma * euclidean_target  # Use Euclidean target for noise scale
+            
+            if full_complement_noise:
+                # 2. Complement noise in orthogonal subspace (isotropic)
+                z_full = torch.randn_like(g_bar)
+                z_complement = z_full - U @ (U.T @ z_full)  # Project to complement
+                complement_noise = z_complement * sigma * euclidean_target  # Use Euclidean target
+                total_noise = fisher_noise + complement_noise
+                complement_noise_norm = complement_noise.norm().item()
+            else:
+                # Only Fisher subspace noise (preserves curvature-aware benefits)
+                total_noise = fisher_noise
+                complement_noise_norm = 0.0
+            
+            g_fisher_priv = g_bar + total_noise
+            
+            # Track noise components
+            fisher_noise_norm = fisher_noise.norm().item()
+            total_noise_norm = total_noise.norm().item()
+            noise_l2.append(total_noise_norm)
+
+            # ============================================================
+            # OPTIONAL: DP-SAT OPTIMIZATION (Sharpness-Aware) - CORRECTED
+            # ============================================================
+            
+            g_final = g_fisher_priv
+            
+            # 1. Restore weights if using Exact Mode
+            if perturbation is not None:
+                current_idx = 0
+                for p in params:
+                    n = p.numel()
+                    p.data.sub_(perturbation[current_idx:current_idx+n].view_as(p))
+                    current_idx += n
+
+            # Store current Fisher-noisy gradient for next iteration (needed for Exact)
+            if use_dp_sat or dp_sat_mode != "none":
+                g_fisher_priv_prev = g_fisher_priv.clone().detach()
+
+            # Scatter back to model parameters
+            idx = 0
             for p in params:
-                 n = p.numel()
-                 p.data.sub_(perturbation[current_idx:current_idx+n].view_as(p))
-                 current_idx += n
-
-        # Store current Fisher-noisy gradient for next iteration (needed for Exact)
-        if use_dp_sat or dp_sat_mode != "none":
-            g_fisher_priv_prev = g_fisher_priv.clone().detach()
-
-        # Scatter back to model parameters
-        idx = 0
-        for p in params:
-            n = p.numel()
-            p.grad = g_final[idx:idx+n].view_as(p)
-            idx += n
-        opt.step()
+                n = p.numel()
+                p.grad = g_final[idx:idx+n].view_as(p)
+                idx += n
+            opt.step()
 
     grad_type = "‖g_user‖_Mah" if not sample_level else "‖g‖_Mah"
     print(f"\n📊  Fisher DP + {optimizer_name} final stats:")
@@ -926,7 +933,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         print(f"   • Last batch: Fisher={fisher_noise_norm:.1f}, Complement={complement_noise_norm:.1f}")
     else:
         print(f"   • Last batch: Fisher only={fisher_noise_norm:.1f} (complement disabled)")
-    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {epochs} epochs")
+    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {dp_epochs} DP fine-tuning epochs")
     print(f"   • ✅ FAIR COMPARISON: Same effective sensitivity Δ₂ as vanilla DP-SGD")
 
     return model
@@ -1071,7 +1078,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             steps_per_epoch=steps_per_epoch
         )
         
-        sigma = noise_multiplier * args.clip_radius
+        # sigma = noise_multiplier * args.clip_radius
+        sigma = noise_multiplier
         display_epsilon = args.target_epsilon
         
         print(f"\n🔒 Privacy Accounting for Optimized Ablation Study:")
@@ -1105,7 +1113,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
-        dp_param_count=args.dp_param_count
+        dp_param_count=args.dp_param_count,
+        dp_epochs=args.dp_epochs
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1158,7 +1167,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         positive_noise_correlation=args.positive_noise_correlation,
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
         precomputed_U=U,
-        dp_param_count=args.dp_param_count
+        dp_param_count=args.dp_param_count,
+        dp_epochs=args.dp_epochs
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1195,7 +1205,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         positive_noise_correlation=args.positive_noise_correlation,
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
         precomputed_U=U,
-        dp_param_count=args.dp_param_count
+        dp_param_count=args.dp_param_count,
+        dp_epochs=args.dp_epochs
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1541,6 +1552,9 @@ def main():
     parser.add_argument('--max-seq-length', type=int, default=512,
                        help='Maximum sequence length for language datasets')
     parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--dp-epochs', type=int, default=None,
+                       help='Number of DP fine-tuning epochs. If None, uses max(1, ceil(epochs/10)). '
+                            'Lower values may help DP-SAT perform better.')
     
     # Model arguments
     parser.add_argument('--model-type', type=str, default='cnn',

@@ -111,6 +111,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-size", type=int, default=50000)
     parser.add_argument("--public-ratio", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--dp-epochs", type=int, default=None,
+                       help='Number of DP fine-tuning epochs. If None, uses max(1, ceil(epochs/10)). '
+                            'Lower values may help DP-SAT perform better.')
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--critical-label", type=int, default=None)
@@ -279,6 +282,7 @@ def main() -> None:
         sample_level=args.sample_level,
         epochs=args.epochs,
         positive_noise_correlation=args.positively_correlated_noise,
+        dp_epochs=args.dp_epochs,
     )
 
     vanilla_dp_model: Optional[torch.nn.Module] = None
@@ -300,6 +304,7 @@ def main() -> None:
             quantile=args.quantile,
             sample_level=args.sample_level,
             epochs=args.epochs,
+            dp_epochs=args.dp_epochs,
         )
 
         print("\n🔺 DP-SAT: Sharpness-Aware Training (comparison)…")

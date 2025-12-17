@@ -15,7 +15,7 @@ from models.utils import compute_loss
 def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
                          clip_radius=10.0, device="cuda", target_layer="conv1",
                          adaptive_clip=True, quantile=0.95, sample_level=None,
-                         epochs=1, sigma=None, dp_param_count=None):
+                         epochs=1, sigma=None, dp_param_count=None, dp_epochs=None):
     """
     Vanilla DP-SGD training with Euclidean clipping and isotropic noise.
     
@@ -149,8 +149,9 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
     adaptive_radius_computed = False
     actual_radius = clip_radius  # Start with provided radius
 
-    # Use 1/10th of requested epochs for DP finetuning (at least 1)
-    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    # Determine DP fine-tuning epochs
+    if dp_epochs is None:
+        dp_epochs = max(1, int(math.ceil(epochs / 10)))
     if sigma is None:
         sigma = sigma_single_epoch / math.sqrt(dp_epochs)
         print(f"   • Legacy accounting: T={dp_epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")

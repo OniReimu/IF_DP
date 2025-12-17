@@ -176,7 +176,7 @@ def train_with_dp(model, train_loader, fisher,
                   adaptive_clip=False, quantile=0.95, sample_level=None,
                   epochs=1, sigma=None, full_complement_noise=False,
                   positive_noise_correlation=False,
-                  dp_sat_mode="none", rho_sat=0.001):
+                  dp_sat_mode="none", rho_sat=0.001, dp_epochs=None):
     """
     Train with Fisher-informed DP-SGD
     
@@ -292,8 +292,9 @@ def train_with_dp(model, train_loader, fisher,
     # Initialize previous step's noisy gradient for DP-SAT
     g_prev_priv = None
 
-    # Use 1/10th of requested epochs for DP finetuning (at least 1) to mirror dp_sat
-    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    # Determine DP fine-tuning epochs
+    if dp_epochs is None:
+        dp_epochs = max(1, int(math.ceil(epochs / 10)))
     print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
 
     for epoch in range(dp_epochs):
