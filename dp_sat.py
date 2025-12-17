@@ -17,7 +17,7 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                       clip_radius=10.0, device="cuda", target_layer="conv1",
                       adaptive_clip=True, quantile=0.95, sample_level=None,
                       epochs=1, sigma=None, rho_sat=0.001, lambda_flatness=None,
-                      dp_param_count=None):
+                      dp_param_count=None, dp_epochs=None):
     """
     DP-SAT training: Vanilla DP-SGD + Sharpness-Aware flatness adjustment.
     
@@ -55,16 +55,16 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     
-    # Privacy accounting (same as vanilla DP-SGD) — note dp_epochs below
+    # Privacy accounting (same as vanilla DP-SGD)
     if sigma is not None:
         # Use provided sigma (proper privacy accounting)
         print(f"   • Using provided sigma: {sigma:.4f}")
     else:
         # Legacy privacy accounting for multi-epoch training
         # Use simple composition bound: σ_total = σ_single / √T for T epochs
-        # (We will set dp_epochs below to be a fraction of the requested epochs.)
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
-        # defer sigma adjustment until dp_epochs is defined
+        sigma = sigma_single_epoch / math.sqrt(epochs)  # Adjust for T epochs
+        print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
 
     # gather parameter objects based on target_layer
     def _match(name: str, layer: str) -> bool:
@@ -166,20 +166,16 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     adaptive_radius_computed = False
     actual_radius = clip_radius  # Start with provided radius
     
-    # Initialize previous step's noisy gradient for DP-SAT
-    g_prev_priv = None
-
-    # Use 1/10th of requested epochs for DP finetuning (at least 1)
-    dp_epochs = max(1, int(math.ceil(epochs / 10)))
+    # Determine DP fine-tuning epochs
+    if dp_epochs is None:
+        dp_epochs = max(1, int(math.ceil(epochs / 10)))
     print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
 
-    # If using legacy sigma calculation, adjust now with actual dp_epochs
-    if sigma is None:
-        sigma = sigma_single_epoch / math.sqrt(dp_epochs)
-        print(f"   • Legacy accounting: T={dp_epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
-
+    # Initialize previous step's noisy gradient for DP-SAT
+    g_prev_priv = None
+    
     for epoch in range(dp_epochs):
-        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"DP-SAT ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"DP-SAT ({mode_str}) E{epoch+1}/{dp_epochs}")):
             # accept (x,y) OR (x,y,uid)
             if len(batch_data) == 3:
                 x, y, user_ids = batch_data
@@ -187,147 +183,147 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                 x, y = batch_data
                 user_ids = None
             x, y = x.to(device), y.to(device)
-        
-        # ============================================================
-        # DP-SAT EXACT: 1. Perturb weights
-        # ============================================================
-        perturbation = None
-        if g_prev_priv is not None:
-            # Euclidean perturbation: δ = ρ * g / ||g||₂
-            g_norm = g_prev_priv.norm() + 1e-8
-            perturbation = rho_sat * g_prev_priv / g_norm
             
-            # Apply perturbation
-            current_idx = 0
-            for p in params:
-                n = p.numel()
-                p.data.add_(perturbation[current_idx:current_idx+n].view_as(p))
-                current_idx += n
+            # ============================================================
+            # DP-SAT EXACT: 1. Perturb weights
+            # ============================================================
+            perturbation = None
+            if g_prev_priv is not None:
+                # Euclidean perturbation: δ = ρ * g / ||g||₂
+                g_norm = g_prev_priv.norm() + 1e-8
+                perturbation = rho_sat * g_prev_priv / g_norm
+                
+                # Apply perturbation
+                current_idx = 0
+                for p in params:
+                    n = p.numel()
+                    p.data.add_(perturbation[current_idx:current_idx+n].view_as(p))
+                    current_idx += n
 
-        # Standard DP-SGD forward/backward on (possibly perturbed) weights
-        model.zero_grad()
-        losses = F.cross_entropy(model(x), y, reduction="none")
-        
-        if sample_level:
-            # SAMPLE-LEVEL DP: Compute per-sample gradients
-            per_g = []
-            for i in range(x.size(0)):
-                gi = grad(losses[i], params, retain_graph=True)
-                per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
-            per_g = torch.stack(per_g)
+            # Standard DP-SGD forward/backward on (possibly perturbed) weights
+            model.zero_grad()
+            losses = F.cross_entropy(model(x), y, reduction="none")
             
-            # Adaptive clipping: collect norms from first batch to compute quantile
-            if adaptive_clip and not adaptive_radius_computed:
-                batch_norms = []
-                for i in range(per_g.size(0)):
-                    # Compute Euclidean norm
-                    euclidean_norm = per_g[i].norm().item()
-                    batch_norms.append(euclidean_norm)
-                grad_norm.extend(batch_norms)
+            if sample_level:
+                # SAMPLE-LEVEL DP: Compute per-sample gradients
+                per_g = []
+                for i in range(x.size(0)):
+                    gi = grad(losses[i], params, retain_graph=True)
+                    per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
+                per_g = torch.stack(per_g)
                 
-                # If we have enough samples or it's a large batch, compute adaptive radius
-                if len(grad_norm) >= 100 or batch_idx == 0:
-                    adaptive_radius = np.quantile(grad_norm, quantile)
-                    actual_radius = adaptive_radius
-                    adaptive_radius_computed = True
-                    
-                    print(f"📊 DP-SAT adaptive clipping from {len(grad_norm)} samples:")
-                    print(f"   • Mean: {np.mean(grad_norm):.3f}")
-                    print(f"   • Median: {np.median(grad_norm):.3f}")
-                    print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
-                    print(f"   • Max: {np.max(grad_norm):.3f}")
-                    print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
-                    
-                    grad_norm = []  # Reset for actual training statistics
-            
-            # Vanilla Euclidean clipping for each sample
-            for i in range(per_g.size(0)):
-                norm = per_g[i].norm()
-                if norm > actual_radius:
-                    per_g[i].mul_(actual_radius / norm)
-                grad_norm.append(norm.item())
-            
-            # Average clipped gradients
-            g_bar = per_g.mean(0)
-            
-        else:
-            # USER-LEVEL DP
-            user_gradients = []
-            unique_users = torch.unique(user_ids) if user_ids is not None else [0]
-            
-            for uid in unique_users:
-                if user_ids is not None:
-                    mask = (user_ids == uid)
-                    user_losses = losses[mask]
-                else:
-                    user_losses = losses
-                    mask = torch.ones_like(losses, dtype=torch.bool)
-                
-                user_total_loss = user_losses.sum()
-                user_grad = grad(user_total_loss, params, retain_graph=True)
-                user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
-                user_gradients.append(user_grad_flat)
-                
-                # Adaptive clipping
+                # Adaptive clipping: collect norms from first batch to compute quantile
                 if adaptive_clip and not adaptive_radius_computed:
-                    user_norm = user_grad_flat.norm().item()
-                    grad_norm.append(user_norm)
+                    batch_norms = []
+                    for i in range(per_g.size(0)):
+                        # Compute Euclidean norm
+                        euclidean_norm = per_g[i].norm().item()
+                        batch_norms.append(euclidean_norm)
+                    grad_norm.extend(batch_norms)
                     
-                    if len(grad_norm) >= min(10, len(train_loader)) or batch_idx == 0:
+                    # If we have enough samples or it's a large batch, compute adaptive radius
+                    if len(grad_norm) >= 100 or batch_idx == 0:
                         adaptive_radius = np.quantile(grad_norm, quantile)
                         actual_radius = adaptive_radius
                         adaptive_radius_computed = True
                         
-                        print(f"📊 DP-SAT adaptive clipping from {len(grad_norm)} users:")
-                        print(f"   • Mean user grad norm: {np.mean(grad_norm):.3f}")
-                        print(f"   • Median user grad norm: {np.median(grad_norm):.3f}")
+                        print(f"📊 DP-SAT adaptive clipping from {len(grad_norm)} samples:")
+                        print(f"   • Mean: {np.mean(grad_norm):.3f}")
+                        print(f"   • Median: {np.median(grad_norm):.3f}")
                         print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
-                        print(f"   • Max user grad norm: {np.max(grad_norm):.3f}")
+                        print(f"   • Max: {np.max(grad_norm):.3f}")
                         print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
                         
-                        grad_norm = []
+                        grad_norm = []  # Reset for actual training statistics
+                
+                # Vanilla Euclidean clipping for each sample
+                for i in range(per_g.size(0)):
+                    norm = per_g[i].norm()
+                    if norm > actual_radius:
+                        per_g[i].mul_(actual_radius / norm)
+                    grad_norm.append(norm.item())
+                
+                # Average clipped gradients
+                g_bar = per_g.mean(0)
+                
+            else:
+                # USER-LEVEL DP
+                user_gradients = []
+                unique_users = torch.unique(user_ids) if user_ids is not None else [0]
+                
+                for uid in unique_users:
+                    if user_ids is not None:
+                        mask = (user_ids == uid)
+                        user_losses = losses[mask]
+                    else:
+                        user_losses = losses
+                        mask = torch.ones_like(losses, dtype=torch.bool)
+                    
+                    user_total_loss = user_losses.sum()
+                    user_grad = grad(user_total_loss, params, retain_graph=True)
+                    user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
+                    user_gradients.append(user_grad_flat)
+                    
+                    # Adaptive clipping
+                    if adaptive_clip and not adaptive_radius_computed:
+                        user_norm = user_grad_flat.norm().item()
+                        grad_norm.append(user_norm)
+                        
+                        if len(grad_norm) >= min(10, len(train_loader)) or batch_idx == 0:
+                            adaptive_radius = np.quantile(grad_norm, quantile)
+                            actual_radius = adaptive_radius
+                            adaptive_radius_computed = True
+                            
+                            print(f"📊 DP-SAT adaptive clipping from {len(grad_norm)} users:")
+                            print(f"   • Mean user grad norm: {np.mean(grad_norm):.3f}")
+                            print(f"   • Median user grad norm: {np.median(grad_norm):.3f}")
+                            print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
+                            print(f"   • Max user grad norm: {np.max(grad_norm):.3f}")
+                            print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
+                            
+                            grad_norm = []
+                
+                if len(user_gradients) != 1:
+                    print(f"⚠️  Warning: Expected 1 user per batch, got {len(user_gradients)} users")
+                
+                # Clip each user's gradient (Euclidean clipping)
+                clipped_user_grads = []
+                for user_grad_flat in user_gradients:
+                    user_norm = user_grad_flat.norm()
+                    if user_norm > actual_radius:
+                        user_grad_flat.mul_(actual_radius / user_norm)
+                    grad_norm.append(user_norm.item())
+                    clipped_user_grads.append(user_grad_flat)
+                
+                g_bar = torch.stack(clipped_user_grads).mean(0)
             
-            if len(user_gradients) != 1:
-                print(f"⚠️  Warning: Expected 1 user per batch, got {len(user_gradients)} users")
+            # Add isotropic Gaussian noise (standard DP-SGD)
+            iso_noise = torch.randn_like(g_bar) * sigma * actual_radius
+            g_priv = g_bar + iso_noise
+            noise_l2.append(iso_noise.norm().item())
             
-            # Clip each user's gradient (Euclidean clipping)
-            clipped_user_grads = []
-            for user_grad_flat in user_gradients:
-                user_norm = user_grad_flat.norm()
-                if user_norm > actual_radius:
-                    user_grad_flat.mul_(actual_radius / user_norm)
-                grad_norm.append(user_norm.item())
-                clipped_user_grads.append(user_grad_flat)
+            # ============================================================
+            # DP-SAT EXACT: 3. Restore weights & 4. Update
+            # ============================================================
             
-            g_bar = torch.stack(clipped_user_grads).mean(0)
-        
-        # Add isotropic Gaussian noise (standard DP-SGD)
-        iso_noise = torch.randn_like(g_bar) * sigma * actual_radius
-        g_priv = g_bar + iso_noise
-        noise_l2.append(iso_noise.norm().item())
-        
-        # ============================================================
-        # DP-SAT EXACT: 3. Restore weights & 4. Update
-        # ============================================================
-        
-        # Restore weights
-        if perturbation is not None:
-            current_idx = 0
+            # Restore weights
+            if perturbation is not None:
+                current_idx = 0
+                for p in params:
+                     n = p.numel()
+                     p.data.sub_(perturbation[current_idx:current_idx+n].view_as(p))
+                     current_idx += n
+            
+            # Store current noisy gradient for next iteration
+            g_prev_priv = g_priv.clone().detach()
+            
+            # Apply update
+            idx = 0
             for p in params:
-                 n = p.numel()
-                 p.data.sub_(perturbation[current_idx:current_idx+n].view_as(p))
-                 current_idx += n
-        
-        # Store current noisy gradient for next iteration
-        g_prev_priv = g_priv.clone().detach()
-        
-        # Apply update
-        idx = 0
-        for p in params:
-            n = p.numel()
-            p.grad = g_priv[idx:idx+n].view_as(p)
-            idx += n
-        opt.step()
+                n = p.numel()
+                p.grad = g_priv[idx:idx+n].view_as(p)
+                idx += n
+            opt.step()
     
     grad_type = "‖g_user‖₂" if not sample_level else "‖g‖₂"
     print(f"\n📊  DP-SAT final stats:")

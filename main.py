@@ -102,6 +102,8 @@ p.add_argument('--cpu', action='store_true')
 p.add_argument('--dataset-size', type=int,   default=50000)
 p.add_argument('--private-ratio', type=float, default=0.8)
 p.add_argument('--epochs', type=int, default=10)
+p.add_argument('--dp-epochs', type=int, default=None,
+               help='Number of epochs for DP fine-tuning (default: max(1, ceil(epochs/10)))')
 
 p.add_argument('--clean', action='store_true',
                help='Remove all saved models before training')
@@ -327,7 +329,8 @@ fisher_dp_model = train_with_dp(fisher_dp_model, priv_loader, Fmat,
                                 quantile=args.quantile,
                                 sample_level=args.sample_level,
                                 epochs=args.epochs,
-                                positive_noise_correlation=args.positively_correlated_noise)
+                                positive_noise_correlation=args.positively_correlated_noise,
+                                dp_epochs=args.dp_epochs)
 
 # ════════════════════════════════════════════════════════════════
 # 4. Vanilla DP-SGD (comparison baseline)
@@ -347,7 +350,8 @@ if args.compare_others:
                                                  adaptive_clip=args.adaptive_clip,
                                                  quantile=args.quantile,
                                                  sample_level=args.sample_level,
-                                                 epochs=args.epochs)
+                                                 epochs=args.epochs,
+                                                 dp_epochs=args.dp_epochs)
     else:
         vanilla_dp_model = train_with_vanilla_dp(vanilla_dp_model, priv_loader,
                                                  epsilon=display_epsilon, delta=args.delta,
@@ -358,7 +362,8 @@ if args.compare_others:
                                                  adaptive_clip=args.adaptive_clip,
                                                  quantile=args.quantile,
                                                  sample_level=args.sample_level,
-                                                 epochs=args.epochs)
+                                                 epochs=args.epochs,
+                                                 dp_epochs=args.dp_epochs)
         
         # Compute and validate actual achieved epsilons
         actual_fisher_epsilon = compute_actual_epsilon(
@@ -422,7 +427,8 @@ if args.compare_others:
                                         quantile=args.quantile,
                                         sample_level=args.sample_level,
                                         epochs=args.epochs,
-                                        lambda_flatness=args.lambda_flatness)
+                                        lambda_flatness=args.lambda_flatness,
+                                        dp_epochs=args.dp_epochs)
     else:
         dp_sat_model = train_with_dp_sat(dp_sat_model, priv_loader,
                                         epsilon=display_epsilon, delta=args.delta,
@@ -434,7 +440,8 @@ if args.compare_others:
                                         quantile=args.quantile,
                                         sample_level=args.sample_level,
                                         epochs=args.epochs,
-                                        lambda_flatness=args.lambda_flatness)
+                                        lambda_flatness=args.lambda_flatness,
+                                        dp_epochs=args.dp_epochs)
         
         # Compute actual achieved epsilon for DP-SAT (should be same as others)
         actual_dp_sat_epsilon = compute_actual_epsilon(
