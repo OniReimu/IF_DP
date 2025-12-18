@@ -42,3 +42,5 @@ DS_Store
 *.log 
 
 saved_models/
+
+cifar-10-batches-py/
