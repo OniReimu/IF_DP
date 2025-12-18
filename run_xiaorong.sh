@@ -26,6 +26,10 @@ CLIP_RADIUS="$3"
 DP_SAT_MODE="$4"
 TAG="$5"
 
+EPOCHS="${IFDP_EPOCHS:-100}"
+K_VALUE="${IFDP_K:-2048}"
+DP_PARAM_COUNT="${IFDP_DP_PARAM_COUNT:-20000}"
+
 MAX_GPUS="${SLURM_GPUS_ON_NODE:-1}"
 GPUS_PER_LAUNCH="${GPUS_PER_LAUNCH:-${MAX_GPUS}}"
 
@@ -56,7 +60,7 @@ RESOURCE_DIR=/scratch/project_462001050/myli/resources/lumi
 SIF=${RESOURCE_DIR}/lumi-pytorch-rocm-6.2.1-python-3.12-pytorch-20240918-vllm-4075b35.sif
 ENV=${RESOURCE_DIR}/ifdp-venv/bin/activate
 
-echo "[$(date --iso-8601=seconds)] Running ${TAG} with eps=${EPSILON}, users=${USERS}, clip=${CLIP_RADIUS}, mode=${DP_SAT_MODE} on CUDA devices {${CUDA_SET}}"
+echo "[$(date --iso-8601=seconds)] Running ${TAG} with eps=${EPSILON}, users=${USERS}, clip=${CLIP_RADIUS}, mode=${DP_SAT_MODE}, epochs=${EPOCHS}, k=${K_VALUE}, dp-param-count=${DP_PARAM_COUNT} on CUDA devices {${CUDA_SET}}"
 
 singularity exec "${SIF}" \
     bash -lc "\$WITH_CONDA && \
@@ -64,11 +68,11 @@ singularity exec "${SIF}" \
         python ablation.py \
             --dataset cifar10 \
             --model-type efficientnet \
-            --k 2048 \
-            --epochs 100 \
+            --k ${K_VALUE} \
+            --epochs ${EPOCHS} \
             --target-epsilon ${EPSILON} \
             --delta 1e-5 \
-            --dp-param-count 20000 \
+            --dp-param-count ${DP_PARAM_COUNT} \
             --clip-radius ${CLIP_RADIUS} \
             --run-mia \
             --users ${USERS} \

@@ -42,6 +42,3 @@ DS_Store
 *.log 
 
 saved_models/
-
-data/*
-!data/*.py
