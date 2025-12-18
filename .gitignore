@@ -41,4 +41,7 @@ DS_Store
 *.ckpt
 *.log 
 
+data/
+!data/*.py
+
 saved_models/
