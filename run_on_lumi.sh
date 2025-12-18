@@ -20,7 +20,7 @@ singularity exec "${SIF}" \
     bash -lc  "\$WITH_CONDA  &&\
         source ${ENV} &&\
         python ablation.py \
-            --dataset  cifar10  \
+
             --model-type efficientnet \
             --k 2048 \
             --epochs 100 \
