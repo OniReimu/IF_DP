@@ -30,6 +30,4 @@ singularity exec "${SIF}" \
             --run-mia \
             --users 100 \
             --calibration-k 200 \
-            --dp-sat-mode fisher \
-            --multi-gpu \
-            --cuda-devices 0,1"
+            --dp-sat-mode fisher"
