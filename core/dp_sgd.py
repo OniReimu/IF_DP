@@ -161,122 +161,121 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Vanilla DP-SGD ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
             features, labels, user_ids = prepare_batch(batch_data, device)
             batch_size = labels.size(0)
-        
-        model.zero_grad()
-        logits = model(features)
-        losses = F.cross_entropy(logits, labels, reduction="none")
-        
-        if sample_level:
-            # SAMPLE-LEVEL DP: Compute per-sample gradients
-            per_g = []
-            for i in range(batch_size):
-                gi = grad(losses[i], params, retain_graph=True)
-                per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
-            per_g = torch.stack(per_g)
+            model.zero_grad()
+            logits = model(features)
+            losses = F.cross_entropy(logits, labels, reduction="none")
             
-            # Adaptive clipping: collect norms from first batch to compute quantile
-            if adaptive_clip and not adaptive_radius_computed:
-                batch_norms = []
-                for i in range(per_g.size(0)):
-                    # Compute Euclidean norm
-                    euclidean_norm = per_g[i].norm().item()
-                    batch_norms.append(euclidean_norm)
-                grad_norm.extend(batch_norms)
+            if sample_level:
+                # SAMPLE-LEVEL DP: Compute per-sample gradients
+                per_g = []
+                for i in range(batch_size):
+                    gi = grad(losses[i], params, retain_graph=True)
+                    per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
+                per_g = torch.stack(per_g)
                 
-                # If we have enough samples or it's a large batch, compute adaptive radius
-                if len(grad_norm) >= 100 or batch_idx == 0:
-                    adaptive_radius = np.quantile(grad_norm, quantile)
-                    actual_radius = adaptive_radius
-                    adaptive_radius_computed = True
-                    
-                    print(f"📊 Vanilla adaptive clipping from {len(grad_norm)} samples:")
-                    print(f"   • Mean: {np.mean(grad_norm):.3f}")
-                    print(f"   • Median: {np.median(grad_norm):.3f}")
-                    print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
-                    print(f"   • Max: {np.max(grad_norm):.3f}")
-                    print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
-                    
-                    grad_norm = []  # Reset for actual training statistics
-            
-            # Vanilla Euclidean clipping for each sample
-            for i in range(per_g.size(0)):
-                norm = per_g[i].norm()
-                if norm > actual_radius:
-                    per_g[i].mul_(actual_radius / norm)
-                grad_norm.append(norm.item())
-            
-            # Average clipped gradients
-            g_bar = per_g.mean(0)
-            
-        else:
-            # USER-LEVEL DP: Compute gradient per user (more robust approach)
-            user_gradients = []
-            unique_users = torch.unique(user_ids) if user_ids is not None else [0]
-            
-            for uid in unique_users:
-                if user_ids is not None:
-                    mask = (user_ids == uid)
-                    user_losses = losses[mask]
-                else:
-                    # If no user_ids (shouldn't happen in user-level mode), treat all as one user
-                    user_losses = losses
-                    mask = torch.ones_like(losses, dtype=torch.bool)
-                
-                # Compute gradient of user's total loss: ∇_θ ∑_{i ∈ user} ℓ(x_i, y_i, θ)
-                user_total_loss = user_losses.sum()
-                user_grad = grad(user_total_loss, params, retain_graph=True)
-                user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
-                user_gradients.append(user_grad_flat)
-                
-                # Adaptive clipping: collect user gradient norms
+                # Adaptive clipping: collect norms from first batch to compute quantile
                 if adaptive_clip and not adaptive_radius_computed:
-                    user_norm = user_grad_flat.norm().item()
-                    grad_norm.append(user_norm)
+                    batch_norms = []
+                    for i in range(per_g.size(0)):
+                        # Compute Euclidean norm
+                        euclidean_norm = per_g[i].norm().item()
+                        batch_norms.append(euclidean_norm)
+                    grad_norm.extend(batch_norms)
                     
-                    # If we have enough users or it's the first batch, compute adaptive radius
-                    if len(grad_norm) >= min(10, len(train_loader)) or batch_idx == 0:
+                    # If we have enough samples or it's a large batch, compute adaptive radius
+                    if len(grad_norm) >= 100 or batch_idx == 0:
                         adaptive_radius = np.quantile(grad_norm, quantile)
                         actual_radius = adaptive_radius
                         adaptive_radius_computed = True
                         
-                        print(f"📊 Vanilla adaptive clipping from {len(grad_norm)} users:")
-                        print(f"   • Mean user grad norm: {np.mean(grad_norm):.3f}")
-                        print(f"   • Median user grad norm: {np.median(grad_norm):.3f}")
+                        print(f"📊 Vanilla adaptive clipping from {len(grad_norm)} samples:")
+                        print(f"   • Mean: {np.mean(grad_norm):.3f}")
+                        print(f"   • Median: {np.median(grad_norm):.3f}")
                         print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
-                        print(f"   • Max user grad norm: {np.max(grad_norm):.3f}")
+                        print(f"   • Max: {np.max(grad_norm):.3f}")
                         print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
                         
                         grad_norm = []  # Reset for actual training statistics
+                
+                # Vanilla Euclidean clipping for each sample
+                for i in range(per_g.size(0)):
+                    norm = per_g[i].norm()
+                    if norm > actual_radius:
+                        per_g[i].mul_(actual_radius / norm)
+                    grad_norm.append(norm.item())
+                
+                # Average clipped gradients
+                g_bar = per_g.mean(0)
+                
+            else:
+                # USER-LEVEL DP: Compute gradient per user (more robust approach)
+                user_gradients = []
+                unique_users = torch.unique(user_ids) if user_ids is not None else [0]
+                
+                for uid in unique_users:
+                    if user_ids is not None:
+                        mask = (user_ids == uid)
+                        user_losses = losses[mask]
+                    else:
+                        # If no user_ids (shouldn't happen in user-level mode), treat all as one user
+                        user_losses = losses
+                        mask = torch.ones_like(losses, dtype=torch.bool)
+                    
+                    # Compute gradient of user's total loss: ∇_θ ∑_{i ∈ user} ℓ(x_i, y_i, θ)
+                    user_total_loss = user_losses.sum()
+                    user_grad = grad(user_total_loss, params, retain_graph=True)
+                    user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
+                    user_gradients.append(user_grad_flat)
+                    
+                    # Adaptive clipping: collect user gradient norms
+                    if adaptive_clip and not adaptive_radius_computed:
+                        user_norm = user_grad_flat.norm().item()
+                        grad_norm.append(user_norm)
+                        
+                        # If we have enough users or it's the first batch, compute adaptive radius
+                        if len(grad_norm) >= min(10, len(train_loader)) or batch_idx == 0:
+                            adaptive_radius = np.quantile(grad_norm, quantile)
+                            actual_radius = adaptive_radius
+                            adaptive_radius_computed = True
+                            
+                            print(f"📊 Vanilla adaptive clipping from {len(grad_norm)} users:")
+                            print(f"   • Mean user grad norm: {np.mean(grad_norm):.3f}")
+                            print(f"   • Median user grad norm: {np.median(grad_norm):.3f}")
+                            print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
+                            print(f"   • Max user grad norm: {np.max(grad_norm):.3f}")
+                            print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
+                            
+                            grad_norm = []  # Reset for actual training statistics
+                
+                # In user-level DP with UserBatchSampler, we should have exactly one user per batch
+                if len(user_gradients) != 1:
+                    print(f"⚠️  Warning: Expected 1 user per batch, got {len(user_gradients)} users")
+                    print(f"   Unique users in batch: {unique_users.tolist()}")
+                
+                # Clip each user's gradient (Euclidean clipping)
+                clipped_user_grads = []
+                for user_grad_flat in user_gradients:
+                    user_norm = user_grad_flat.norm()
+                    if user_norm > actual_radius:
+                        user_grad_flat.mul_(actual_radius / user_norm)
+                    grad_norm.append(user_norm.item())
+                    clipped_user_grads.append(user_grad_flat)
+                
+                # Average across users in batch (should be just one user for UserBatchSampler)
+                g_bar = torch.stack(clipped_user_grads).mean(0)
             
-            # In user-level DP with UserBatchSampler, we should have exactly one user per batch
-            if len(user_gradients) != 1:
-                print(f"⚠️  Warning: Expected 1 user per batch, got {len(user_gradients)} users")
-                print(f"   Unique users in batch: {unique_users.tolist()}")
+            # Add isotropic Gaussian noise
+            iso_noise = torch.randn_like(g_bar) * sigma * actual_radius
+            g_priv = g_bar + iso_noise
+            noise_l2.append(iso_noise.norm().item())
             
-            # Clip each user's gradient (Euclidean clipping)
-            clipped_user_grads = []
-            for user_grad_flat in user_gradients:
-                user_norm = user_grad_flat.norm()
-                if user_norm > actual_radius:
-                    user_grad_flat.mul_(actual_radius / user_norm)
-                grad_norm.append(user_norm.item())
-                clipped_user_grads.append(user_grad_flat)
-            
-            # Average across users in batch (should be just one user for UserBatchSampler)
-            g_bar = torch.stack(clipped_user_grads).mean(0)
-        
-        # Add isotropic Gaussian noise
-        iso_noise = torch.randn_like(g_bar) * sigma * actual_radius
-        g_priv = g_bar + iso_noise
-        noise_l2.append(iso_noise.norm().item())
-        
-        # scatter back to model parameters
-        idx = 0
-        for p in params:
-            n = p.numel()
-            p.grad = g_priv[idx:idx+n].view_as(p)
-            idx += n
-        opt.step()
+            # scatter back to model parameters
+            idx = 0
+            for p in params:
+                n = p.numel()
+                p.grad = g_priv[idx:idx+n].view_as(p)
+                idx += n
+            opt.step()
     
     grad_type = "‖g_user‖₂" if not sample_level else "‖g‖₂"
     print(f"\n📊  Vanilla DP-SGD final stats:")
