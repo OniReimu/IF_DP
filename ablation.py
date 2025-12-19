@@ -1650,8 +1650,9 @@ def main():
     pub_base_calib = Subset(trainset, calib_idx)        # Public calibration (5k)
     priv_base = Subset(trainset, priv_idx)              # Private DP training (5k)
     
-    # For backward compatibility: combine pretrain + calib for baseline training
-    pub_base = Subset(trainset, np.concatenate([pretrain_idx, calib_idx]))  # Combined public (45k)
+    # Baseline pretraining should ONLY use the pretrain split (no overlap with calibration).
+    # Calibration will use pub_base_calib exclusively.
+    pub_base = pub_base_pretrain
     
     # Evaluation: use full testset (no split needed now)
     eval_base = testset  # Full testset for evaluation (10k)
@@ -1670,7 +1671,7 @@ def main():
         priv_loader = DataLoader(priv_base, batch_size=128, shuffle=True)
         priv_ds = None
         # Public loaders (sample-level)
-        pub_loader = DataLoader(pub_base, batch_size=128, shuffle=False)  # Combined for baseline training
+        pub_loader = DataLoader(pub_base, batch_size=128, shuffle=False)  # Pretrain split only (no calibration)
         pub_loader_calib = DataLoader(pub_base_calib, batch_size=128, shuffle=False)  # Small set for calibration
     else:
         print(f'👥 Using USER-level DP ({args.users} synthetic users)')
@@ -1678,7 +1679,7 @@ def main():
         priv_loader = DataLoader(priv_ds, batch_sampler=UserBatchSampler(priv_ds.uid))
         # Public loaders (user-level) - use same synthetic user structure
         pub_ds = SyntheticUserDataset(pub_base, args.users)
-        pub_loader = DataLoader(pub_ds, batch_size=128, shuffle=False)  # Combined for baseline training
+        pub_loader = DataLoader(pub_ds, batch_size=128, shuffle=False)  # Pretrain split only (no calibration)
         pub_ds_calib = SyntheticUserDataset(pub_base_calib, args.users)
         pub_loader_calib = DataLoader(pub_ds_calib, batch_size=128, shuffle=False)  # Small set for calibration
     
