@@ -161,7 +161,53 @@ def load_state_dict_forgiving(model, state_dict, description="model"):
     Load a checkpoint while skipping parameters whose shapes do not match.
     Returns the list of skipped parameter keys.
     """
+    # Normalize common wrapper prefixes to improve compatibility across branches.
+    # Example: older/saber-style wrappers may save EfficientNet under "efficientnet.*"
+    # while this repo wraps torchvision models under "backbone.*".
+    if isinstance(state_dict, dict) and any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k[len("module."):] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+
     model_state = model.state_dict()
+    model_keys = set(model_state.keys())
+
+    def _count_key_matches(sd):
+        return sum(1 for k in sd.keys() if k in model_keys)
+
+    # Try best-effort prefix remaps only when it actually increases key matches.
+    if isinstance(state_dict, dict):
+        base_matches = _count_key_matches(state_dict)
+        candidates = []
+        if any(k.startswith("backbone.") for k in model_keys):
+            candidates.extend(
+                [
+                    ("efficientnet.", "backbone."),
+                    ("resnet.", "backbone."),
+                    ("vit.", "backbone."),
+                ]
+            )
+        best_state = state_dict
+        best_matches = base_matches
+        best_rule = None
+        for src_prefix, dst_prefix in candidates:
+            if not any(k.startswith(src_prefix) for k in state_dict.keys()):
+                continue
+            remapped = {}
+            for k, v in state_dict.items():
+                if k.startswith(src_prefix):
+                    remapped[dst_prefix + k[len(src_prefix) :]] = v
+                else:
+                    remapped[k] = v
+            matches = _count_key_matches(remapped)
+            if matches > best_matches:
+                best_state = remapped
+                best_matches = matches
+                best_rule = (src_prefix, dst_prefix)
+        # Only apply if we meaningfully improve compatibility.
+        if best_rule is not None and best_matches > base_matches:
+            src_prefix, dst_prefix = best_rule
+            print(f"   🔧 Remapped checkpoint keys for {description}: '{src_prefix}*' → '{dst_prefix}*' ({base_matches}→{best_matches} matching keys)")
+            state_dict = best_state
+
     compatible_state = {}
     skipped = []
     for key, value in state_dict.items():
@@ -173,6 +219,8 @@ def load_state_dict_forgiving(model, state_dict, description="model"):
             continue
         compatible_state[key] = value
     model.load_state_dict(compatible_state, strict=False)
+    if not compatible_state and isinstance(state_dict, dict) and len(state_dict) > 0:
+        print(f"   ⚠️  Loaded 0 parameters for {description}. The checkpoint is likely incompatible with this model wrapper/type.")
     if skipped:
         print(f"   ⚠️  Skipped {len(skipped)} incompatible parameters when loading {description}:")
         for name in skipped:
