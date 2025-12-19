@@ -1464,6 +1464,24 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         eval_source = eval_dataset if eval_dataset is not None else getattr(eval_loader, "dataset", None)
         if eval_source is None:
             raise RuntimeError("Evaluation dataset is required for MIA sampling. Ensure dataset builder provides it.")
+        
+        # CRITICAL ASSERTION: Verify that MIA member extraction uses the exact same dataset that models were trained on
+        if not args.sample_level:
+            # For user-level DP, priv_ds must wrap the exact priv_base used for training
+            if priv_ds is None:
+                raise RuntimeError("priv_ds is None in user-level mode. Cannot prepare MIA data.")
+            if not hasattr(priv_ds, 'base'):
+                raise RuntimeError(f"priv_ds ({type(priv_ds)}) does not have 'base' attribute. Expected SyntheticUserDataset.")
+            if priv_ds.base is not priv_base:
+                raise RuntimeError(
+                    f"CRITICAL MIA BUG: priv_ds.base ({id(priv_ds.base)}) is not the same object as priv_base ({id(priv_base)}).\n"
+                    f"This means MIA will extract 'members' from a different dataset than what the models were trained on,\n"
+                    f"leading to incorrect AUC (likely ~0.5 or inverted).\n"
+                    f"priv_ds.base type: {type(priv_ds.base)}, len: {len(priv_ds.base) if hasattr(priv_ds.base, '__len__') else 'N/A'}\n"
+                    f"priv_base type: {type(priv_base)}, len: {len(priv_base) if hasattr(priv_base, '__len__') else 'N/A'}"
+                )
+            print(f"✅ Verified: priv_ds.base is priv_base (same object reference) - MIA data source is correct")
+        
         # Prepare member and non-member datasets
         if args.sample_level:
             print("📊 Sample-level MIA: Using actual private training samples as members")
@@ -1486,7 +1504,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         
         for model_name, model in models_to_evaluate.items():
             print(f"   Evaluating {model_name}...")
-            shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_source)
+            shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_source, shadow_epochs=args.shadow_epochs)
             mia_results[model_name] = {
                 'shadow_auc': shadow_result['auc'],
                 'shadow_acc': shadow_result['accuracy']
@@ -1687,6 +1705,8 @@ def main():
     # MIA evaluation
     parser.add_argument('--run-mia', action='store_true')
     parser.add_argument('--mia-size', type=int, default=1000)
+    parser.add_argument('--shadow-epochs', type=int, default=3,
+                       help='Number of training epochs for each shadow model in MIA attack (default: 3)')
     
     args = parser.parse_args()
     

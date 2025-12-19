@@ -62,8 +62,15 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
 
         transform_train = T.Compose(
             [
-                T.RandomCrop(32, padding=4),
-                T.RandomHorizontalFlip(),
+                # Data augmentation disabled for MIA evaluation consistency:
+                # - RandomCrop/Flip introduce stochasticity that reduces memorization signal,
+                #   making membership inference attacks less meaningful (AUC → 0.5)
+                # - Deterministic transforms ensure fair MIA evaluation: members and non-members
+                #   are evaluated under identical preprocessing conditions
+                # - Matches reference implementation for reproducibility
+                # To re-enable augmentation for utility-focused experiments, uncomment below:
+                # T.RandomCrop(32, padding=4),
+                # T.RandomHorizontalFlip(),
                 T.ToTensor(),
                 T.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
             ]

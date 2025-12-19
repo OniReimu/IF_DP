@@ -130,6 +130,18 @@ This repository implements **Option 1: Frozen Backbone + DP Finetuning** to prov
 
 **Note**: This treats most of the training set as "public" for simulation purposes. In real applications, public data would come from a genuinely public source (e.g., ImageNet pretraining, web-scraped images, etc.).
 
+### Data Preprocessing
+
+**Data augmentation is disabled** (no RandomCrop, RandomHorizontalFlip) for the following reasons:
+
+1. **MIA Evaluation Consistency**: Random augmentation introduces stochasticity that reduces memorization signal, making membership inference attacks less meaningful. With augmentation, models show lower memorization (AUC → 0.5), which obscures privacy-utility tradeoffs.
+
+2. **Fair Comparison**: Deterministic transforms ensure that members and non-members are evaluated under identical preprocessing conditions during MIA evaluation, providing fair and interpretable privacy metrics.
+
+3. **Reproducibility**: Matches the reference implementation for consistent baseline comparisons.
+
+**Note**: Data augmentation can be re-enabled in `data/vision.py` for utility-focused experiments where MIA evaluation is not the primary concern. Augmentation does not affect DP guarantees (DP is closed under post-processing), but it does impact the interpretability of privacy evaluation.
+
 ### Why This Approach?
 
 Computing Fisher information matrices for all parameters is computationally expensive. By:

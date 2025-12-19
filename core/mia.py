@@ -286,12 +286,13 @@ def validate_and_clean_features(features, labels, name="features"):
     
     return features, labels
 
-def shadow_model_attack(target_model, member_loader, non_member_loader, train_data, device, eval_data=None):
+def shadow_model_attack(target_model, member_loader, non_member_loader, train_data, device, eval_data=None, shadow_epochs=3):
     """
     Shokri et al. shadow model attack.
     Uses shadow models to learn attack patterns.
     train_data: The actual training data used for the target model (priv_base)
     eval_data: The evaluation data used for target non-members (eval_base)
+    shadow_epochs: Number of training epochs for each shadow model (default: 3)
     """
     
     # Prepare shadow training data from the actual training data
@@ -316,7 +317,7 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
         print(f"⚠️  Shadow attack: Using train_data for non-members (may be inaccurate)")
     
     # Train shadow models
-    shadow_models = train_shadow_models(shadow_trainset, target_model, num_shadows=3, epochs=3, device=device)
+    shadow_models = train_shadow_models(shadow_trainset, target_model, num_shadows=3, epochs=shadow_epochs, device=device)
     
     # Generate attack training data using shadow models
     shadow_features = []
@@ -442,7 +443,7 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
 
 def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, eval_data, 
                                 private_indices, priv_ds, num_users, 
-                                mia_size, sample_level, device, vanilla_dp_model=None, dp_sat_model=None, l2_baseline_model=None):
+                                mia_size, sample_level, device, vanilla_dp_model=None, dp_sat_model=None, l2_baseline_model=None, shadow_epochs=3):
     """Evaluate membership inference attacks on baseline, Fisher DP, and optionally Vanilla DP & DP-SAT models
     
     Args:
@@ -515,22 +516,22 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         print(f"\n🕶️  SHADOW MODEL ATTACK (Run {run_idx + 1}/{num_runs})")
         print("-" * 40)
         
-        baseline_shadow = shadow_model_attack(baseline_model, member_loader, non_member_loader, train_data, device, eval_data)
-        fisher_shadow = shadow_model_attack(fisher_dp_model, member_loader, non_member_loader, train_data, device, eval_data)
+        baseline_shadow = shadow_model_attack(baseline_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
+        fisher_shadow = shadow_model_attack(fisher_dp_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
         
         all_results['baseline']['shadow'].append(baseline_shadow['auc'])
         all_results['fisher_dp']['shadow'].append(fisher_shadow['auc'])
         
         if l2_baseline_model is not None:
-            l2_baseline_shadow = shadow_model_attack(l2_baseline_model, member_loader, non_member_loader, train_data, device, eval_data)
+            l2_baseline_shadow = shadow_model_attack(l2_baseline_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
             all_results['l2_baseline']['shadow'].append(l2_baseline_shadow['auc'])
         
         if vanilla_dp_model is not None:
-            vanilla_shadow = shadow_model_attack(vanilla_dp_model, member_loader, non_member_loader, train_data, device, eval_data)
+            vanilla_shadow = shadow_model_attack(vanilla_dp_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
             all_results['vanilla_dp']['shadow'].append(vanilla_shadow['auc'])
         
         if dp_sat_model is not None:
-            dp_sat_shadow = shadow_model_attack(dp_sat_model, member_loader, non_member_loader, train_data, device, eval_data)
+            dp_sat_shadow = shadow_model_attack(dp_sat_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
             all_results['dp_sat']['shadow'].append(dp_sat_shadow['auc'])
     
     # Statistical analysis of results
