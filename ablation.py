@@ -1190,7 +1190,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         sample_level=args.sample_level,
         epochs=args.epochs,
         rho_sat=args.rho_sat,  # Use consistent perturbation radius
-        dp_param_count=args.dp_param_count
+        dp_param_count=args.dp_param_count,
+        dp_epochs=args.dp_epochs
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1219,7 +1220,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         positive_noise_correlation=args.positive_noise_correlation,
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
         precomputed_U=U,
-        dp_param_count=args.dp_param_count
+        dp_param_count=args.dp_param_count,
+        dp_epochs=args.dp_epochs
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1256,7 +1258,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         positive_noise_correlation=args.positive_noise_correlation,
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
         precomputed_U=U,
-        dp_param_count=args.dp_param_count
+        dp_param_count=args.dp_param_count,
+        dp_epochs=args.dp_epochs
     )
     
     # Get critical slice using EVALUATION data (eval_loader) for the slice-gradient
