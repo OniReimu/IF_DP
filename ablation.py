@@ -1884,7 +1884,9 @@ def main():
                        choices=['linear', 'public-fisher'],
                        help='Calibration method: linear (fast regularization) or public-fisher (uses public data Fisher matrix)')
     parser.add_argument('--calibration-subset', type=int, default=5000,
-                       help='Number of public samples used to build the calibration loader')
+                       help='[DEPRECATED] Number of public samples used to build the calibration loader. '
+                            'Not used in standard setup: dataset builders provide a separate calibration loader '
+                            'with zero overlap from pretraining data. Only used as fallback if calibration loader is missing.')
     parser.add_argument('--calibration-k', type=int, default=100,
                        help='Number of top-k samples to use for calibration')
     parser.add_argument('--trust-tau', type=float, default=0.005,
