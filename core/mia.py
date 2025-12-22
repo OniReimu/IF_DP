@@ -19,6 +19,15 @@ from sklearn.metrics import roc_auc_score, accuracy_score, precision_recall_curv
 from data.common import prepare_batch
 from models.model import CNN
 
+def auc_star(auc: float) -> float:
+    """Sign-invariant attack strength: attacker can flip score direction."""
+    return float(max(auc, 1.0 - auc))
+
+
+def auc_advantage(auc: float) -> float:
+    """Membership advantage over random guessing (0.0 is best)."""
+    return float(abs(auc - 0.5))
+
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -204,7 +213,7 @@ def train_shadow_models(shadow_trainset, target_model, num_shadows=3, epochs=5, 
         
         # Train shadow model
         shadow_model.train()
-        for epoch in range(epochs):
+        for epoch in tqdm(range(epochs), desc=f"  Shadow {i+1}/{num_shadows} epochs", leave=False):
             for batch_data in shadow_loader:
                 features, labels, _ = prepare_batch(batch_data, device)
                 optimizer.zero_grad()
@@ -317,6 +326,7 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
         print(f"⚠️  Shadow attack: Using train_data for non-members (may be inaccurate)")
     
     # Train shadow models
+    print(f"   🔧 Training {3} shadow models with {shadow_epochs} epochs each...")
     shadow_models = train_shadow_models(shadow_trainset, target_model, num_shadows=3, epochs=shadow_epochs, device=device)
     
     # Generate attack training data using shadow models
@@ -342,7 +352,8 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
             shadow_labels.extend([0] * len(non_member_features))  # Non-members
     
     if not shadow_features:
-        return {'auc': 0.5, 'accuracy': 0.5}
+        base = 0.5
+        return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5}
     
     # Combine all shadow training data
     X_shadow = np.vstack(shadow_features)
@@ -352,18 +363,21 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
     X_shadow, y_shadow = validate_and_clean_features(X_shadow, y_shadow, "shadow training data")
     
     if len(X_shadow) < 10:  # Need minimum samples for training
-        return {'auc': 0.5, 'accuracy': 0.5, 'shadow_auc': 0.5}
+        base = 0.5
+        return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
     # Check class balance
     unique_labels, label_counts = np.unique(y_shadow, return_counts=True)
     
     if len(unique_labels) < 2:
-        return {'auc': 0.5, 'accuracy': 0.5, 'shadow_auc': 0.5}
+        base = 0.5
+        return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
     # Ensure minimum samples per class
     min_class_size = min(label_counts)
     if min_class_size < 5:
-        return {'auc': 0.5, 'accuracy': 0.5, 'shadow_auc': 0.5}
+        base = 0.5
+        return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
     # Train attack classifier
     from sklearn.linear_model import LogisticRegression
@@ -397,14 +411,16 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
         shadow_auc = roc_auc_score(y_test, shadow_predictions)
         
     except Exception as e:
-        return {'auc': 0.5, 'accuracy': 0.5, 'shadow_auc': 0.5}
+        base = 0.5
+        return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
     # Extract features from target model for actual attack
     target_member_features = extract_attack_features(target_model, member_loader, device)
     target_non_member_features = extract_attack_features(target_model, non_member_loader, device)
     
     if target_member_features.size == 0 or target_non_member_features.size == 0:
-        return {'auc': 0.5, 'accuracy': 0.5, 'shadow_auc': shadow_auc}
+        base = 0.5
+        return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': shadow_auc}
     
     # Create target attack dataset
     X_target = np.vstack([target_member_features, target_non_member_features])
@@ -427,10 +443,13 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
         attack_accuracy = accuracy_score(y_target, target_predictions)
         
     except Exception as e:
-        return {'auc': 0.5, 'accuracy': 0.5, 'shadow_auc': shadow_auc}
+        base = 0.5
+        return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': shadow_auc}
     
     return {
         'auc': auc_score,
+        'auc_star': auc_star(auc_score),
+        'adv': auc_advantage(auc_score),
         'accuracy': attack_accuracy,
         'shadow_auc': shadow_auc,
         'n_shadow_samples': len(X_shadow),

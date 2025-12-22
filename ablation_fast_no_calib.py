@@ -11,6 +11,7 @@ import os, glob, argparse, copy, math, sys
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
+from typing import List, Optional
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
@@ -1397,65 +1398,9 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     if args.run_mia:
         print(f"\n🛡️  Running MIA evaluation on core ablation variants (no calibration models)...")
         
-        # Prepare all models for MIA evaluation
-        # Optional non-DP comparator (trained on private data WITHOUT DP) for AUC reference
-        non_dp_scope = "private"
-        non_dp_path = build_pretrain_cache_path(
-            models_dir=models_dir,
-            dataset_name=args.dataset_name,
-            model_type=args.model_type,
-            epochs=args.epochs,
-            scope=non_dp_scope,
-        )
-        legacy_non_dp_path = os.path.join(models_dir, f"Pretrain_{args.model_type}_{args.epochs}_{non_dp_scope}.pth")
-        non_dp_private = build_model_for_device(args.model_type, model_kwargs, args, device)
-        if os.path.exists(non_dp_path):
-            print(f"\n💾 Loading cached NON-DP private comparator: {non_dp_path}")
-            comparator_state = safe_torch_load(non_dp_path, map_location=device)
-            ck_dataset = comparator_state.get("dataset_name") if isinstance(comparator_state, dict) else None
-            if ck_dataset is not None and ck_dataset != args.dataset_name:
-                print(f"   ⚠️  Cache dataset mismatch: checkpoint={ck_dataset} vs requested={args.dataset_name}. Retraining comparator.")
-            else:
-                if isinstance(comparator_state, dict) and 'model_state_dict' in comparator_state:
-                    comparator_state = comparator_state['model_state_dict']
-                load_state_dict_forgiving(non_dp_private, comparator_state, description="NON-DP comparator")
-                comparator_state = None
-        elif os.path.exists(legacy_non_dp_path):
-            print(f"\n💾 Found legacy NON-DP private comparator cache: {legacy_non_dp_path}")
-            comparator_state = safe_torch_load(legacy_non_dp_path, map_location=device)
-            legacy_dataset = comparator_state.get("dataset_name") if isinstance(comparator_state, dict) else None
-            if legacy_dataset is None:
-                print("   ⚠️  Legacy comparator cache has no dataset metadata; skipping to avoid cross-dataset reuse.")
-            elif legacy_dataset != args.dataset_name:
-                print(f"   ⚠️  Legacy comparator cache dataset mismatch: checkpoint={legacy_dataset} vs requested={args.dataset_name}. Skipping.")
-            else:
-                if isinstance(comparator_state, dict) and 'model_state_dict' in comparator_state:
-                    comparator_state = comparator_state['model_state_dict']
-                load_state_dict_forgiving(non_dp_private, comparator_state, description="NON-DP comparator (legacy cache)")
-                comparator_state = None
-        else:
-            print("\n⚠️  Training NON-DP comparator on PRIVATE data for AUC reference (not DP-safe)...")
-            opt_non_dp = torch.optim.SGD(non_dp_private.parameters(), lr=1e-3, momentum=.9)
-            for epoch in tqdm(range(args.epochs), desc="Training NON-DP private comparator"):
-                non_dp_private.train()
-                for batch_data in priv_loader:
-                    features, labels, _ = prepare_batch(batch_data, device)
-                    opt_non_dp.zero_grad()
-                    F.cross_entropy(non_dp_private(features), labels).backward()
-                    opt_non_dp.step()
-            torch.save({
-                "model_state_dict": non_dp_private.state_dict(),
-                "model_type": args.model_type,
-                "dataset_name": args.dataset_name,
-                "epochs": args.epochs,
-                "scope": non_dp_scope,
-                "timestamp": __import__("time").strftime("%Y%m%d_%H%M%S"),
-            }, non_dp_path)
-            print(f"✅ Saved NON-DP private comparator to {non_dp_path}")
-
+        # Prepare all models for MIA evaluation (no non-DP private comparator).
         models_to_evaluate = {
             'Baseline (Public Only)': baseline,  # strictly public-pretrained
-            'Non-DP (Private, not DP-safe)': non_dp_private,  # reference AUC > 0.5 expected
             'Vanilla DP-SGD': vanilla_dp_model,
             'Vanilla DP-SGD + DP-SAT': vanilla_dpsat_model,
             'Fisher DP + Normal': fisher_normal_model,
@@ -1508,9 +1453,15 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_source, shadow_epochs=args.shadow_epochs)
             mia_results[model_name] = {
                 'shadow_auc': shadow_result['auc'],
+                'shadow_auc_star': shadow_result.get('auc_star', max(shadow_result['auc'], 1.0 - shadow_result['auc'])),
+                'shadow_adv': shadow_result.get('adv', abs(shadow_result['auc'] - 0.5)),
                 'shadow_acc': shadow_result['accuracy']
             }
-            print(f"     • AUC: {shadow_result['auc']:.4f}, Accuracy: {shadow_result['accuracy']:.4f}")
+            print(
+                f"     • AUC: {shadow_result['auc']:.4f} "
+                f"(AUC*: {mia_results[model_name]['shadow_auc_star']:.4f}, |AUC-0.5|: {mia_results[model_name]['shadow_adv']:.4f}), "
+                f"Accuracy: {shadow_result['accuracy']:.4f}"
+            )
         
         # Comprehensive analysis
         print(f"\n📊 COMPREHENSIVE MIA ANALYSIS")
@@ -1518,25 +1469,38 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         
         # Use shadow attack AUC directly (no need for worst-case since we only have one attack)
         shadow_aucs = {}
+        shadow_auc_stars = {}
+        shadow_advs = {}
         for model_name in models_to_evaluate.keys():
             shadow_aucs[model_name] = mia_results[model_name]['shadow_auc']
+            shadow_auc_stars[model_name] = mia_results[model_name]['shadow_auc_star']
+            shadow_advs[model_name] = mia_results[model_name]['shadow_adv']
         
         print(f"\n🎯 Shadow Attack AUC Comparison:")
         for model_name, auc in shadow_aucs.items():
             print(f"   • {model_name:30}: {auc:.4f}")
+
+        print(f"\n🎯 Shadow Attack AUC* (sign-invariant) Comparison:")
+        for model_name, aucs in shadow_auc_stars.items():
+            print(f"   • {model_name:30}: {aucs:.4f}")
+        print(f"\n🎯 Shadow Attack Advantage |AUC-0.5| (lower is better):")
+        for model_name, adv in shadow_advs.items():
+            print(f"   • {model_name:30}: {adv:.4f}")
         
         # Identify best and worst models for privacy
-        best_privacy_model = min(shadow_aucs.items(), key=lambda x: x[1])
-        worst_privacy_model = max(shadow_aucs.items(), key=lambda x: x[1])
+        best_privacy_model = min(shadow_auc_stars.items(), key=lambda x: x[1])
+        worst_privacy_model = max(shadow_auc_stars.items(), key=lambda x: x[1])
         
         print(f"\n🏆 Privacy Protection Ranking:")
-        print(f"   🥇 BEST:  {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
-        print(f"   🥴 WORST: {worst_privacy_model[0]} (AUC: {worst_privacy_model[1]:.4f})")
+        print(f"   🥇 BEST:  {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
+        print(f"   🥴 WORST: {worst_privacy_model[0]} (AUC*: {worst_privacy_model[1]:.4f})")
         
         # Privacy vs Accuracy tradeoff analysis
         print(f"\n⚖️  Privacy vs Accuracy Tradeoff:")
-        print(f"   Model                          Accuracy  Privacy (1-AUC)")
-        print(f"   {'─'*30} ─────────  ──────────────")
+        print(f"   Model                          Accuracy  AttackAUC*  |AUC-0.5|")
+        print(f"   {'─'*30} ─────────  ─────────  ─────────")
+        # Baseline row: show placeholder for attack metrics (not applicable as DP comparator)
+        print(f"   {'Baseline (Public Only)':30} {baseline_acc:5.1f}%     {'-':>7}    {'-':>7}")
         for model_name in ['Vanilla DP-SGD', 'Vanilla DP-SGD + DP-SAT', 'Fisher DP + Normal', 'Fisher DP + DP-SAT']:
             if model_name == 'Vanilla DP-SGD':
                 acc = vanilla_dp_acc
@@ -1546,29 +1510,29 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
                 acc = fisher_normal_acc
             else:  # Fisher DP + DP-SAT
                 acc = fisher_dpsat_acc
-            
-            privacy_score = 1.0 - shadow_aucs[model_name]  # Higher is better
-            print(f"   {model_name:30} {acc:5.1f}%     {privacy_score:.3f}")
+
+            aucs = shadow_auc_stars[model_name]
+            adv = shadow_advs[model_name]
+            print(f"   {model_name:30} {acc:5.1f}%     {aucs:.4f}    {adv:.4f}")
         
         # Key comparisons only
         print(f"\n🔒 Key Privacy Effects:")
         
-        fisher_normal_auc = shadow_aucs['Fisher DP + Normal']
-        fisher_dpsat_auc = shadow_aucs['Fisher DP + DP-SAT']
+        fisher_normal_auc_star = shadow_auc_stars['Fisher DP + Normal']
+        fisher_dpsat_auc_star = shadow_auc_stars['Fisher DP + DP-SAT']
         
-        dpsat_privacy_effect = fisher_normal_auc - fisher_dpsat_auc
+        dpsat_privacy_effect = fisher_normal_auc_star - fisher_dpsat_auc_star
         
-        print(f"   • DP-SAT effect:      {dpsat_privacy_effect:+.4f} AUC")
+        print(f"   • DP-SAT effect:      {dpsat_privacy_effect:+.4f} AUC*")
         
         # Final recommendation
-        print(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC: {best_privacy_model[1]:.4f})")
-        non_dp_private_auc = shadow_aucs.get('Non-DP (Private, not DP-safe)', None)
-        if non_dp_private_auc is not None:
-            print(f"   • Non-DP private comparator AUC: {non_dp_private_auc:.4f} (expected >0.5, not DP-safe)")
+        print(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
         
         # Store results for return
         ablation_results['mia_results'] = {
             'shadow_aucs': shadow_aucs,
+            'shadow_auc_stars': shadow_auc_stars,
+            'shadow_advs': shadow_advs,
             'best_privacy_model': best_privacy_model,
             'detailed_results': mia_results,
             'privacy_effects': {
@@ -1577,8 +1541,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         }
         
         # Update legacy fields for compatibility
-        ablation_results['mia_results']['fisher_worst_auc'] = fisher_normal_auc
-        ablation_results['mia_results']['dp_sat_worst_auc'] = fisher_dpsat_auc
+        ablation_results['mia_results']['fisher_worst_auc'] = fisher_normal_auc_star
+        ablation_results['mia_results']['dp_sat_worst_auc'] = fisher_dpsat_auc_star
         
         print(f"\n✅ MIA evaluation complete! (Shadow attack only)")
 
@@ -1608,6 +1572,14 @@ def main():
                        help='Number of private samples to draw from the dataset (default: 5k, matching legacy ablation)')
     parser.add_argument('--public-ratio', type=float, default=1.0,
                        help='Fraction of the remaining training data reserved for the public split (default: all remaining samples)')
+    parser.add_argument(
+        '--public-pretrain-exclude-classes',
+        type=str,
+        default="",
+        help='Comma-separated class indices to exclude from PUBLIC PRETRAIN only (non-IID simulation). '
+             'Any excluded-class samples removed from public pretrain are moved into the private split; '
+             'calibration and evaluation remain unchanged. Example: "0,1". Default: empty.',
+    )
     parser.add_argument('--batch-size', type=int, default=128,
                        help='Mini-batch size for private/public loaders')
     parser.add_argument('--eval-batch-size', type=int, default=256,
@@ -1763,6 +1735,15 @@ def main():
         raise ValueError(f"Dataset '{args.dataset_name}' did not specify num_labels; cannot build model.")
     model_kwargs = {'num_labels': dataset_num_labels}
     label_mapping = dataset_builder.get_label_mapping()
+    def _parse_excluded_classes(spec: str) -> Optional[List[int]]:
+        spec = (spec or "").strip()
+        if not spec:
+            return None
+        parts = [p.strip() for p in spec.split(",") if p.strip()]
+        if not parts:
+            return None
+        return [int(p) for p in parts]
+
     dataset_config = DatasetConfig(
         dataset_root=dataset_root,
         allow_download=allow_download,
@@ -1775,6 +1756,7 @@ def main():
         critical_label=args.critical_label,
         tokenizer_name=args.tokenizer_name,
         max_seq_length=args.max_seq_length,
+        public_pretrain_exclude_classes=_parse_excluded_classes(args.public_pretrain_exclude_classes),
         seed=get_random_seed(),
     )
     loaders = dataset_builder.build(dataset_config)

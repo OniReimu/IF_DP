@@ -62,15 +62,8 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
 
         transform_train = T.Compose(
             [
-                # Data augmentation disabled for MIA evaluation consistency:
-                # - RandomCrop/Flip introduce stochasticity that reduces memorization signal,
-                #   making membership inference attacks less meaningful (AUC → 0.5)
-                # - Deterministic transforms ensure fair MIA evaluation: members and non-members
-                #   are evaluated under identical preprocessing conditions
-                # - Matches reference implementation for reproducibility
-                # To re-enable augmentation for utility-focused experiments, uncomment below:
-                # T.RandomCrop(32, padding=4),
-                # T.RandomHorizontalFlip(),
+                T.RandomCrop(32, padding=4),
+                T.RandomHorizontalFlip(),
                 T.ToTensor(),
                 T.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
             ]
@@ -104,6 +97,53 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
             config.public_ratio,
             config.seed,
         )
+        # Optional non-IID simulation:
+        # - Exclude some class labels from PUBLIC PRETRAIN only
+        # - Move the removed public-pretrain samples into PRIVATE
+        # - Calibration and evaluation remain unchanged
+        exclude = getattr(config, "public_pretrain_exclude_classes", None)
+        if exclude:
+            exclude_set = {int(x) for x in exclude}
+            targets = getattr(trainset, "targets", None)
+            if targets is None:
+                targets = getattr(trainset, "labels", None)
+            if targets is None:
+                raise RuntimeError(
+                    "public_pretrain_exclude_classes requested, but dataset has no 'targets'/'labels' attribute."
+                )
+            targets_arr = np.asarray(targets, dtype=int)
+
+            pub_idx_arr = np.asarray(pub_idx, dtype=int)
+            priv_idx_arr = np.asarray(priv_idx, dtype=int)
+            calib_idx_arr = np.asarray(calib_idx, dtype=int)
+
+            pub_targets = targets_arr[pub_idx_arr]
+            remove_mask = np.isin(pub_targets, list(exclude_set))
+            removed_from_public = pub_idx_arr[remove_mask]
+            pub_idx_filtered = pub_idx_arr[~remove_mask]
+
+            # Move removed public samples into private (private size increases).
+            if removed_from_public.size > 0:
+                priv_idx_arr = np.concatenate([priv_idx_arr, removed_from_public.astype(int)], axis=0)
+
+            def _count_for(indices: np.ndarray, cls: int) -> int:
+                if indices.size == 0:
+                    return 0
+                return int(np.sum(targets_arr[indices] == int(cls)))
+
+            print("\n🧪 Non-IID simulation: exclude classes from public pretrain and move to private")
+            print(f"   • Excluded classes: {sorted(exclude_set)}")
+            print(f"   • Public pretrain size: {len(pub_idx_arr)} -> {len(pub_idx_filtered)} (moved {len(removed_from_public)})")
+            print(f"   • Private size: {len(priv_idx)} -> {len(priv_idx_arr)} (calibration unchanged: {len(calib_idx_arr)})")
+            for cls in sorted(exclude_set):
+                print(
+                    f"   • class {cls}: public={_count_for(pub_idx_filtered, cls)} "
+                    f"private={_count_for(priv_idx_arr, cls)} calib={_count_for(calib_idx_arr, cls)}"
+                )
+
+            # Replace indices with our non-IID construction.
+            priv_idx = priv_idx_arr
+            pub_idx = pub_idx_filtered
         private_subset = Subset(trainset, priv_idx.tolist())
         public_subset = Subset(trainset, pub_idx.tolist())
         calibration_subset = Subset(trainset, calib_idx.tolist())

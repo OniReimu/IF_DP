@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -24,6 +24,9 @@ class DatasetConfig:
     critical_label: Optional[int] = None
     tokenizer_name: str = "bert-base-uncased"
     max_seq_length: int = 512
+    # Optional non-IID simulation: exclude specific class labels from the public pretrain split only.
+    # Private/calibration/evaluation splits remain unchanged.
+    public_pretrain_exclude_classes: Optional[Sequence[int]] = None
     seed: int = 0
 
 
