@@ -548,6 +548,47 @@ def accuracy(model, loader, device):
             tot += labels.size(0)
     return 100*correct/tot
 
+def accuracy_by_class_groups(model, loader, device, excluded_classes=None):
+    """
+    Compute accuracy grouped by excluded classes (e.g., 0/1) vs the rest.
+    Returns: (overall_acc, excluded_acc, rest_acc, excluded_count, rest_count)
+    """
+    if not excluded_classes:
+        overall = accuracy(model, loader, device)
+        return overall, None, None, 0, 0
+
+    excluded_set = set(excluded_classes)
+    model.eval()
+    tot = correct = 0
+    excluded_tot = excluded_correct = 0
+    rest_tot = rest_correct = 0
+
+    with torch.no_grad():
+        for batch_data in loader:
+            features, labels, _ = prepare_batch(batch_data, device)
+            preds = model(features).argmax(1)
+
+            correct += (preds == labels).sum().item()
+            tot += labels.size(0)
+
+            for i in range(labels.size(0)):
+                label = labels[i].item()
+                is_correct = (preds[i] == labels[i]).item()
+                if label in excluded_set:
+                    excluded_tot += 1
+                    if is_correct:
+                        excluded_correct += 1
+                else:
+                    rest_tot += 1
+                    if is_correct:
+                        rest_correct += 1
+
+    overall_acc = 100 * correct / tot if tot > 0 else 0.0
+    excluded_acc = 100 * excluded_correct / excluded_tot if excluded_tot > 0 else None
+    rest_acc = 100 * rest_correct / rest_tot if rest_tot > 0 else None
+
+    return overall_acc, excluded_acc, rest_acc, excluded_tot, rest_tot
+
 # ════════════════════════════════════════════════════════════════
 # ABLATION: Fisher DP-SGD with Optional DP-SAT Optimization
 # ════════════════════════════════════════════════════════════════
@@ -1267,12 +1308,35 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     print("📊 FAST ABLATION STUDY RESULTS")
     print(f"{'='*70}")
     
-    # Compute accuracies
+    # Get excluded classes for per-class accuracy reporting
+    excluded_classes = None
+    if hasattr(args, 'public_pretrain_exclude_classes') and args.public_pretrain_exclude_classes:
+        spec = args.public_pretrain_exclude_classes.strip()
+        if spec:
+            parts = [p.strip() for p in spec.split(",") if p.strip()]
+            if parts:
+                excluded_classes = [int(p) for p in parts]
+
+    # Compute overall accuracies
     baseline_acc = accuracy(baseline, eval_loader, device)
     vanilla_dp_acc = accuracy(vanilla_dp_model, eval_loader, device)
     vanilla_dpsat_acc = accuracy(vanilla_dpsat_model, eval_loader, device)
     fisher_normal_acc = accuracy(fisher_normal_model, eval_loader, device)
     fisher_dpsat_acc = accuracy(fisher_dpsat_model, eval_loader, device)
+
+    # Compute per-class accuracies if excluded classes are specified
+    baseline_excl = baseline_rest = None
+    vanilla_dp_excl = vanilla_dp_rest = None
+    vanilla_dpsat_excl = vanilla_dpsat_rest = None
+    fisher_normal_excl = fisher_normal_rest = None
+    fisher_dpsat_excl = fisher_dpsat_rest = None
+
+    if excluded_classes:
+        _, baseline_excl, baseline_rest, _, _ = accuracy_by_class_groups(baseline, eval_loader, device, excluded_classes)
+        _, vanilla_dp_excl, vanilla_dp_rest, _, _ = accuracy_by_class_groups(vanilla_dp_model, eval_loader, device, excluded_classes)
+        _, vanilla_dpsat_excl, vanilla_dpsat_rest, _, _ = accuracy_by_class_groups(vanilla_dpsat_model, eval_loader, device, excluded_classes)
+        _, fisher_normal_excl, fisher_normal_rest, _, _ = accuracy_by_class_groups(fisher_normal_model, eval_loader, device, excluded_classes)
+        _, fisher_dpsat_excl, fisher_dpsat_rest, _, _ = accuracy_by_class_groups(fisher_dpsat_model, eval_loader, device, excluded_classes)
     
     ablation_results['baseline'] = baseline_acc
     ablation_results['vanilla_dp'] = vanilla_dp_acc
@@ -1282,11 +1346,18 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     
     dp_mode = "Sample-level" if args.sample_level else f"User-level ({args.users} users)"
     print(f"\n🎯 Accuracy Comparison ({dp_mode} DP):")
-    print(f"   • Baseline (Public Only)          : {baseline_acc:6.2f}%")
-    print(f"   • Vanilla DP-SGD                  : {vanilla_dp_acc:6.2f}%")
-    print(f"   • Vanilla DP-SGD + DP-SAT          : {vanilla_dpsat_acc:6.2f}%")
-    print(f"   • Fisher DP + Normal              : {fisher_normal_acc:6.2f}%")
-    print(f"   • Fisher DP + DP-SAT              : {fisher_dpsat_acc:6.2f}%")
+
+    def _fmt(overall, excl, rest):
+        if excluded_classes and excl is not None and rest is not None:
+            excl_str = ",".join(map(str, sorted(excluded_classes)))
+            return f"{overall:6.2f}% (excluded {excl_str}: {excl:5.2f}%, rest: {rest:5.2f}%)"
+        return f"{overall:6.2f}%"
+
+    print(f"   • Baseline (Public Only)          : {_fmt(baseline_acc, baseline_excl, baseline_rest)}")
+    print(f"   • Vanilla DP-SGD                  : {_fmt(vanilla_dp_acc, vanilla_dp_excl, vanilla_dp_rest)}")
+    print(f"   • Vanilla DP-SGD + DP-SAT          : {_fmt(vanilla_dpsat_acc, vanilla_dpsat_excl, vanilla_dpsat_rest)}")
+    print(f"   • Fisher DP + Normal              : {_fmt(fisher_normal_acc, fisher_normal_excl, fisher_normal_rest)}")
+    print(f"   • Fisher DP + DP-SAT              : {_fmt(fisher_dpsat_acc, fisher_dpsat_excl, fisher_dpsat_rest)}")
     
     # Compute improvements
     vanilla_dp_improvement = vanilla_dp_acc - baseline_acc

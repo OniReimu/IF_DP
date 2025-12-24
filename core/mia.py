@@ -23,7 +23,6 @@ def auc_star(auc: float) -> float:
     """Sign-invariant attack strength: attacker can flip score direction."""
     return float(max(auc, 1.0 - auc))
 
-
 def auc_advantage(auc: float) -> float:
     """Membership advantage over random guessing (0.0 is best)."""
     return float(abs(auc - 0.5))
