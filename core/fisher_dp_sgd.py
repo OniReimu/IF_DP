@@ -37,36 +37,53 @@ def compute_fisher(model, dataloader, device,
         # stricter prefix match to avoid accidental substring matches
         return name.startswith(layer)
     if dp_param_count is not None:
-        # DP parameter budget mode: smart selection to maximize parameter usage
-        print(f"🎯 computing Fisher for up to {dp_param_count} parameters")
+        # DP parameter budget mode: prioritize classifier/head parameters first, then fill by order.
+        print(f"🎯 computing Fisher for up to {dp_param_count} parameters (head-first)")
         all_params = list(model.named_parameters())
-        
-        # Build list of (name, param, size, index) for knapsack optimization
-        param_info = [(name, param, param.numel(), idx) 
-                      for idx, (name, param) in enumerate(all_params)]
-        
-        # Greedy knapsack: select parameters that fit within budget
+        # Build list with head-first priority
+        def _is_head_param(param_name: str) -> bool:
+            parts = param_name.split(".")
+            head_parts = {"classifier", "fc", "head", "lm_head", "score", "output"}
+            return any(p in head_parts for p in parts)
+
+        param_info = []
+        for idx, (name, param) in enumerate(all_params):
+            size = int(param.numel())
+            priority = 1 if _is_head_param(name) else 0
+            param_info.append((priority, idx, name, param, size))
+        param_info.sort(key=lambda x: (-x[0], x[1]))
+
+        # Greedy knapsack
         selected_indices = []
         total_selected = 0
-        
-        for name, param, size, idx in param_info:
+        head_selected = 0
+        head_total_params = sum(size for prio, _, _, _, size in param_info if prio == 1)
+        head_min_tensor = min([size for prio, _, _, _, size in param_info if prio == 1] or [0])
+
+        for priority, idx, name, param, size in param_info:
             if total_selected + size <= dp_param_count:
                 selected_indices.append(idx)
                 total_selected += size
+                if priority == 1:
+                    head_selected += 1
             elif total_selected < dp_param_count:
-                # Would exceed budget - silently skip for cleaner logs
                 continue
-        
+
         # Extract selected parameters
         tgt_names = []
         for idx in sorted(selected_indices):
             name, param = all_params[idx]
             tgt_names.append(name)
-        
+
         unused = dp_param_count - total_selected
         efficiency = (total_selected / dp_param_count) * 100
         print(f"   ✅ Selected {len(tgt_names)} complete parameters")
         print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
+        if head_total_params > 0:
+            print(f"      Head params: selected {head_selected} tensors (head scalars available: {head_total_params})")
+            if head_selected == 0 and head_min_tensor > 0 and dp_param_count < head_min_tensor:
+                print(f"   ⚠️  Budget too small to include even the smallest head tensor (min head tensor size={head_min_tensor}).")
+                print(f"      Increase --dp-param-count or use --dp-layer to target the classifier/head directly.")
     else:
         if target_layer == "all":
             tgt_names = [n for n, _ in model.named_parameters()]
