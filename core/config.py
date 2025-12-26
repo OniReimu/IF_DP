@@ -9,6 +9,11 @@ import numpy as np
 # Default random seed for reproducible experiments
 DEFAULT_SEED = 400
 
+# Rehearsal buffer threshold: maximum allowed ratio of excluded classes in private set
+# When using --public-pretrain-exclude-classes, we add rehearsal samples from other classes
+# to private until excluded classes are no longer the majority (≤ 50%).
+REHEARSAL_MAX_EXCLUDED_CLASS_RATIO = 0.5
+
 def get_random_seed():
     """
     Get the random seed from environment variable or use default.

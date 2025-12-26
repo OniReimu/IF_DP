@@ -14,12 +14,14 @@ from torch.autograd import grad
 from tqdm import tqdm
 
 from data.common import prepare_batch
+from core.param_selection import select_parameters_by_budget
 
 def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                       clip_radius=10.0, device="cuda", target_layer="conv1",
                       adaptive_clip=True, quantile=0.95, sample_level=None,
                       epochs=1, sigma=None, rho_sat=0.001, lambda_flatness=None,
-                      dp_param_count=None, dp_epochs=None):
+                      dp_param_count=None, dp_epochs=None, use_approximate_method=False,
+                      lr=1e-3, public_loader=None, rehearsal_lambda=1.0):
     """
     DP-SAT training: Vanilla DP-SGD + Sharpness-Aware flatness adjustment.
     
@@ -28,7 +30,7 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     
     Args:
         model: PyTorch model to train
-        train_loader: DataLoader for training data
+        train_loader: DataLoader for training data (private)
         epsilon: Privacy budget
         delta: Privacy parameter
         clip_radius: Clipping radius for gradients (L2 norm)
@@ -44,6 +46,11 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                If None, compute sigma from epsilon using legacy method.
         rho_sat: Perturbation radius (ρ) for weight perturbation (default: 0.001).
         lambda_flatness: Legacy parameter, mapped to rho_sat if rho_sat is default.
+        public_loader: Optional DataLoader for public rehearsal (non-DP gradient).
+                      If provided, combines DP private gradient with non-DP public gradient:
+                      g_total = g_priv_DP + λ * g_public
+        rehearsal_lambda: Mixing weight for public rehearsal gradient (default: 1.0).
+                         Only used if public_loader is provided.
     
     Returns:
         Trained model with DP-SAT
@@ -55,7 +62,7 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         rho_sat = lambda_flatness
 
     model.train()
-    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
     
     # Privacy accounting (same as vanilla DP-SGD) — note dp_epochs below
     if sigma is not None:
@@ -68,60 +75,11 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
         # defer sigma adjustment until dp_epochs is defined
 
-    # gather parameter objects based on target_layer
-    def _match(name: str, layer: str) -> bool:
-        return name.startswith(layer)
-    
-    # gather parameter objects based on target_layer or dp_param_count
-    if dp_param_count is not None:
-        # DP parameter budget mode: smart selection to maximize parameter usage
-        print(f"   🎯 DP Parameter Budget Mode: selecting up to {dp_param_count} parameters")
-        all_params = list(model.named_parameters())
-        
-        # Build list of (name, param, size, index) for knapsack optimization
-        param_info = [(name, param, param.numel(), idx) 
-                      for idx, (name, param) in enumerate(all_params)]
-        
-        # Greedy knapsack: select parameters that fit within budget
-        selected_indices = []
-        total_selected = 0
-        
-        for name, param, size, idx in param_info:
-            if total_selected + size <= dp_param_count:
-                selected_indices.append(idx)
-                total_selected += size
-            elif total_selected < dp_param_count:
-                # Would exceed budget - silently skip for cleaner logs
-                continue
-        
-        # Extract selected parameters
-        names = []
-        params = []
-        for idx in sorted(selected_indices):
-            name, param = all_params[idx]
-            names.append(name)
-            params.append(param)
-        
-        unused = dp_param_count - total_selected
-        efficiency = (total_selected / dp_param_count) * 100
-        
-        print(f"   ✅ Selected {len(names)} complete parameters")
-        print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
-        
-        dp_mask = None  # No masking needed - all complete parameters
-    else:
-        if target_layer == "all":
-            names = [n for n,_ in model.named_parameters()]
-        elif "," in target_layer:
-            layers = [s.strip() for s in target_layer.split(",")]
-            names  = [n for n,_ in model.named_parameters()
-                    if any(_match(n, l) for l in layers)]
-        else:
-            names = [n for n,_ in model.named_parameters()
-                    if _match(n, target_layer)]
-        params = [dict(model.named_parameters())[n] for n in names]
-        
-        dp_mask = None  # No masking in layer mode
+    # Use shared parameter selection utility for consistency across all DP methods
+    names, params, stats = select_parameters_by_budget(
+        model, dp_param_count, target_layer, verbose=True
+    )
+    dp_mask = None  # No masking needed - all complete parameters
     
     # Strict DP: Freeze all other layers
     frozen_count = 0
@@ -146,7 +104,8 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
             sample_level = unique_users.numel() > 1
     
     mode_str = "Sample-level" if sample_level else "User-level"
-    print(f"\n🎯 DP-SAT config: {mode_str} DP  layers={target_layer}  ε={epsilon}")
+    selection_desc = f"dp-param-count={dp_param_count}" if dp_param_count is not None else f"layers={target_layer}"
+    print(f"\n🎯 DP-SAT config: {mode_str} DP  {selection_desc}  ε={epsilon}")
     if sigma is not None:
         print(f"   • Proper privacy accounting: σ={sigma:.4f}")
     else:
@@ -160,6 +119,15 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         print("   • User-level mode: Clipping aggregated user gradients")
     else:
         print("   • Sample-level mode: Clipping individual sample gradients")
+    
+    # Public rehearsal setup (uses public pretrain dataset)
+    if public_loader is not None and rehearsal_lambda > 0:
+        print(f"   • Public rehearsal enabled: λ={rehearsal_lambda} (using public pretrain dataset)")
+        public_iter = iter(public_loader)
+    else:
+        public_iter = None
+        if public_loader is not None and rehearsal_lambda == 0:
+            print(f"   • Public rehearsal disabled (λ=0)")
     print()
     
     noise_l2, grad_norm = [], []
@@ -178,6 +146,9 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
     
     for epoch in range(dp_epochs):
+        # Reset public loader iterator each epoch
+        if public_loader is not None:
+            public_iter = iter(public_loader)
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"DP-SAT ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
             features, labels, user_ids = prepare_batch(batch_data, device)
             batch_size = labels.size(0)
@@ -315,11 +286,43 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
             # Store current noisy gradient for next iteration
             g_prev_priv = g_priv.clone().detach()
             
+            # ============================================================
+            # Public Rehearsal: Add non-DP gradient from public data
+            # ============================================================
+            if public_iter is not None:
+                try:
+                    public_batch = next(public_iter)
+                except StopIteration:
+                    # Reset iterator if exhausted
+                    public_iter = iter(public_loader)
+                    public_batch = next(public_iter)
+                
+                # Compute non-DP gradient on public batch
+                pub_features, pub_labels, _ = prepare_batch(public_batch, device)
+                model.zero_grad()
+                pub_logits = model(pub_features)
+                pub_loss = F.cross_entropy(pub_logits, pub_labels, reduction="mean")
+                pub_grad = grad(pub_loss, params, retain_graph=False)
+                g_public = torch.cat([g.view(-1) for g in pub_grad]).detach()
+
+                # Diagnostic: if public rehearsal is weak relative to DP noisy update, λ=1 won't help much.
+                # (We only log DP-safe quantities here: g_priv already includes noise.)
+                if batch_idx == 0:
+                    g_priv_norm = float(g_priv.norm().item())
+                    g_pub_norm = float(g_public.norm().item())
+                    ratio = g_pub_norm / (g_priv_norm + 1e-12)
+                    print(f"   📌 Rehearsal strength (batch0): ‖g_priv‖={g_priv_norm:.2f}, ‖g_pub‖={g_pub_norm:.2f}, ‖g_pub‖/‖g_priv‖={ratio:.4f}")
+                
+                # Combine: g_total = g_priv_DP + λ * g_public
+                g_total = g_priv + rehearsal_lambda * g_public
+            else:
+                g_total = g_priv
+            
             # Apply update
             idx = 0
             for p in params:
                 n = p.numel()
-                p.grad = g_priv[idx:idx+n].view_as(p)
+                p.grad = g_total[idx:idx+n].view_as(p)
                 idx += n
             opt.step()
     
@@ -328,7 +331,7 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     print(f"   • Median {grad_type} = {np.median(grad_norm):.2f}")
     print(f"   • Isotropic noise ℓ₂ ∈ [{min(noise_l2):.1f},{max(noise_l2):.1f}]")
     print(f"   • Perturbation radius ρ = {rho_sat:.4f}")
-    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {epochs} epochs")
+    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {dp_epochs} DP epochs")
     print(f"   • ✅ IMPLEMENTATION: Exact DP-SAT (Weight Perturbation)")
     
     return model

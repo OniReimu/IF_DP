@@ -97,12 +97,21 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
             config.public_ratio,
             config.seed,
         )
+        
+        # Determine split mode
+        non_iid = getattr(config, "non_iid", False)
+        if non_iid:
+            print("\n🔀 Non-IID dataset split mode enabled")
+        else:
+            print("\n📊 IID dataset split mode (default)")
+        
         # Optional non-IID simulation:
         # - Exclude some class labels from PUBLIC PRETRAIN only
         # - Move the removed public-pretrain samples into PRIVATE
         # - Calibration and evaluation remain unchanged
+        # Only apply non-IID logic if explicitly enabled
         exclude = getattr(config, "public_pretrain_exclude_classes", None)
-        if exclude:
+        if non_iid and exclude:
             exclude_set = {int(x) for x in exclude}
             targets = getattr(trainset, "targets", None)
             if targets is None:
@@ -130,6 +139,64 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
                 if indices.size == 0:
                     return 0
                 return int(np.sum(targets_arr[indices] == int(cls)))
+
+            # ============================================================
+            # REHEARSAL BUFFER: Add samples from non-excluded classes to private
+            # to prevent catastrophic forgetting (keep excluded classes ≤ 50% of private)
+            # ============================================================
+            from core.config import REHEARSAL_MAX_EXCLUDED_CLASS_RATIO
+            
+            # Identify rehearsal classes (all classes NOT in excluded set)
+            all_classes = set(np.unique(targets_arr))
+            rehearsal_classes = sorted(all_classes - exclude_set)
+            
+            # Count excluded-class samples in private
+            excluded_in_private = sum(_count_for(priv_idx_arr, cls) for cls in exclude_set)
+            total_private = len(priv_idx_arr)
+            
+            # Calculate how many rehearsal samples we need
+            if total_private > 0 and excluded_in_private / total_private > REHEARSAL_MAX_EXCLUDED_CLASS_RATIO:
+                # Target: excluded_classes / (total_private + rehearsal_needed) ≤ REHEARSAL_MAX_EXCLUDED_CLASS_RATIO
+                # => rehearsal_needed ≥ excluded_in_private / REHEARSAL_MAX_EXCLUDED_CLASS_RATIO - total_private
+                rehearsal_needed = int(np.ceil(
+                    excluded_in_private / REHEARSAL_MAX_EXCLUDED_CLASS_RATIO - total_private
+                ))
+                
+                if rehearsal_needed > 0 and len(rehearsal_classes) > 0:
+                    # Find rehearsal-class samples in public pretrain
+                    pub_targets_filtered = targets_arr[pub_idx_filtered]
+                    rehearsal_mask = np.isin(pub_targets_filtered, list(rehearsal_classes))
+                    rehearsal_candidates = pub_idx_filtered[rehearsal_mask]
+                    
+                    if len(rehearsal_candidates) >= rehearsal_needed:
+                        # Take exactly what we need (randomly if more available)
+                        if len(rehearsal_candidates) > rehearsal_needed:
+                            rng = np.random.RandomState(int(config.seed))
+                            selected_indices = rng.choice(
+                                len(rehearsal_candidates), 
+                                size=rehearsal_needed, 
+                                replace=False
+                            )
+                            rehearsal_selected = rehearsal_candidates[selected_indices]
+                        else:
+                            rehearsal_selected = rehearsal_candidates
+                        
+                        # Move rehearsal samples from public to private
+                        priv_idx_arr = np.concatenate([priv_idx_arr, rehearsal_selected.astype(int)], axis=0)
+                        pub_idx_filtered = pub_idx_filtered[~np.isin(pub_idx_filtered, rehearsal_selected)]
+                        
+                        print(f"\n📚 Rehearsal buffer: added {len(rehearsal_selected)} samples from classes {rehearsal_classes}")
+                        print(f"   • Goal: keep excluded classes ≤ {REHEARSAL_MAX_EXCLUDED_CLASS_RATIO*100:.0f}% of private")
+                        print(f"   • Before: excluded={excluded_in_private}/{total_private} ({excluded_in_private/total_private*100:.1f}%)")
+                        excluded_after = sum(_count_for(priv_idx_arr, cls) for cls in exclude_set)
+                        print(f"   • After:  excluded={excluded_after}/{len(priv_idx_arr)} ({excluded_after/len(priv_idx_arr)*100:.1f}%)")
+                    else:
+                        print(f"\n⚠️  Rehearsal buffer: requested {rehearsal_needed} samples but only {len(rehearsal_candidates)} available in public pretrain")
+                        if len(rehearsal_candidates) > 0:
+                            # Take all available
+                            priv_idx_arr = np.concatenate([priv_idx_arr, rehearsal_candidates.astype(int)], axis=0)
+                            pub_idx_filtered = pub_idx_filtered[~np.isin(pub_idx_filtered, rehearsal_candidates)]
+                            print(f"   • Added {len(rehearsal_candidates)} available samples")
 
             print("\n🧪 Non-IID simulation: exclude classes from public pretrain and move to private")
             print(f"   • Excluded classes: {sorted(exclude_set)}")

@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from data.common import prepare_batch
 from models.utils import compute_loss
+from core.param_selection import select_parameters_by_budget
 
 # ============================================================
 # 1.  Fisher estimation (damped) on chosen layer set
@@ -33,70 +34,29 @@ def compute_fisher(model, dataloader, device,
     model.eval()
 
     # ------------ choose parameters ------------
-    def _match(name: str, layer: str) -> bool:
-        # stricter prefix match to avoid accidental substring matches
-        return name.startswith(layer)
+    # Use shared parameter selection utility for consistency across all DP methods
+    # Note: compute_fisher only needs names, not the actual parameter objects
+    tgt_names, _, stats = select_parameters_by_budget(
+        model, dp_param_count, target_layer, verbose=True
+    )
+    # Adjust print prefix for Fisher computation context
     if dp_param_count is not None:
-        # DP parameter budget mode: prioritize classifier/head parameters first, then fill by order.
         print(f"🎯 computing Fisher for up to {dp_param_count} parameters (head-first)")
-        all_params = list(model.named_parameters())
-        # Build list with head-first priority
-        def _is_head_param(param_name: str) -> bool:
-            parts = param_name.split(".")
-            head_parts = {"classifier", "fc", "head", "lm_head", "score", "output"}
-            return any(p in head_parts for p in parts)
-
-        param_info = []
-        for idx, (name, param) in enumerate(all_params):
-            size = int(param.numel())
-            priority = 1 if _is_head_param(name) else 0
-            param_info.append((priority, idx, name, param, size))
-        param_info.sort(key=lambda x: (-x[0], x[1]))
-
-        # Greedy knapsack
-        selected_indices = []
-        total_selected = 0
-        head_selected = 0
-        head_total_params = sum(size for prio, _, _, _, size in param_info if prio == 1)
-        head_min_tensor = min([size for prio, _, _, _, size in param_info if prio == 1] or [0])
-
-        for priority, idx, name, param, size in param_info:
-            if total_selected + size <= dp_param_count:
-                selected_indices.append(idx)
-                total_selected += size
-                if priority == 1:
-                    head_selected += 1
-            elif total_selected < dp_param_count:
-                continue
-
-        # Extract selected parameters
-        tgt_names = []
-        for idx in sorted(selected_indices):
-            name, param = all_params[idx]
-            tgt_names.append(name)
-
-        unused = dp_param_count - total_selected
-        efficiency = (total_selected / dp_param_count) * 100
         print(f"   ✅ Selected {len(tgt_names)} complete parameters")
-        print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
-        if head_total_params > 0:
-            print(f"      Head params: selected {head_selected} tensors (head scalars available: {head_total_params})")
-            if head_selected == 0 and head_min_tensor > 0 and dp_param_count < head_min_tensor:
-                print(f"   ⚠️  Budget too small to include even the smallest head tensor (min head tensor size={head_min_tensor}).")
+        print(f"      Budget: {dp_param_count} | Used: {stats['total_selected']} | Unused: {stats['unused']} ({stats['efficiency']:.1f}% efficiency)")
+        if stats['head_total_params'] > 0:
+            print(f"      Head params: selected {stats['head_selected']} tensors (head scalars available: {stats['head_total_params']})")
+            if stats['head_selected'] == 0 and stats['head_min_tensor'] > 0 and dp_param_count < stats['head_min_tensor']:
+                print(f"   ⚠️  Budget too small to include even the smallest head tensor (min head tensor size={stats['head_min_tensor']}).")
                 print(f"      Increase --dp-param-count or use --dp-layer to target the classifier/head directly.")
     else:
         if target_layer == "all":
-            tgt_names = [n for n, _ in model.named_parameters()]
             print("🎯 computing Fisher for ALL layers")
-        elif "," in target_layer:
-            layers = [s.strip() for s in target_layer.split(",")]
-            tgt_names = [n for n, _ in model.named_parameters()
-                        if any(_match(n, l) for l in layers)]
+        elif "," in str(target_layer):
+            layers = [s.strip() for s in str(target_layer).split(",")]
             print(f"🎯 computing Fisher for layers {layers}")
         else:
-            tgt_names = [n for n, _ in model.named_parameters()
-                        if _match(n, target_layer)]
-        print(f"🎯 computing Fisher for layer '{target_layer}'")
+            print(f"🎯 computing Fisher for layer '{target_layer}'")
 
     if not tgt_names:
         raise ValueError(f"No parameters match selection (layer='{target_layer}', dp_param_count={dp_param_count})")
@@ -150,7 +110,7 @@ def topk_eigh_with_floor(mat: torch.Tensor,
                          lam_floor: float = 5e-1):
     # Ensure k doesn't exceed matrix size
     actual_k = min(k, mat.shape[0])
-    print(f"计算 top-{actual_k} eigenpairs (requested {k}), λ_floor = {lam_floor}")
+    print(f"Compute top-{actual_k} eigenpairs (requested {k}), λ_floor = {lam_floor}")
     
     mat_cpu = mat.cpu().numpy()
     try:
@@ -193,7 +153,8 @@ def train_with_dp(model, train_loader, fisher,
                   adaptive_clip=False, quantile=0.95, sample_level=None,
                   epochs=1, sigma=None, full_complement_noise=False,
                   positive_noise_correlation=False,
-                  dp_sat_mode="none", rho_sat=0.001, dp_epochs=None):
+                  dp_sat_mode="none", rho_sat=0.001, dp_epochs=None,
+                  lr=1e-3, public_loader=None, rehearsal_lambda=1.0):
     """
     Train with Fisher-informed DP-SGD
     
@@ -213,9 +174,14 @@ def train_with_dp(model, train_loader, fisher,
                                    If True, use positively correlated noise (noise ∝ √λ).
         dp_sat_mode: "none" (default), "euclidean" (Euclidean DP-SAT), "fisher" (Fisher DP-SAT).
         rho_sat: Perturbation radius for Exact DP-SAT.
+        public_loader: Optional DataLoader for public rehearsal (non-DP gradient).
+                      If provided, combines DP private gradient with non-DP public gradient:
+                      g_total = g_priv_DP + λ * g_public
+        rehearsal_lambda: Mixing weight for public rehearsal gradient (default: 1.0).
+                         Only used if public_loader is provided.
     """
     model.train()
-    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
 
     lam, U       = topk_eigh_with_floor(fisher, k=k, lam_floor=lam_floor)
     lam, U       = lam.to(device), U.to(device)
@@ -297,6 +263,15 @@ def train_with_dp(model, train_loader, fisher,
         print("   • User-level mode: Clipping aggregated user gradients")
     else:
         print("   • Sample-level mode: Clipping individual sample gradients")
+    
+    # Public rehearsal setup (uses public pretrain dataset)
+    if public_loader is not None and rehearsal_lambda > 0:
+        print(f"   • Public rehearsal enabled: λ={rehearsal_lambda} (using public pretrain dataset)")
+        public_iter = iter(public_loader)
+    else:
+        public_iter = None
+        if public_loader is not None and rehearsal_lambda == 0:
+            print(f"   • Public rehearsal disabled (λ=0)")
     print()
 
     noise_l2, grad_norm = [], []
@@ -315,6 +290,9 @@ def train_with_dp(model, train_loader, fisher,
     print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
 
     for epoch in range(dp_epochs):
+        # Reset public loader iterator each epoch
+        if public_loader is not None:
+            public_iter = iter(public_loader)
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP-SGD ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
             features, labels, user_ids = prepare_batch(batch_data, device)
             batch_size = labels.size(0)
@@ -544,11 +522,43 @@ def train_with_dp(model, train_loader, fisher,
         total_noise_norm = total_noise.norm().item()
         noise_l2.append(total_noise_norm)
 
+        # ============================================================
+        # Public Rehearsal: Add non-DP gradient from public data
+        # ============================================================
+        if public_iter is not None:
+            try:
+                public_batch = next(public_iter)
+            except StopIteration:
+                # Reset iterator if exhausted
+                public_iter = iter(public_loader)
+                public_batch = next(public_iter)
+            
+            # Compute non-DP gradient on public batch
+            pub_features, pub_labels, _ = prepare_batch(public_batch, device)
+            model.zero_grad()
+            pub_logits = model(pub_features)
+            pub_loss = F.cross_entropy(pub_logits, pub_labels, reduction="mean")
+            pub_grad = grad(pub_loss, params, retain_graph=False)
+            g_public = torch.cat([g.view(-1) for g in pub_grad]).detach()
+
+            # Diagnostic: if public rehearsal is weak relative to DP noisy update, λ=1 won't help much.
+            # (We only log DP-safe quantities here: g_priv already includes noise.)
+            if batch_idx == 0:
+                g_priv_norm = float(g_priv.norm().item())
+                g_pub_norm = float(g_public.norm().item())
+                ratio = g_pub_norm / (g_priv_norm + 1e-12)
+                print(f"   📌 Rehearsal strength (batch0): ‖g_priv‖={g_priv_norm:.2f}, ‖g_pub‖={g_pub_norm:.2f}, ‖g_pub‖/‖g_priv‖={ratio:.4f}")
+            
+            # Combine: g_total = g_priv_DP + λ * g_public
+            g_total = g_priv + rehearsal_lambda * g_public
+        else:
+            g_total = g_priv
+
         # scatter back
         idx = 0
         for p in params:
             n = p.numel()
-            p.grad = g_priv[idx:idx+n].view_as(p)
+            p.grad = g_total[idx:idx+n].view_as(p)
             idx += n
         opt.step()
 
@@ -564,7 +574,7 @@ def train_with_dp(model, train_loader, fisher,
             print(f"   • Last batch noise components: Fisher={fisher_noise_norm:.1f}, Complement={complement_noise_norm:.1f}")
         else:
             print(f"   • Last batch noise: Fisher only={fisher_noise_norm:.1f} (complement disabled)")
-    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {epochs} epochs")
+    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {dp_epochs} DP epochs")
     print(f"   • ✅ FAIR COMPARISON: Same noise scale σ×Δ={sigma * actual_radius:.3f} as vanilla DP-SGD")
     print(f"   • 🔧 NOISE SCALING FIXED: Using actual_radius for noise (not euclidean_target)")
 

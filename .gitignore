@@ -45,3 +45,5 @@ data/
 !data/*.py
 
 saved_models/
+
+AGENTS.md

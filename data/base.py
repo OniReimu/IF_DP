@@ -27,6 +27,7 @@ class DatasetConfig:
     # Optional non-IID simulation: exclude specific class labels from the public pretrain split only.
     # Private/calibration/evaluation splits remain unchanged.
     public_pretrain_exclude_classes: Optional[Sequence[int]] = None
+    non_iid: bool = False  # If True, enable non-IID split (requires public_pretrain_exclude_classes)
     seed: int = 0
 
 

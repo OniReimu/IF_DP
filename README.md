@@ -17,16 +17,16 @@ This repository provides a comprehensive comparison of three major DP-SGD enhanc
 uv pip install torch torchvision numpy scipy scikit-learn tqdm opacus
 ```
 
-### Run Single Experiments
+### Run Experiments
 ```bash
-# Compare all three methods (default: positively correlated noise)
-uv run main.py --mps --compare-others --target-epsilon 10.0 --run-mia
+# Full ablation study (all variants including calibration)
+uv run ablation.py --mps --model-type efficientnet --users 100 --dp-epochs 20 --target-epsilon 20.0 --delta 1e-5 --clip-radius 1.0 --dp-param-count 20000 --k 512 --run-mia
 
-# Noise strategy is fixed to negatively correlated (default); no flag needed
-uv run main.py --mps --compare-others --target-epsilon 10.0
+# Fast ablation (no calibration variants, faster iteration)
+uv run ablation_fast_no_calib.py --mps --model-type efficientnet --users 100 --dp-epochs 10 --target-epsilon 20.0 --delta 1e-5 --clip-radius 1.0 --dp-param-count 20000 --k 512 --dp-sat-mode fisher --run-mia
 
-# Run ablation study with Fisher + DP-SAT synergy
-uv run ablation.py --mps --target-epsilon 10.0 --k 64 --run-mia
+# Non-IID split with public rehearsal
+uv run ablation_fast_no_calib.py --mps --model-type efficientnet --non-iid --public-pretrain-exclude-classes 0,1 --users 100 --dp-epochs 10 --target-epsilon 20.0 --delta 1e-5 --clip-radius 1.0 --dp-param-count 20000 --k 512 --rehearsal-lambda 0.1 --run-mia
 ```
 
 ## 🧱 Modular Architecture Overview
@@ -118,29 +118,27 @@ This repository implements **Option 1: Frozen Backbone + DP Finetuning** to prov
 
 ### Data Splitting (Simulation Setup)
 
-**For CIFAR-10 ablation studies**, we simulate a "large public corpus + small private dataset" scenario:
+**For CIFAR-10 ablation studies**, we simulate a "large public corpus + small private dataset" scenario with two modes:
 
-- **Public pretraining data (40k)**: Large subset of CIFAR-10 train → baseline pretraining
+### IID Mode (Default)
+- **Public pretraining data (~10k)**: Subset of CIFAR-10 train → baseline pretraining
 - **Public calibration data (5k)**: Small subset of CIFAR-10 train → influence function calibration
-- **Private data (5k)**: Small subset of CIFAR-10 train → DP finetuning  
-  - Controlled by `--dataset-size` (default: 5,000)
+- **Private data (30k)**: Large subset of CIFAR-10 train → DP finetuning  
+  - Controlled by `--dataset-size` (default: 30,000 for IID mode)
 - **Evaluation data (10k)**: Full CIFAR-10 test → final accuracy measurement
 
-**Optimization**: The public data is split into pretraining (40k) and calibration (5k) subsets. This significantly speeds up influence function computation, as we only need to compute influences on 5k samples instead of 45k, while still maintaining strong baseline performance from 40k pretraining samples.
+### Non-IID Mode (`--non-iid`)
+- **Public pretraining data (~27k)**: Subset of CIFAR-10 train **excluding specified classes** → baseline pretraining
+- **Public calibration data (5k)**: Small subset of CIFAR-10 train (unchanged) → influence function calibration
+- **Private data (~18k)**: Includes **all samples from excluded classes** + rehearsal buffer from non-excluded classes → DP finetuning
+  - Excluded classes specified via `--public-pretrain-exclude-classes` (e.g., `0,1`)
+  - Rehearsal buffer automatically added to prevent catastrophic forgetting (keeps excluded classes ≤ 50% of private set)
+- **Evaluation data (10k)**: Full CIFAR-10 test → final accuracy measurement
+
+**Optimization**: The public data is split into pretraining and calibration subsets. This significantly speeds up influence function computation, as we only need to compute influences on 5k samples instead of the full public set, while still maintaining strong baseline performance.
 
 **Note**: This treats most of the training set as "public" for simulation purposes. In real applications, public data would come from a genuinely public source (e.g., ImageNet pretraining, web-scraped images, etc.).
 
-<!-- ### Data Preprocessing
-
-**Data augmentation is disabled** (no RandomCrop, RandomHorizontalFlip) for the following reasons:
-
-1. **MIA Evaluation Consistency**: Random augmentation introduces stochasticity that reduces memorization signal, making membership inference attacks less meaningful. With augmentation, models show lower memorization (AUC → 0.5), which obscures privacy-utility tradeoffs.
-
-2. **Fair Comparison**: Deterministic transforms ensure that members and non-members are evaluated under identical preprocessing conditions during MIA evaluation, providing fair and interpretable privacy metrics.
-
-3. **Reproducibility**: Matches the reference implementation for consistent baseline comparisons.
-
-**Note**: Data augmentation can be re-enabled in `data/vision.py` for utility-focused experiments where MIA evaluation is not the primary concern. Augmentation does not affect DP guarantees (DP is closed under post-processing), but it does impact the interpretability of privacy evaluation. -->
 
 ### Why This Approach?
 
@@ -153,29 +151,34 @@ we achieve **strict DP** while maintaining computational feasibility and strong 
 
 ### Implementation Details
 
-- **Baseline**: Trained on `pub_loader` (45k public samples) in `ablation.py`.
-  - **Caching**: Pretrained baselines are automatically saved as `Pretrain_{dataset}_{model}_{epochs}_public.pth`
+- **Baseline**: Trained on public pretraining data in `ablation.py` and `ablation_fast_no_calib.py`.
+  - **Caching**: Pretrained baselines are automatically saved as `Pretrain_{dataset}_{model}_{epochs}_public_{iid_mode}.pth`
+    - `iid_mode` is `"iid"` or `"noniid"` to prevent cache reuse across different data distribution modes
   - Current recipe: strong-from-scratch SGD (lr=0.1, momentum=0.9, weight_decay=5e-4, cosine schedule)
-  - On subsequent runs with same model/epochs, the cached baseline is loaded (massive speedup!)
+  - On subsequent runs with same model/epochs/IID mode, the cached baseline is loaded (massive speedup!)
   - Use `--clean` flag to force retraining from scratch
-- **Freezing**: All parameters NOT in `--dp-layer`/`--dp-param-count` are automatically frozen during DP training.
+- **Freezing**: All parameters NOT in `--dp-layer`/`--dp-param-count` are automatically frozen during DP training (`requires_grad=False`).
 - **Verification**: The code logs `🔒 Strict DP: Frozen N parameter groups` to confirm the setup.
+- **Public Rehearsal**: All DP training functions support optional public rehearsal via `--rehearsal-lambda`:
+  - Combines DP private gradient with non-DP public gradient: `g_total = g_priv_DP + λ * g_public`
+  - Privacy-free post-processing (public gradient uses only public data)
+  - Helps prevent catastrophic forgetting in non-IID scenarios
 
 **Example**:
 ```bash
-# Default: 40k pretrain + 5k calib public, 5k private (from 50k trainset)
+# IID mode (default): 30k private, ~10k public pretrain, 5k calibration
 uv run ablation.py --dp-param-count 20000 --target-epsilon 2.0
 
-# Custom split: 35k pretrain + 5k calib, 10k private
-uv run ablation.py --dataset-size 10000 --dp-param-count 20000 --target-epsilon 2.0
+# Non-IID mode: exclude classes 0,1 from public pretrain
+uv run ablation.py --non-iid --public-pretrain-exclude-classes 0,1 --dp-param-count 20000 --target-epsilon 2.0
 
 # Force retrain baseline (ignore cached pretrained model)
 uv run ablation.py --clean --dp-layer "conv1,conv2" --target-epsilon 2.0
 
-# Cached baseline: Second run is much faster (skips 300 epochs of pretraining!)
-uv run ablation.py --model-type resnet18 --epochs 300 --dp-layer "resnet.layer4" --target-epsilon 2.0
-# → Creates: Pretrain_cifar10_resnet18_300_public.pth
-# Next run with same model+epochs will load this cached baseline
+# Cached baseline: Second run is much faster (skips 100 epochs of pretraining!)
+uv run ablation.py --model-type resnet18 --epochs 100 --dp-layer "resnet.layer4" --target-epsilon 2.0
+# → Creates: Pretrain_cifar10_resnet18_100_public_iid.pth
+# Next run with same model/epochs/IID mode will load this cached baseline
 ```
 
 This ensures the final model has a formal $(\epsilon, \delta)$-DP guarantee w.r.t. the private training dataset.
@@ -190,12 +193,12 @@ This ensures the final model has a formal $(\epsilon, \delta)$-DP guarantee w.r.
 --target-epsilon 1.0    # High privacy
 --target-epsilon 10.0   # Moderate privacy
 
-# Dataset sizes (Simulation Setup - Option B)
---dataset-size 5000     # Size of PRIVATE dataset (from CIFAR-10 trainset, default: 5,000)
-                        # Public pretrain = 50k - dataset_size - 5k (default: 40,000)
+# Dataset sizes (IID mode default)
+--dataset-size 30000   # Size of PRIVATE dataset (from CIFAR-10 trainset, default: 30,000 for IID)
+                        # Public pretrain ≈ 10,000 (calculated from public_ratio=0.667)
                         # Public calibration = fixed 5k (for efficient influence computation)
                         # Evaluation = full testset (10,000)
-                        # Example: --dataset-size 10000 → 35k pretrain, 5k calib, 10k private, 10k eval
+                        # Non-IID mode: default dataset-size=5000, public_ratio=1.0
 
 # Model architecture
 --model-type cnn              # Simple CNN (default)
@@ -224,18 +227,18 @@ This ensures the final model has a formal $(\epsilon, \delta)$-DP guarantee w.r.
 - **User-level DP (`--users K`, without `--sample-level`)**  
   - The DP unit is an entire **synthetic user**, i.e., all samples belonging to that user.  
   - In code, we create `K` synthetic users by assigning each training sample a user id in round-robin and clip **per-user gradients**.  
-  - The sampling rate for privacy accounting is approximately `1 / K` (one user per batch with `UserBatchSampler`), so:
-    - For fixed target \((\epsilon,\delta)\), changing `--users` changes the required noise multiplier.  
-    - Larger `K` → smaller per-step sample rate → Opacus can often use **smaller noise** for the same target ε, but each user also has fewer samples.
+  - Each DP step processes **one user per batch** via `UserBatchSampler`, so changing `--users` changes the *training dynamics*:
+    - **More users (`K↑`)** → **more DP steps per epoch** (because `len(priv_loader) == K`) but **fewer samples per user** (each user batch is smaller).
+    - **Fewer users (`K↓`)** → **fewer DP steps per epoch** but **more samples per user** (each user batch is larger).
+  - **Privacy accounting note (implementation detail)**: in the ablation scripts we currently pass an *effective* sampling rate derived from loader/dataset sizes (e.g., `len(priv_loader) / len(priv_base)`), so the noise multiplier can change with `--users`. This is an approximation of user-level accounting in this repo’s current setup.
 
 **Important nuance in this repo**:
 - In practice, the **effective harshness** of DP-SGD depends on both:
   - the sampling rate used in the RDP accountant (controls σ), and  
   - the **scale of the clipped gradients** (per-sample vs per-user sums).
 - In our experiments:
-  - User-level with many users (e.g. `--users 100`) can require a **large σ** and has large per-user gradients → Vanilla DP-SGD accuracy can collapse (≈10%).  
-  - User-level with fewer users (e.g. `--users 10`) yields smaller σ and milder clipping → accuracy improves.  
-  - Sample-level DP uses much smaller sampling rate (batch_size / dataset_size) and per-sample gradients → the accountant chooses **smaller σ**, and accuracy can look closer to the “10-user” regime rather than the harsh 100-user case.
+  - Increasing `--users` can make fine-tuning **move much more** (more DP steps), which can *recover private-only classes* but also cause **catastrophic forgetting** on the remaining classes if the private split is highly skewed.
+  - Decreasing `--users` reduces the number of DP steps, so models stay closer to the public baseline (often higher “rest” accuracy) but may fail to adapt to private-only classes.
 
 Use **sample-level DP** if you care about individual examples, and **user-level DP** if you want to protect an entire user’s contribution (all their samples) as one DP unit.
 
@@ -244,17 +247,30 @@ Use **sample-level DP** if you care about individual examples, and **user-level 
 - **`--k` (Fidelity)**: Sets the rank of the Fisher approximation within that scope.
   - **Constraint**: $k \le P$ (automatically clamped if larger).
   - **Tradeoff**: Higher $k$ captures more curvature information but requires more memory/compute. Lower $k$ is faster but uses a coarser approximation.
+  - **Noise magnitude**: By default, Fisher DP adds noise **only in the Fisher subspace** (top-$k$ directions), so noise ℓ₂ norm scales like $\sqrt{k} \times \sigma \times C$ instead of $\sqrt{P} \times \sigma \times C$ (vanilla DP-SGD). This makes Fisher DP's noise **much smaller** (e.g., $\sqrt{512}$ vs $\sqrt{20000}$ ≈ **6× smaller**), which can lead to better utility but makes direct comparison with vanilla DP-SGD less fair.
+
+**For fairer comparison with vanilla DP-SGD**: Use `--full-complement-noise` to add isotropic noise in the **orthogonal complement** (remaining $P-k$ dimensions) in addition to the Fisher subspace noise. This makes total noise magnitude similar to vanilla DP-SGD ($\sqrt{P} \times \sigma \times C$) while still preserving curvature-aware benefits in the Fisher subspace. The tradeoff: utility may drop closer to vanilla levels, but privacy accounting becomes more aligned with standard DP-SGD mechanisms.
+
+**Important**: Fisher DP uses **norm calibration** to ensure fair comparison. The `--clip-radius` argument sets the target Euclidean sensitivity Δ₂ (same as vanilla DP-SGD). During training, the code automatically calibrates a Mahalanobis threshold (`actual_radius`) that achieves the same effective sensitivity in Fisher space. Both clipping and noise scaling use this calibrated `actual_radius` to ensure the same privacy-utility tradeoff as vanilla DP-SGD.
 
 ### Advanced Features
 ```bash
 # Adaptive clipping (disabled by default)
 --adaptive-clip --quantile 0.95
 
-# DP-SAT flatness
---lambda-flatness 0.01
+# DP-SAT configuration
+--dp-sat-mode fisher      # Fisher DP-SAT (for Fisher DP variants) or euclidean (for Vanilla DP-SGD)
+--rho-sat 0.001          # Perturbation radius for DP-SAT
+
+# Public rehearsal (prevents catastrophic forgetting in non-IID scenarios)
+--rehearsal-lambda 0.1   # Mixing weight: g_total = g_priv_DP + λ * g_public (default: 1.0, set to 0 to disable)
+
+# Non-IID data splits
+--non-iid                                # Enable non-IID mode (requires --public-pretrain-exclude-classes)
+--public-pretrain-exclude-classes 0,1   # Exclude classes 0,1 from public pretrain (moved to private)
 
 # MIA evaluation
---run-mia --mia-size 1000
+--run-mia --shadow-epochs 3             # Run membership inference attack (default: 3 shadow epochs)
 
 # Target specific layers (Strict DP: other layers are frozen)
 --dp-layer "conv1,conv2"               # CNN: matches prefixes conv1, conv2, ...
@@ -263,19 +279,20 @@ Use **sample-level DP** if you care about individual examples, and **user-level 
 --dp-layer "resnet.conv1,resnet.layer1"  # add first block; expand with layer2, layer3, layer4 as needed
 
 # OR: Use parameter budget (mutually exclusive with --dp-layer)
---dp-param-count 20000                 # Train up to 20,000 parameters with DP (smart selection)
+--dp-param-count 20000                 # Train up to 20,000 parameters with DP (head-first selection)
 ```
 
 **Note**: When using `--dp-layer`, the specified layers are trained with DP on private data, while all other layers are **frozen** (pre-trained on public data). This ensures strict $(\epsilon, \delta)$-DP for the entire model.
 
-When using `--dp-param-count N`, the code smartly selects **complete parameters** (no partial layers) that maximize parameter usage within budget `N`. It selects parameters in model order, skipping any that would exceed the budget. This ensures:
+When using `--dp-param-count N`, the code uses **head-first selection** to prioritize classifier/head parameters, then fills remaining budget with backbone parameters. This ensures:
+- Classifier parameters are always included when budget allows (critical for learning new classes)
 - Only complete parameters are selected (no partial layer training)
 - Maximum utilization of the parameter budget
 - Predictable behavior across different architectures
 
-**Example**: With budget 20,000 and layers [conv1: 896, conv2: 18,496, conv3: 73,728]:
-- Selects: conv1 + conv2 = 19,392 parameters (96.96% efficiency)
-- Skips: conv3 (would exceed budget)
+**Example**: With budget 20,000 and EfficientNet-B0:
+- Prioritizes: classifier (12,810 params) + early backbone layers
+- Ensures model can learn private-only classes in non-IID scenarios
 
 **`--dp-layer` vs `--dp-param-count`**:
 - These options are **mutually exclusive**
@@ -291,11 +308,21 @@ When using `--dp-param-count N`, the code smartly selects **complete parameters*
 
 ## 🏗️ **Core Files**
 
-- **`main.py`**: Single experiment comparison
-- **`ablation.py`**: Fisher + DP-SAT synergy study
-- **`fisher_dp_sgd.py`**: Fisher-informed DP-SGD implementation
-- **`dp_sat.py`**: DP-SAT implementation
-- **`mia.py`**: Membership inference attack evaluation
+### Main Entry Points
+- **`ablation.py`**: Full ablation study with all variants (pretrain → DP finetune → MIA → optional IF calibration)
+- **`ablation_fast_no_calib.py`**: Fast ablation study without calibration variants (pretrain → DP finetune → MIA only)
+- **`training/main.py`**: Single experiment comparison script for quick testing
+
+### Core DP Training Modules (`core/`)
+- **`core/fisher_dp_sgd.py`**: Fisher estimation (`compute_fisher`) + low-rank Fisher-DP-SGD training loop (`train_with_dp`)
+- **`core/dp_sat.py`**: DP-SAT-style optimizer component (`train_with_dp_sat`) - baseline Euclidean DP-SGD + post-processing flatness term
+- **`core/dp_sgd.py`**: Vanilla DP-SGD implementation (`train_with_vanilla_dp`) - standard baseline with Euclidean clipping + isotropic noise
+- **`core/influence_function.py`**: Influence-function calibration routines (iterative + line search) for post-hoc slice repair
+- **`core/mia.py`**: Membership inference attack evaluation (shadow model attack, confidence attack, etc.)
+- **`core/privacy_accounting.py`**: Privacy accounting utilities (RDP accountant, noise multiplier calculation, privacy tracking)
+- **`core/param_selection.py`**: Shared parameter selection utility (`select_parameters_by_budget`) for consistent DP parameter budgeting across all methods
+- **`core/config.py`**: Configuration utilities (random seeds, dataset location, rehearsal buffer constants)
+- **`core/device_utils.py`**: Device resolution utilities (MPS/CUDA/CPU detection and multi-GPU support)
 
 ## 📚 **References**
 

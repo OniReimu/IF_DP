@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip
 from core.dp_sgd import train_with_vanilla_dp
 from core.dp_sat import train_with_dp_sat
+from core.param_selection import select_parameters_by_budget
 from core.privacy_accounting import (
     get_privacy_params_for_target_epsilon, 
 )
@@ -54,13 +55,15 @@ def _sanitize_cache_key(value: str) -> str:
     return str(value).replace("/", "_").replace(" ", "_")
 
 
-def build_pretrain_cache_path(models_dir: str, dataset_name: str, model_type: str, epochs: int, scope: str) -> str:
+def build_pretrain_cache_path(models_dir: str, dataset_name: str, model_type: str, epochs: int, scope: str, non_iid: bool = False) -> str:
     """
     Cache naming scheme (dataset-scoped to avoid accidental reuse across datasets):
-      Pretrain_{dataset}_{model}_{epochs}_{scope}.pth
+      Pretrain_{dataset}_{model}_{epochs}_{scope}_{iid_mode}.pth
+    where iid_mode is "iid" or "noniid"
     """
     ds = _sanitize_cache_key(dataset_name)
-    return os.path.join(models_dir, f"Pretrain_{ds}_{model_type}_{int(epochs)}_{scope}.pth")
+    iid_mode = "noniid" if non_iid else "iid"
+    return os.path.join(models_dir, f"Pretrain_{ds}_{model_type}_{int(epochs)}_{scope}_{iid_mode}.pth")
 
 # ════════════════════════════════════════════════════════════════
 # Diagnostic functions (moved from influence_function.py)
@@ -603,7 +606,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                   optimizer_name="Normal", positive_noise_correlation=False,
                                   precomputed_lam=None, precomputed_U=None,
                                   dp_sat_mode="none", rho_sat=0.001, dp_param_count=None,
-                                  dp_epochs=None):
+                                  dp_epochs=None, lr=1e-3, public_loader=None, rehearsal_lambda=1.0):
     """
     TRICK 4: EXACT FISHER-AWARE DP-SAT
     Standard DP-SAT adds a gradient term, which is approximate. Here we implement 
@@ -637,7 +640,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         4. Final update: θ ← θ - η g_fisher_priv
     """
     model.train()
-    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
     
     # Fisher eigendecomposition (use pre-computed if available)
     if precomputed_lam is not None and precomputed_U is not None:
@@ -675,83 +678,14 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         sigma = sigma_single_epoch / math.sqrt(epochs)
         print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
 
-    # Gather parameter objects
-    def _match(name: str, layer: str) -> bool:
-        # stricter match: prefix match to avoid accidental substring matches across deeper blocks
-        return name.startswith(layer)
-
-    # Gather parameter objects
-    if dp_param_count is not None:
-        # DP parameter budget mode: prioritise classifier/head parameters first,
-        # then fill remaining budget in model order. This keeps Fisher matrix and
-        # training parameter subsets consistent (avoids U/grad mismatch).
-        print(f"   🎯 DP Parameter Budget Mode: selecting up to {dp_param_count} parameters (head-first)")
-        all_params = list(model.named_parameters())
-
-        def _is_head_param(param_name: str) -> bool:
-            parts = param_name.split(".")
-            head_parts = {"classifier", "fc", "head", "lm_head", "score", "output"}
-            return any(p in head_parts for p in parts)
-
-        # Build list with priority flag
-        param_info = []
-        for idx, (name, param) in enumerate(all_params):
-            size = int(param.numel())
-            priority = 1 if _is_head_param(name) else 0
-            param_info.append((priority, idx, name, param, size))
-        param_info.sort(key=lambda x: (-x[0], x[1]))
-
-        # Greedy knapsack
-        selected_indices = []
-        total_selected = 0
-        head_selected = 0
-        head_total_params = sum(size for prio, _, _, _, size in param_info if prio == 1)
-        head_min_tensor = min([size for prio, _, _, _, size in param_info if prio == 1] or [0])
-
-        for priority, idx, name, param, size in param_info:
-            if total_selected + size <= dp_param_count:
-                selected_indices.append(idx)
-                total_selected += size
-                if priority == 1:
-                    head_selected += 1
-            elif total_selected < dp_param_count:
-                continue
-
-        # Extract selected parameters
-        names = []
-        params = []
-        for idx in sorted(selected_indices):
-            name, param = all_params[idx]
-            names.append(name)
-            params.append(param)
-
-        param_dim = total_selected
-        unused = dp_param_count - total_selected
-        efficiency = (total_selected / dp_param_count) * 100
-
-        print(f"   ✅ Selected {len(names)} complete parameters")
-        print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
-        if head_total_params > 0:
-            print(f"      Head params: selected {head_selected} tensors (head scalars available: {head_total_params})")
-            if head_selected == 0 and head_min_tensor > 0 and dp_param_count < head_min_tensor:
-                print(f"   ⚠️  Budget too small to include even the smallest head tensor (min head tensor size={head_min_tensor}).")
-                print(f"      Increase --dp-param-count or use --dp-layer to target the classifier/head directly.")
-
-        dp_mask = None  # No masking needed - all complete parameters
-    else:
-        if target_layer == "all":
-            names = [n for n,_ in model.named_parameters()]
-        elif "," in target_layer:
-            layers = [s.strip() for s in target_layer.split(",")]
-            names = [n for n,_ in model.named_parameters()
-                    if any(_match(n, l) for l in layers)]
-        else:
-            names = [n for n,_ in model.named_parameters()
-                    if _match(n, target_layer)]
-        params = [dict(model.named_parameters())[n] for n in names]
-        param_dim = sum(p.numel() for p in params)
-
-        dp_mask = None  # No masking in layer mode
+    # Use shared parameter selection utility for consistency across all DP methods
+    # This ensures Fisher matrix and training parameter subsets are consistent (avoids U/grad mismatch)
+    # Handles both dp_param_count (budget mode) and target_layer (legacy layer mode)
+    names, params, stats = select_parameters_by_budget(
+        model, dp_param_count, target_layer, verbose=True
+    )
+    param_dim = stats['total_selected']
+    dp_mask = None  # No masking needed - all complete parameters
 
     # Strict DP: Freeze all other layers
     frozen_count = 0
@@ -800,6 +734,15 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         print("   • User-level mode: Clipping aggregated user gradients")
     else:
         print("   • Sample-level mode: Clipping individual sample gradients")
+    
+    # Public rehearsal setup (uses public pretrain dataset)
+    if public_loader is not None and rehearsal_lambda > 0:
+        print(f"   • Public rehearsal enabled: λ={rehearsal_lambda} (using public pretrain dataset)")
+        public_iter = iter(public_loader)
+    else:
+        public_iter = None
+        if public_loader is not None and rehearsal_lambda == 0:
+            print(f"   • Public rehearsal disabled (λ=0)")
     print()
 
     noise_l2, grad_norm, flatness_norm = [], [], []
@@ -818,6 +761,9 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
 
     for epoch in range(dp_epochs):
+        # Reset public loader iterator each epoch
+        if public_loader is not None:
+            public_iter = iter(public_loader)
         for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Fisher DP + {opt_type} ({mode_str}) epoch {epoch+1}/{dp_epochs}", leave=False)):
             features, labels, user_ids = prepare_batch(batch_data, device)
             batch_size = labels.size(0)
@@ -985,13 +931,13 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             
             # 1. Low-rank noise in Fisher subspace (anisotropic)
             z_fisher = torch.randn(actual_k, device=device)
-            fisher_noise = U @ (z_fisher * noise_scaling) * sigma * euclidean_target  # Use Euclidean target for noise scale
+            fisher_noise = U @ (z_fisher * noise_scaling) * sigma * actual_radius  # Use calibrated Mahalanobis threshold for noise scale
             
             if full_complement_noise:
                 # 2. Complement noise in orthogonal subspace (isotropic)
                 z_full = torch.randn_like(g_bar)
                 z_complement = z_full - U @ (U.T @ z_full)  # Project to complement
-                complement_noise = z_complement * sigma * euclidean_target  # Use Euclidean target
+                complement_noise = z_complement * sigma * actual_radius  # Use calibrated Mahalanobis threshold for noise scale
                 total_noise = fisher_noise + complement_noise
                 complement_noise_norm = complement_noise.norm().item()
             else:
@@ -1023,6 +969,36 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             # Store current Fisher-noisy gradient for next iteration (needed for Exact)
             if use_dp_sat or dp_sat_mode != "none":
                 g_fisher_priv_prev = g_fisher_priv.clone().detach()
+
+            # ============================================================
+            # Public Rehearsal: Add non-DP gradient from public data
+            # ============================================================
+            if public_iter is not None:
+                try:
+                    public_batch = next(public_iter)
+                except StopIteration:
+                    # Reset iterator if exhausted
+                    public_iter = iter(public_loader)
+                    public_batch = next(public_iter)
+                
+                # Compute non-DP gradient on public batch
+                pub_features, pub_labels, _ = prepare_batch(public_batch, device)
+                model.zero_grad()
+                pub_logits = model(pub_features)
+                pub_loss = F.cross_entropy(pub_logits, pub_labels, reduction="mean")
+                pub_grad = grad(pub_loss, params, retain_graph=False)
+                g_public = torch.cat([g.view(-1) for g in pub_grad]).detach()
+
+                # Diagnostic: if public rehearsal is weak relative to DP noisy update, λ=1 won't help much.
+                # (We only log DP-safe quantities here: g_final already includes DP noise.)
+                if batch_idx == 0:
+                    g_priv_norm = float(g_final.norm().item())
+                    g_pub_norm = float(g_public.norm().item())
+                    ratio = g_pub_norm / (g_priv_norm + 1e-12)
+                    print(f"   📌 Rehearsal strength (batch0): ‖g_priv‖={g_priv_norm:.2f}, ‖g_pub‖={g_pub_norm:.2f}, ‖g_pub‖/‖g_priv‖={ratio:.4f}")
+                
+                # Combine: g_total = g_final_DP + λ * g_public
+                g_final = g_final + rehearsal_lambda * g_public
 
             # Scatter back to model parameters
             idx = 0
@@ -1100,6 +1076,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         model_type=args.model_type,
         epochs=args.epochs,
         scope="public",
+        non_iid=args.non_iid,
     )
     legacy_pretrain_path = os.path.join(models_dir, f"Pretrain_{args.model_type}_{args.epochs}_public.pth")
 
@@ -1108,8 +1085,11 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         print(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
         checkpoint = safe_torch_load(pretrain_path, map_location=device)
         ck_dataset = checkpoint.get("dataset_name") if isinstance(checkpoint, dict) else None
+        ck_non_iid = checkpoint.get("non_iid", False) if isinstance(checkpoint, dict) else False
         if ck_dataset is not None and ck_dataset != args.dataset_name:
             print(f"   ⚠️  Cache dataset mismatch: checkpoint={ck_dataset} vs requested={args.dataset_name}. Retraining baseline.")
+        elif ck_non_iid != args.non_iid:
+            print(f"   ⚠️  Cache IID/non-IID mode mismatch: checkpoint={'non-IID' if ck_non_iid else 'IID'} vs requested={'non-IID' if args.non_iid else 'IID'}. Retraining baseline.")
         else:
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline")
@@ -1169,6 +1149,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             'epochs': args.epochs,
             'accuracy': baseline_acc,
             'public_data_size': len(pub_loader.dataset),
+            'non_iid': args.non_iid,
             'timestamp': __import__('time').strftime('%Y%m%d_%H%M%S')
         }, pretrain_path)
         print(f"\n💾 Saved pretrained baseline to {pretrain_path}")
@@ -1176,6 +1157,12 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
 
     # Privacy accounting setup
     if not args.use_legacy_accounting:
+        # Determine actual DP fine-tuning epochs (same logic as in training functions)
+        if args.dp_epochs is not None:
+            actual_dp_epochs = args.dp_epochs
+        else:
+            actual_dp_epochs = max(1, int(math.ceil(args.epochs / 10)))
+        
         sample_rate = len(priv_loader) / len(priv_base)
         steps_per_epoch = len(priv_loader)
         
@@ -1183,7 +1170,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             target_epsilon=args.target_epsilon,
             target_delta=args.delta,
             sample_rate=sample_rate,
-            epochs=args.epochs,
+            epochs=actual_dp_epochs,  # Use DP fine-tuning epochs, not public pretraining epochs
             steps_per_epoch=steps_per_epoch
         )
         
@@ -1193,6 +1180,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         
         print(f"\n🔒 Privacy Accounting for Optimized Ablation Study:")
         print(f"   • Target (ε, δ): ({args.target_epsilon}, {args.delta})")
+        print(f"   • DP fine-tuning epochs: {actual_dp_epochs} (public pretrain: {args.epochs})")
         print(f"   • Noise multiplier: {noise_multiplier:.4f}")
         print(f"   • Sigma: {sigma:.4f}")
     else:
@@ -1223,7 +1211,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         sample_level=args.sample_level,
         epochs=args.epochs,
         dp_param_count=args.dp_param_count,
-        dp_epochs=args.dp_epochs
+        dp_epochs=args.dp_epochs,
+        lr=args.dp_lr,
+        public_loader=pub_loader,  # Always use public pretrain dataset for rehearsal
+        rehearsal_lambda=args.rehearsal_lambda
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1248,7 +1239,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         epochs=args.epochs,
         rho_sat=args.rho_sat,  # Use consistent perturbation radius
         dp_param_count=args.dp_param_count,
-        dp_epochs=args.dp_epochs
+        dp_epochs=args.dp_epochs,
+        lr=args.dp_lr,
+        public_loader=pub_loader,  # Always use public pretrain dataset for rehearsal
+        rehearsal_lambda=args.rehearsal_lambda
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1278,7 +1272,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
         precomputed_U=U,
         dp_param_count=args.dp_param_count,
-        dp_epochs=args.dp_epochs
+        dp_epochs=args.dp_epochs,
+        lr=args.dp_lr,
+        public_loader=pub_loader,  # Always use public pretrain dataset for rehearsal
+        rehearsal_lambda=args.rehearsal_lambda
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1316,7 +1313,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         precomputed_lam=lam,  # Pass pre-computed eigendecomposition
         precomputed_U=U,
         dp_param_count=args.dp_param_count,
-        dp_epochs=args.dp_epochs
+        dp_epochs=args.dp_epochs,
+        lr=args.dp_lr,
+        public_loader=pub_loader,  # Always use public pretrain dataset for rehearsal
+        rehearsal_lambda=args.rehearsal_lambda
     )
     
     # ════════════════════════════════════════════════════════════════
@@ -1658,16 +1658,21 @@ def main():
     parser.add_argument('--dataset', '--dataset-name', dest='dataset_name',
                        choices=AVAILABLE_DATASETS, default='cifar10',
                        help='Dataset identifier registered in the data package (vision or language)')
-    parser.add_argument('--dataset-size', type=int, default=5000,
-                       help='Number of private samples to draw from the dataset (default: 5k, matching legacy ablation)')
-    parser.add_argument('--public-ratio', type=float, default=1.0,
-                       help='Fraction of the remaining training data reserved for the public split (default: all remaining samples)')
+    parser.add_argument('--non-iid', action='store_true',
+                       help='Enable non-IID dataset split. When enabled, requires --public-pretrain-exclude-classes. '
+                            'When disabled (default), uses IID split with public=30000, private=10000.')
+    parser.add_argument('--dataset-size', type=int, default=None,
+                       help='Number of private samples to draw from the dataset. '
+                            'Default: 10000 for IID mode, 5000 for non-IID mode.')
+    parser.add_argument('--public-ratio', type=float, default=None,
+                       help='Fraction of the remaining training data reserved for the public split. '
+                            'Default: calculated to get ~30000 public samples for IID mode, 1.0 for non-IID mode.')
     parser.add_argument(
         '--public-pretrain-exclude-classes',
         type=str,
         default="",
         help='Comma-separated class indices to exclude from PUBLIC PRETRAIN only (non-IID simulation). '
-             'Any excluded-class samples removed from public pretrain are moved into the private split; '
+             'Required when --non-iid is set. Any excluded-class samples removed from public pretrain are moved into the private split; '
              'calibration and evaluation remain unchanged. Example: "0,1". Default: empty.',
     )
     parser.add_argument('--batch-size', type=int, default=128,
@@ -1714,6 +1719,12 @@ def main():
     
     parser.add_argument('--delta', type=float, default=1e-5)
     parser.add_argument('--clip-radius', type=float, default=1.0)
+    parser.add_argument('--dp-lr', '--learning-rate', type=float, default=1e-3,
+                       help='Learning rate for DP fine-tuning (default: 1e-3)')
+    parser.add_argument('--rehearsal-lambda', type=float, default=0.1,
+                       help='Mixing weight for public rehearsal gradient (default: 0.1). '
+                            'Combines DP private gradient with non-DP gradient from public pretrain dataset: '
+                            'g_total = g_priv_DP + λ * g_public. Set to 0 to disable rehearsal.')
     
     # Fisher DP arguments
     parser.add_argument('--k', type=int, default=64)
@@ -1817,6 +1828,13 @@ def main():
     # Data preparation (vision + language)
     # ════════════════════════════════════════════════════════════════
     
+    # Validate non-IID mode requirements
+    if args.non_iid:
+        excluded_classes = args.public_pretrain_exclude_classes.strip()
+        if not excluded_classes:
+            raise ValueError("--non-iid requires --public-pretrain-exclude-classes to be specified. "
+                           "Example: --non-iid --public-pretrain-exclude-classes 0,1")
+    
     dataset_root, allow_download = get_dataset_location(dataset_key=args.dataset_name)
     dataset_builder = build_dataset_builder(args.dataset_name)
     dataset_task_type = getattr(dataset_builder, "task_type", None)
@@ -1834,6 +1852,23 @@ def main():
             return None
         return [int(p) for p in parts]
 
+    # Set defaults based on IID/non-IID mode
+    # For IID mode: private=30000, public≈10000 (calibration=5000 unchanged)
+    # For non-IID mode: use legacy defaults (private=5000, public_ratio=1.0)
+    if args.dataset_size is None:
+        args.dataset_size = 30000 if not args.non_iid else 5000
+    
+    if args.public_ratio is None:
+        if args.non_iid:
+            args.public_ratio = 1.0
+        else:
+            # IID mode: calculate public_ratio to get ~10000 public samples
+            # Assuming CIFAR-10: 50000 total, private=30000, calib=5000
+            # public_pool = 50000 - 30000 - 5000 = 15000
+            # To get public=10000: public_ratio = 10000/15000 ≈ 0.667
+            # For other datasets, we'll use a reasonable default and let user override
+            args.public_ratio = 0.667  # Approximate for CIFAR-10 IID setup
+
     dataset_config = DatasetConfig(
         dataset_root=dataset_root,
         allow_download=allow_download,
@@ -1847,6 +1882,7 @@ def main():
         tokenizer_name=args.tokenizer_name,
         max_seq_length=args.max_seq_length,
         public_pretrain_exclude_classes=_parse_excluded_classes(args.public_pretrain_exclude_classes),
+        non_iid=args.non_iid,
         seed=get_random_seed(),
     )
     loaders = dataset_builder.build(dataset_config)
