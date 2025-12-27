@@ -13,6 +13,9 @@ from tqdm import tqdm
 from data.common import prepare_batch
 from models.utils import compute_loss
 from core.param_selection import select_parameters_by_budget
+from config import get_logger
+
+logger = get_logger("fisher_dp")
 
 # ============================================================
 # 1.  Fisher estimation (damped) on chosen layer set
@@ -41,35 +44,48 @@ def compute_fisher(model, dataloader, device,
     )
     # Adjust print prefix for Fisher computation context
     if dp_param_count is not None:
-        print(f"🎯 computing Fisher for up to {dp_param_count} parameters (head-first)")
-        print(f"   ✅ Selected {len(tgt_names)} complete parameters")
-        print(f"      Budget: {dp_param_count} | Used: {stats['total_selected']} | Unused: {stats['unused']} ({stats['efficiency']:.1f}% efficiency)")
+        logger.info("Computing Fisher for up to %s parameters (head-first)", dp_param_count)
+        logger.info("   ✅ Selected %s complete parameters", len(tgt_names))
+        logger.info(
+            "      Budget: %s | Used: %s | Unused: %s (%.1f%% efficiency)",
+            dp_param_count,
+            stats['total_selected'],
+            stats['unused'],
+            stats['efficiency'],
+        )
         if stats['head_total_params'] > 0:
-            print(f"      Head params: selected {stats['head_selected']} tensors (head scalars available: {stats['head_total_params']})")
+            logger.info(
+                "      Head params: selected %s tensors (head scalars available: %s)",
+                stats['head_selected'],
+                stats['head_total_params'],
+            )
             if stats['head_selected'] == 0 and stats['head_min_tensor'] > 0 and dp_param_count < stats['head_min_tensor']:
-                print(f"   ⚠️  Budget too small to include even the smallest head tensor (min head tensor size={stats['head_min_tensor']}).")
-                print(f"      Increase --dp-param-count or use --dp-layer to target the classifier/head directly.")
+                logger.warn(
+                    "Budget too small to include the smallest head tensor (min head tensor size=%s).",
+                    stats['head_min_tensor'],
+                )
+                logger.warn("Increase --dp-param-count or use --dp-layer to target the classifier/head directly.")
     else:
         if target_layer == "all":
-            print("🎯 computing Fisher for ALL layers")
+            logger.info("Computing Fisher for ALL layers")
         elif "," in str(target_layer):
             layers = [s.strip() for s in str(target_layer).split(",")]
-            print(f"🎯 computing Fisher for layers {layers}")
+            logger.info("Computing Fisher for layers %s", layers)
         else:
-            print(f"🎯 computing Fisher for layer '{target_layer}'")
+            logger.info("Computing Fisher for layer '%s'", target_layer)
 
     if not tgt_names:
         raise ValueError(f"No parameters match selection (layer='{target_layer}', dp_param_count={dp_param_count})")
 
     P = sum(dict(model.named_parameters())[n].numel() for n in tgt_names)
-    print(f"Target parameters: {tgt_names}")
-    print(f"Total parameters: {P}")
-    print(f"Damping coefficient ρ = {rho}")
+    logger.info("Target parameters: %s", tgt_names)
+    logger.info("Total parameters: %s", P)
+    logger.info("Damping coefficient ρ = %s", rho)
 
     mem_gb = P**2 * 4 / 1e9
-    print(f"Fisher matrix size: {P}×{P} ≈ {mem_gb:.2f} GB")
+    logger.info("Fisher matrix size: %s×%s ≈ %.2f GB", P, P, mem_gb)
     if mem_gb > 2:
-        print("⚠️  Fisher matrix is large; eigendecomp may be slow.")
+        logger.warn("Fisher matrix is large; eigendecomp may be slow.")
 
     # ------------ accumulate per-sample grads ------------
     grads = []
@@ -86,19 +102,19 @@ def compute_fisher(model, dataloader, device,
         grads.append(torch.cat([v.flatten() for v in g]).detach())
 
     G = torch.vstack(grads)                     # [N_rows, P]
-    print(f"Gradient matrix shape: {G.shape}")
+    logger.info("Gradient matrix shape: %s", tuple(G.shape))
 
     fisher = (G.T @ G) / len(G) + rho * torch.eye(P, device=device)
-    print(f"Fisher matrix shape: {fisher.shape}")
+    logger.info("Fisher matrix shape: %s", tuple(fisher.shape))
 
     # ------------ condition-number (CPU fallback on MPS) ------------
     try:
         eigvals = torch.linalg.eigvals(fisher.cpu() if fisher.device.type=="mps" else fisher).real
         cond    = (eigvals.max() / eigvals.min()).item()
         rank_est= (eigvals > eigvals.max()*1e-10).sum().item()
-        print(f"Condition number ≈ {cond:.2e}   Estimated rank {rank_est}/{P}")
+        logger.info("Condition number ≈ %.2e   Estimated rank %s/%s", cond, rank_est, P)
     except Exception as e:
-        print(f"⚠️  Condition-number computation failed (ignored): {e}")
+        logger.warn("Condition-number computation failed (ignored): %s", e)
 
     return fisher, tgt_names
 
@@ -110,7 +126,7 @@ def topk_eigh_with_floor(mat: torch.Tensor,
                          lam_floor: float = 5e-1):
     # Ensure k doesn't exceed matrix size
     actual_k = min(k, mat.shape[0])
-    print(f"Compute top-{actual_k} eigenpairs (requested {k}), λ_floor = {lam_floor}")
+    logger.info("Compute top-%s eigenpairs (requested %s), λ_floor = %s", actual_k, k, lam_floor)
     
     mat_cpu = mat.cpu().numpy()
     try:
@@ -119,7 +135,7 @@ def topk_eigh_with_floor(mat: torch.Tensor,
         lam, U  = lam[::-1].copy(), U[:, ::-1].copy()    # descending order
         lam     = np.maximum(lam, lam_floor)
     except Exception as e:
-        print(f"eigh failed ({e}) – using diagonal fallback")
+        logger.warn("eigh failed (%s) – using diagonal fallback", e)
         diag  = np.diag(mat_cpu)
         idx   = np.argpartition(-diag, actual_k)[:actual_k]
         lam   = np.maximum(diag[idx], lam_floor)
@@ -129,9 +145,9 @@ def topk_eigh_with_floor(mat: torch.Tensor,
     # Ensure we have the right number of eigenvalues and eigenvectors
     actual_returned_k = len(lam)
     if actual_returned_k != actual_k:
-        print(f"⚠️  Note: Returned {actual_returned_k} eigenpairs instead of requested {actual_k}")
+        logger.warn("Returned %s eigenpairs instead of requested %s", actual_returned_k, actual_k)
     
-    print(f"Eigenvalue range: [{lam[-1]:.3f}, {lam[0]:.3f}] (got {len(lam)} eigenpairs)")
+    logger.info("Eigenvalue range: [%.3f, %.3f] (got %s eigenpairs)", lam[-1], lam[0], len(lam))
     return torch.from_numpy(lam).float(), torch.from_numpy(U).float()
 
 # ============================================================
@@ -204,18 +220,18 @@ def train_with_dp(model, train_loader, fisher,
     # Privacy accounting
     if sigma is not None:
         # Use provided sigma (proper privacy accounting)
-        print(f"   • Using provided sigma: {sigma:.4f}")
+        logger.info("   • Using provided sigma: %.4f", sigma)
     else:
         # Legacy privacy accounting for multi-epoch training
         # Use simple composition bound: σ_total = σ_single / √T for T epochs
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
         sigma = sigma_single_epoch / math.sqrt(epochs)  # Adjust for T epochs
-        print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+        logger.info("   • Legacy accounting: σ_single=%.3f, σ_adjusted=%.3f", sigma_single_epoch, sigma)
     
     # Use the actual k returned by eigendecomposition
     actual_k = len(lam)
     if actual_k != k:
-        print(f"⚠️  Using k={actual_k} eigenpairs (requested {k}) due to matrix rank constraints")
+        logger.warn("Using k=%s eigenpairs (requested %s) due to matrix rank constraints", actual_k, k)
 
     # gather parameter objects
     if target_layer == "all":
@@ -241,38 +257,38 @@ def train_with_dp(model, train_loader, fisher,
             sample_level = unique_users.numel() > 1
     
     mode_str = "Sample-level" if sample_level else "User-level"
-    print(f"\n🎯 Fisher DP-SGD config: {mode_str} DP  layers={target_layer}  ε={epsilon}")
+    logger.highlight(f"Fisher DP-SGD config: {mode_str} DP  layers={target_layer}  ε={epsilon}")
     if sigma is not None:
-        print(f"   • Proper privacy accounting: σ={sigma:.4f}")
+        logger.info("   • Proper privacy accounting: σ=%.4f", sigma)
     else:
-        print(f"   • Multi-epoch privacy: T={epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
-    print(f"   • Fisher subspace: k={actual_k}, complement dim={param_dim-actual_k}")
-    print(f"   • Target Euclidean sensitivity: Δ₂ = {clip_radius:.3f} (will convert to Mahalanobis)")
-    print(f"   • Adaptive clipping: {adaptive_clip}")
-    print(f"   • Full complement noise: {full_complement_noise}")
-    print(f"   • Noise scaling strategy: {strategy_name}")
+        logger.info("   • Multi-epoch privacy: T=%s, σ_single=%.3f, σ_adjusted=%.3f", epochs, sigma_single_epoch, sigma)
+    logger.info("   • Fisher subspace: k=%s, complement dim=%s", actual_k, param_dim - actual_k)
+    logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f (will convert to Mahalanobis)", clip_radius)
+    logger.info("   • Adaptive clipping: %s", adaptive_clip)
+    logger.info("   • Full complement noise: %s", full_complement_noise)
+    logger.info("   • Noise scaling strategy: %s", strategy_name)
     
     if dp_sat_mode != "none":
-        print(f"   • DP-SAT enabled: mode={dp_sat_mode}, ρ={rho_sat}")
+        logger.info("   • DP-SAT enabled: mode=%s, ρ=%s", dp_sat_mode, rho_sat)
         if dp_sat_mode == "fisher":
-            print(f"     ✨ Using Fisher-whitened weight perturbation (Fisher DP-SAT)")
+            logger.info("     ✨ Using Fisher-whitened weight perturbation (Fisher DP-SAT)")
         elif dp_sat_mode == "euclidean":
-            print(f"     ⚠️  Using Euclidean weight perturbation (Euclidean DP-SAT)")
+            logger.warn("     Using Euclidean weight perturbation (Euclidean DP-SAT)")
     
     if not sample_level:
-        print("   • User-level mode: Clipping aggregated user gradients")
+        logger.info("   • User-level mode: Clipping aggregated user gradients")
     else:
-        print("   • Sample-level mode: Clipping individual sample gradients")
+        logger.info("   • Sample-level mode: Clipping individual sample gradients")
     
     # Public rehearsal setup (uses public pretrain dataset)
     if public_loader is not None and rehearsal_lambda > 0:
-        print(f"   • Public rehearsal enabled: λ={rehearsal_lambda} (using public pretrain dataset)")
+        logger.info("   • Public rehearsal enabled: λ=%s (using public pretrain dataset)", rehearsal_lambda)
         public_iter = iter(public_loader)
     else:
         public_iter = None
         if public_loader is not None and rehearsal_lambda == 0:
-            print(f"   • Public rehearsal disabled (λ=0)")
-    print()
+            logger.info("   • Public rehearsal disabled (λ=0)")
+    logger.info(" ")
 
     noise_l2, grad_norm = [], []
     euclidean_norms = []  # Track Euclidean norms for calibration
@@ -287,7 +303,7 @@ def train_with_dp(model, train_loader, fisher,
     # Determine DP fine-tuning epochs
     if dp_epochs is None:
         dp_epochs = max(1, int(math.ceil(epochs / 10)))
-    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
+    logger.info("   • DP finetuning epochs: %s (requested %s)", dp_epochs, epochs)
 
     for epoch in range(dp_epochs):
         # Reset public loader iterator each epoch
@@ -359,12 +375,12 @@ def train_with_dp(model, train_loader, fisher,
                         euclidean_target = euclidean_adaptive_radius  # Update target
                         adaptive_radius_computed = True
                         
-                        print(f"📊 Fisher adaptive clipping from {len(euclidean_norms)} samples (EUCLIDEAN norms):")
-                        print(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
-                        print(f"   • Median Euclidean: {np.median(euclidean_norms):.3f}")
-                        print(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
-                        print(f"   • Max Euclidean: {np.max(euclidean_norms):.3f}")
-                        print(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
+                        logger.info("Fisher adaptive clipping from %s samples (Euclidean norms):", len(euclidean_norms))
+                        logger.info("   • Mean Euclidean: %.3f", np.mean(euclidean_norms))
+                        logger.info("   • Median Euclidean: %.3f", np.median(euclidean_norms))
+                        logger.info("   • %.1f%% quantile: %.3f", quantile * 100, euclidean_adaptive_radius)
+                        logger.info("   • Max Euclidean: %.3f", np.max(euclidean_norms))
+                        logger.info("   → Using Euclidean target: Δ₂ = %.3f", euclidean_target)
                 
                 # Calibration: find Mahalanobis threshold that matches Euclidean sensitivity
                 if not calibration_computed and len(euclidean_norms) >= 50:
@@ -387,14 +403,13 @@ def train_with_dp(model, train_loader, fisher,
                     actual_radius = (maha_low + maha_high) / 2
                     calibration_computed = True
                     
-                    print(f"🎯 Norm calibration completed:")
-                    print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
-                    print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                    print(f"   • Euclidean clip rate: {euclidean_clip_rate:.1%}")
-                    print(f"   • Mahalanobis clip rate: {np.mean(maha_norms > actual_radius):.1%}")
-                    print(f"   → Fair comparison: same effective sensitivity bound Δ₂")
-                    print(f"   🔧 NOISE SCALING FIX: Using actual_radius={actual_radius:.3f} for noise (was euclidean_target={euclidean_target:.3f})")
-                    print()
+                    logger.info("Norm calibration completed:")
+                    logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f", euclidean_target)
+                    logger.info("   • Calibrated Mahalanobis threshold: %.3f", actual_radius)
+                    logger.info("   • Euclidean clip rate: %.1f%%", euclidean_clip_rate * 100)
+                    logger.info("   • Mahalanobis clip rate: %.1f%%", np.mean(maha_norms > actual_radius) * 100)
+                    logger.info("   → Fair comparison: same effective sensitivity bound Δ₂")
+                    logger.info("   🔧 NOISE SCALING FIX: Using actual_radius=%.3f for noise (was euclidean_target=%.3f)", actual_radius, euclidean_target)
                     
                     euclidean_norms = []  # Reset for actual training statistics
 
@@ -435,12 +450,12 @@ def train_with_dp(model, train_loader, fisher,
                             euclidean_target = euclidean_adaptive_radius
                             adaptive_radius_computed = True
                             
-                            print(f"📊 Fisher adaptive clipping from {len(euclidean_norms)} users (EUCLIDEAN norms):")
-                            print(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
-                            print(f"   • Median Euclidean: {np.median(euclidean_norms):.3f}")
-                            print(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
-                            print(f"   • Max Euclidean: {np.max(euclidean_norms):.3f}")
-                            print(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
+                            logger.info("Fisher adaptive clipping from %s users (Euclidean norms):", len(euclidean_norms))
+                            logger.info("   • Mean Euclidean: %.3f", np.mean(euclidean_norms))
+                            logger.info("   • Median Euclidean: %.3f", np.median(euclidean_norms))
+                            logger.info("   • %.1f%% quantile: %.3f", quantile * 100, euclidean_adaptive_radius)
+                            logger.info("   • Max Euclidean: %.3f", np.max(euclidean_norms))
+                            logger.info("   → Using Euclidean target: Δ₂ = %.3f", euclidean_target)
                     
                     # Calibration for user-level
                     if not calibration_computed and len(euclidean_norms) >= 5:
@@ -451,19 +466,18 @@ def train_with_dp(model, train_loader, fisher,
                         actual_radius = euclidean_target / (ratio + 1e-8)
                         calibration_computed = True
                         
-                        print(f"🎯 User-level norm calibration:")
-                        print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
-                        print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                        print(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}")
-                        print(f"   🔧 NOISE SCALING FIX: Using actual_radius={actual_radius:.3f} for noise (was euclidean_target={euclidean_target:.3f})")
-                        print()
+                        logger.info("User-level norm calibration:")
+                        logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f", euclidean_target)
+                        logger.info("   • Calibrated Mahalanobis threshold: %.3f", actual_radius)
+                        logger.info("   • Sample ratio: ||g||₂/||g||_{F⁻¹} ≈ %.3f", ratio)
+                        logger.info("   🔧 NOISE SCALING FIX: Using actual_radius=%.3f for noise (was euclidean_target=%.3f)", actual_radius, euclidean_target)
                         
                         euclidean_norms = []  # Reset
             
             # In user-level DP with UserBatchSampler, we should have exactly one user per batch
             if len(user_gradients) != 1:
-                print(f"⚠️  Warning: Expected 1 user per batch, got {len(user_gradients)} users")
-                print(f"   Unique users in batch: {unique_users.tolist()}")
+                logger.warn("Expected 1 user per batch, got %s users", len(user_gradients))
+                logger.warn("   Unique users in batch: %s", unique_users.tolist())
             
             # Clip each user's gradient
             clipped_user_grads = []
@@ -547,7 +561,12 @@ def train_with_dp(model, train_loader, fisher,
                 g_priv_norm = float(g_priv.norm().item())
                 g_pub_norm = float(g_public.norm().item())
                 ratio = g_pub_norm / (g_priv_norm + 1e-12)
-                print(f"   📌 Rehearsal strength (batch0): ‖g_priv‖={g_priv_norm:.2f}, ‖g_pub‖={g_pub_norm:.2f}, ‖g_pub‖/‖g_priv‖={ratio:.4f}")
+                logger.info(
+                    "   📌 Rehearsal strength (batch0): ‖g_priv‖=%.2f, ‖g_pub‖=%.2f, ‖g_pub‖/‖g_priv‖=%.4f",
+                    g_priv_norm,
+                    g_pub_norm,
+                    ratio,
+                )
             
             # Combine: g_total = g_priv_DP + λ * g_public
             g_total = g_priv + rehearsal_lambda * g_public
@@ -563,19 +582,19 @@ def train_with_dp(model, train_loader, fisher,
         opt.step()
 
     grad_type = "‖g_user‖_Mah" if not sample_level else "‖g‖_Mah"
-    print(f"\n📊  Fisher DP-SGD final stats:")
-    print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f} (same as vanilla DP-SGD)")
-    print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-    print(f"   • Median {grad_type} = {np.median(grad_norm):.2f}")
-    print(f"   • Total noise ℓ₂ ∈ [{min(noise_l2):.1f},{max(noise_l2):.1f}]")
+    logger.info("Fisher DP-SGD final stats:")
+    logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f (same as vanilla DP-SGD)", euclidean_target)
+    logger.info("   • Calibrated Mahalanobis threshold: %.3f", actual_radius)
+    logger.info("   • Median %s = %.2f", grad_type, np.median(grad_norm))
+    logger.info("   • Total noise ℓ₂ ∈ [%.1f,%.1f]", min(noise_l2), max(noise_l2))
     if len(noise_l2) > 0:
         last_idx = len(noise_l2) - 1
         if full_complement_noise:
-            print(f"   • Last batch noise components: Fisher={fisher_noise_norm:.1f}, Complement={complement_noise_norm:.1f}")
+            logger.info("   • Last batch noise components: Fisher=%.1f, Complement=%.1f", fisher_noise_norm, complement_noise_norm)
         else:
-            print(f"   • Last batch noise: Fisher only={fisher_noise_norm:.1f} (complement disabled)")
-    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {dp_epochs} DP epochs")
-    print(f"   • ✅ FAIR COMPARISON: Same noise scale σ×Δ={sigma * actual_radius:.3f} as vanilla DP-SGD")
-    print(f"   • 🔧 NOISE SCALING FIXED: Using actual_radius for noise (not euclidean_target)")
+            logger.info("   • Last batch noise: Fisher only=%.1f (complement disabled)", fisher_noise_norm)
+    logger.info("   • Privacy: (ε=%s, δ=%s) over %s DP epochs", epsilon, delta, dp_epochs)
+    logger.success("Fair comparison: same noise scale σ×Δ=%.3f as vanilla DP-SGD", sigma * actual_radius)
+    logger.success("Noise scaling fixed: using actual_radius for noise (not euclidean_target)")
 
     return model

@@ -12,6 +12,9 @@ from tqdm import tqdm
 from data.common import prepare_batch
 from models.utils import compute_loss
 from core.param_selection import select_parameters_by_budget
+from config import get_logger
+
+logger = get_logger("dp_sgd")
 
 def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
                          clip_radius=10.0, device="cuda", target_layer="conv1",
@@ -52,7 +55,7 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
     # Privacy accounting
     if sigma is not None:
         # Use provided sigma (proper privacy accounting)
-        print(f"   • Using provided sigma: {sigma:.4f}")
+        logger.info("   • Using provided sigma: %.4f", sigma)
     else:
         # Legacy privacy accounting for multi-epoch training
         # Use simple composition bound: σ_total = σ_single / √T for T epochs
@@ -75,7 +78,7 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
             p.requires_grad = True
     
     if frozen_count > 0:
-        print(f"   🔒 Strict DP: Frozen {frozen_count} parameter groups (trained on public data)")
+        logger.info("   🔒 Strict DP: Frozen %s parameter groups (trained on public data)", frozen_count)
     
     # Auto-detect DP mode if not specified
     if sample_level is None:
@@ -89,29 +92,29 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
     
     mode_str = "Sample-level" if sample_level else "User-level"
     selection_desc = f"dp-param-count={dp_param_count}" if dp_param_count is not None else f"layers={target_layer}"
-    print(f"\n🎯 Vanilla DP-SGD config: {mode_str} DP  {selection_desc}  ε={epsilon}")
+    logger.highlight(f"Vanilla DP-SGD config: {mode_str} DP  {selection_desc}  ε={epsilon}")
     if sigma is not None:
-        print(f"   • Proper privacy accounting: σ={sigma:.4f}")
+        logger.info("   • Proper privacy accounting: σ=%.4f", sigma)
     else:
-        print(f"   • Multi-epoch privacy: T={epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
-    print(f"   • Euclidean clipping with radius {clip_radius}")
-    print(f"   • Isotropic Gaussian noise")
-    print(f"   • Adaptive clipping: {adaptive_clip}")
+        logger.info("   • Multi-epoch privacy: T=%s, σ_single=%.3f, σ_adjusted=%.3f", epochs, sigma_single_epoch, sigma)
+    logger.info("   • Euclidean clipping with radius %s", clip_radius)
+    logger.info("   • Isotropic Gaussian noise")
+    logger.info("   • Adaptive clipping: %s", adaptive_clip)
     
     if not sample_level:
-        print("   • User-level mode: Clipping aggregated user gradients")
+        logger.info("   • User-level mode: Clipping aggregated user gradients")
     else:
-        print("   • Sample-level mode: Clipping individual sample gradients")
+        logger.info("   • Sample-level mode: Clipping individual sample gradients")
     
     # Public rehearsal setup (uses public pretrain dataset)
     if public_loader is not None and rehearsal_lambda > 0:
-        print(f"   • Public rehearsal enabled: λ={rehearsal_lambda} (using public pretrain dataset)")
+        logger.info("   • Public rehearsal enabled: λ=%s (using public pretrain dataset)", rehearsal_lambda)
         public_iter = iter(public_loader)
     else:
         public_iter = None
         if public_loader is not None and rehearsal_lambda == 0:
-            print(f"   • Public rehearsal disabled (λ=0)")
-    print()
+            logger.info("   • Public rehearsal disabled (λ=0)")
+    logger.info(" ")
     
     noise_l2, grad_norm = [], []
     adaptive_radius_computed = False
@@ -122,8 +125,8 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
         dp_epochs = max(1, int(math.ceil(epochs / 10)))
     if sigma is None:
         sigma = sigma_single_epoch / math.sqrt(dp_epochs)
-        print(f"   • Legacy accounting: T={dp_epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
-    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
+        logger.info("   • Legacy accounting: T=%s, σ_single=%.3f, σ_adjusted=%.3f", dp_epochs, sigma_single_epoch, sigma)
+    logger.info("   • DP finetuning epochs: %s (requested %s)", dp_epochs, epochs)
     
     for epoch in range(dp_epochs):
         # Reset public loader iterator each epoch
@@ -159,12 +162,12 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
                         actual_radius = adaptive_radius
                         adaptive_radius_computed = True
                         
-                        print(f"📊 Vanilla adaptive clipping from {len(grad_norm)} samples:")
-                        print(f"   • Mean: {np.mean(grad_norm):.3f}")
-                        print(f"   • Median: {np.median(grad_norm):.3f}")
-                        print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
-                        print(f"   • Max: {np.max(grad_norm):.3f}")
-                        print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
+                        logger.info("Vanilla adaptive clipping from %s samples:", len(grad_norm))
+                        logger.info("   • Mean: %.3f", np.mean(grad_norm))
+                        logger.info("   • Median: %.3f", np.median(grad_norm))
+                        logger.info("   • %.1f%% quantile: %.3f", quantile * 100, adaptive_radius)
+                        logger.info("   • Max: %.3f", np.max(grad_norm))
+                        logger.info("   → Using adaptive radius: %.3f", actual_radius)
                         
                         grad_norm = []  # Reset for actual training statistics
                 
@@ -209,19 +212,19 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
                             actual_radius = adaptive_radius
                             adaptive_radius_computed = True
                             
-                            print(f"📊 Vanilla adaptive clipping from {len(grad_norm)} users:")
-                            print(f"   • Mean user grad norm: {np.mean(grad_norm):.3f}")
-                            print(f"   • Median user grad norm: {np.median(grad_norm):.3f}")
-                            print(f"   • {quantile:.1%} quantile: {adaptive_radius:.3f}")
-                            print(f"   • Max user grad norm: {np.max(grad_norm):.3f}")
-                            print(f"   → Using adaptive radius: {actual_radius:.3f}\n")
+                            logger.info("Vanilla adaptive clipping from %s users:", len(grad_norm))
+                            logger.info("   • Mean user grad norm: %.3f", np.mean(grad_norm))
+                            logger.info("   • Median user grad norm: %.3f", np.median(grad_norm))
+                            logger.info("   • %.1f%% quantile: %.3f", quantile * 100, adaptive_radius)
+                            logger.info("   • Max user grad norm: %.3f", np.max(grad_norm))
+                            logger.info("   → Using adaptive radius: %.3f", actual_radius)
                             
                             grad_norm = []  # Reset for actual training statistics
                 
                 # In user-level DP with UserBatchSampler, we should have exactly one user per batch
                 if len(user_gradients) != 1:
-                    print(f"⚠️  Warning: Expected 1 user per batch, got {len(user_gradients)} users")
-                    print(f"   Unique users in batch: {unique_users.tolist()}")
+                    logger.warn("Expected 1 user per batch, got %s users", len(user_gradients))
+                    logger.warn("   Unique users in batch: %s", unique_users.tolist())
                 
                 # Clip each user's gradient (Euclidean clipping)
                 clipped_user_grads = []
@@ -265,7 +268,12 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
                     g_priv_norm = float(g_priv.norm().item())
                     g_pub_norm = float(g_public.norm().item())
                     ratio = g_pub_norm / (g_priv_norm + 1e-12)
-                    print(f"   📌 Rehearsal strength (batch0): ‖g_priv‖={g_priv_norm:.2f}, ‖g_pub‖={g_pub_norm:.2f}, ‖g_pub‖/‖g_priv‖={ratio:.4f}")
+                    logger.info(
+                        "   📌 Rehearsal strength (batch0): ‖g_priv‖=%.2f, ‖g_pub‖=%.2f, ‖g_pub‖/‖g_priv‖=%.4f",
+                        g_priv_norm,
+                        g_pub_norm,
+                        ratio,
+                    )
                 
                 # Combine: g_total = g_priv_DP + λ * g_public
                 g_total = g_priv + rehearsal_lambda * g_public
@@ -281,9 +289,9 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
             opt.step()
     
     grad_type = "‖g_user‖₂" if not sample_level else "‖g‖₂"
-    print(f"\n📊  Vanilla DP-SGD final stats:")
-    print(f"   • Median {grad_type} = {np.median(grad_norm):.2f}")
-    print(f"   • Isotropic noise ℓ₂ ∈ [{min(noise_l2):.1f},{max(noise_l2):.1f}]")
-    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {dp_epochs} DP epochs")
+    logger.info("Vanilla DP-SGD final stats:")
+    logger.info("   • Median %s = %.2f", grad_type, np.median(grad_norm))
+    logger.info("   • Isotropic noise ℓ₂ ∈ [%.1f,%.1f]", min(noise_l2), max(noise_l2))
+    logger.info("   • Privacy: (ε=%s, δ=%s) over %s DP epochs", epsilon, delta, dp_epochs)
     
     return model

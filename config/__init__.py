@@ -1,6 +1,4 @@
-"""Backward-compatible config shim. Prefer importing from config.config."""
-
-from config.config import (
+from .config import (
     DEFAULT_SEED,
     RANDOM_SEED,
     REHEARSAL_MAX_EXCLUDED_CLASS_RATIO,
@@ -8,6 +6,7 @@ from config.config import (
     get_random_seed,
     set_random_seeds,
 )
+from .logging import get_logger
 
 __all__ = [
     "DEFAULT_SEED",
@@ -16,4 +15,5 @@ __all__ = [
     "get_dataset_location",
     "get_random_seed",
     "set_random_seeds",
+    "get_logger",
 ]

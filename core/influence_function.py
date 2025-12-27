@@ -7,6 +7,9 @@ import torch, numpy as np, cvxpy as cp, copy
 import torch.nn.functional as F
 from tqdm import tqdm
 from data.common import move_to_device
+from config import get_logger
+
+logger = get_logger("calibration")
 
 # --------------------------------------------------------------
 # 0.  Small helpers
@@ -102,7 +105,7 @@ def get_evaluation_slice(eval_loader, target_class="all", max_samples_per_class=
         max_samples_per_class: Maximum samples per class to avoid memory issues
     """
     if target_class == "all":
-        print(f"🎯 Using ALL CLASSES for calibration (general utility improvement)")
+        logger.info("Using ALL classes for calibration (general utility improvement).")
         
         # Collect samples by class for balanced sampling
         class_samples = {}
@@ -130,21 +133,21 @@ def get_evaluation_slice(eval_loader, target_class="all", max_samples_per_class=
             all_x.append(class_x)
             all_y.append(class_y)
             total_samples += len(class_x)
-            print(f"   • Class {class_id}: {len(class_x)} samples")
+            logger.info("   • Class %s: %s samples", class_id, len(class_x))
         
         if not all_x:
-            print(f"⚠️  No samples found in evaluation data")
+            logger.warn("No samples found in evaluation data.")
             return torch.empty(0, 3, 32, 32, device=device), \
                    torch.empty(0, dtype=torch.long, device=device)
         
         eval_x = torch.cat(all_x).to(device)
         eval_y = torch.cat(all_y).to(device)
         
-        print(f"✅ Evaluation slice: {total_samples} samples across {len(class_samples)} classes")
+        logger.success("Evaluation slice: %s samples across %s classes", total_samples, len(class_samples))
         
     else:
         # Single class mode (legacy behavior)
-        print(f"🎯 Using SINGLE CLASS {target_class} for calibration (targeted improvement)")
+        logger.info("Using SINGLE CLASS %s for calibration (targeted improvement).", target_class)
         
         eval_x, eval_y = [], []
         for batch_data in eval_loader:
@@ -156,13 +159,13 @@ def get_evaluation_slice(eval_loader, target_class="all", max_samples_per_class=
                 eval_y.append(y[m])
         
         if not eval_x:
-            print(f"⚠️  No samples of class {target_class}")
+            logger.warn("No samples of class %s", target_class)
             return torch.empty(0, 3, 32, 32, device=device), \
                    torch.empty(0, dtype=torch.long, device=device)
         
         eval_x = torch.cat(eval_x).to(device)
         eval_y = torch.cat(eval_y).to(device)
-        print(f"🎯 Evaluation slice: {len(eval_x)} samples of class {target_class}")
+        logger.success("Evaluation slice: %s samples of class %s", len(eval_x), target_class)
     
     return eval_x, eval_y
 
@@ -173,8 +176,8 @@ def get_critical_slice(eval_loader, target_class: int = 3, device="cpu"):
     ⚠️  DEPRECATED: This function is deprecated and causes overfitting to single class.
     Use get_evaluation_slice with target_class="all" for general utility improvement.
     """
-    print(f"⚠️  WARNING: get_critical_slice is deprecated and causes single-class overfitting!")
-    print(f"⚠️  Recommendation: Use get_evaluation_slice(target_class='all') instead")
+    logger.warn("get_critical_slice is deprecated and causes single-class overfitting.")
+    logger.warn("Recommendation: use get_evaluation_slice(target_class='all') instead.")
     return get_evaluation_slice(eval_loader, target_class=target_class, device=device)
 
 
@@ -227,7 +230,7 @@ def compute_influence_vectors(model, public_loader, train_loader,
     infl_vecs = []
 
     if method == "linear":                                 # -----------------
-        print(f"🔒 Using privacy-preserving 'linear' method (reg={reg})")
+        logger.info("Using privacy-preserving 'linear' method (reg=%s)", reg)
         for x, y in tqdm(public_samples, desc="Privacy-preserving linear-IF"):
             model.zero_grad()
             F.cross_entropy(model(x), y).backward()
@@ -244,14 +247,14 @@ def compute_influence_vectors(model, public_loader, train_loader,
             infl_vecs.append(vec)
 
     elif method == "public-fisher":                       # -----------------
-        print(f"🔒 Using privacy-preserving 'public-fisher' method (reg={reg})")
-        print(f"   Computing Fisher information from PUBLIC data only")
+        logger.info("Using privacy-preserving 'public-fisher' method (reg=%s)", reg)
+        logger.info("   Computing Fisher information from PUBLIC data only")
         
         # Use a smaller subset for Fisher computation to avoid memory issues
         max_fisher_samples = min(100, len(public_samples))  # Much smaller for memory efficiency
         fisher_samples = public_samples[:max_fisher_samples]
         
-        print(f"   Using {max_fisher_samples} public samples for Fisher matrix computation")
+        logger.info("   Using %s public samples for Fisher matrix computation", max_fisher_samples)
         
         # Compute Fisher matrix from public data only (privacy-preserving)
         public_grads = []
@@ -262,7 +265,7 @@ def compute_influence_vectors(model, public_loader, train_loader,
                 grad_vec = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
                 public_grads.append(grad_vec.detach().cpu())  # Move to CPU to save GPU memory
             except RuntimeError as e:
-                print(f"⚠️  Error computing gradient: {e}")
+                logger.warn("Error computing gradient: %s", e)
                 continue
         
         if len(public_grads) >= 10:  # Need minimum samples for stable Fisher
@@ -273,8 +276,8 @@ def compute_influence_vectors(model, public_loader, train_loader,
                 # Add strong regularization for stability
                 fisher_public = (G_public.T @ G_public) / len(G_public) + reg * torch.eye(dim)
                 
-                print(f"   Public Fisher shape: {fisher_public.shape}")
-                print(f"   Successfully computed Fisher from {len(public_grads)} public samples")
+                logger.info("   Public Fisher shape: %s", tuple(fisher_public.shape))
+                logger.success("Computed Fisher from %s public samples", len(public_grads))
                 
                 # Compute influence vectors using public Fisher
                 for x, y in tqdm(public_samples[:200], desc="Public-Fisher influence vectors"):  # Limit total computations
@@ -288,7 +291,7 @@ def compute_influence_vectors(model, public_loader, train_loader,
                             influence_vec_flat = torch.linalg.solve(fisher_public, grad_vec.unsqueeze(1)).squeeze(1)
                         except:
                             # Fallback to pseudo-inverse if singular
-                            print("   Using pseudo-inverse for stability")
+                            logger.warn("Using pseudo-inverse for stability")
                             influence_vec_flat = torch.pinverse(fisher_public) @ grad_vec
                         
                         # Reconstruct parameter-wise influence vector
@@ -303,17 +306,17 @@ def compute_influence_vectors(model, public_loader, train_loader,
                                 vec[n] = torch.zeros_like(p)
                         infl_vecs.append(vec)
                     except Exception as e:
-                        print(f"⚠️  Error in influence computation: {e}")
+                        logger.warn("Error in influence computation: %s", e)
                         # Fallback: create zero influence vector
                         vec = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
                         infl_vecs.append(vec)
                         
             except Exception as e:
-                print(f"⚠️  Error computing public Fisher matrix: {e}")
-                print(f"   Falling back to linear method")
+                logger.warn("Error computing public Fisher matrix: %s", e)
+                logger.warn("Falling back to linear method")
                 return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
         else:
-            print(f"⚠️  Insufficient public gradients ({len(public_grads)} < 10), falling back to linear method")
+            logger.warn("Insufficient public gradients (%s < 10), falling back to linear method", len(public_grads))
             return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
 
     elif method == "batch":                                # -----------------
@@ -331,7 +334,7 @@ def compute_influence_vectors(model, public_loader, train_loader,
     else:                                                  # -----------------
         raise ValueError(f"unknown method '{method}'. Choose 'linear' for privacy-preserving influence functions.")
 
-    print(f"✅ Computed {len(infl_vecs)} privacy-preserving influence vectors using only public data")
+    logger.success("Computed %s privacy-preserving influence vectors using only public data", len(infl_vecs))
     return infl_vecs, public_samples
 
 # --------------------------------------------------------------
@@ -386,7 +389,7 @@ def calibrate_model_research_protocol(model,
     # Paper mapping — Step b (Measure utility drop):
     #   ΔL_DP = (1/|S_crit|) Σ_{s∈S_crit} [ℓ(s, θ̂_DP) − ℓ(s, θ̂_clean)]
     if clean_model is not None and len(crit_x) > 0:
-        print(f"\n📏 MEASURING ΔL_DP: Utility drop due to DP noise on critical slice")
+        logger.info("MEASURING ΔL_DP: Utility drop due to DP noise on critical slice")
         
         clean_model.eval()
         model.eval()
@@ -399,20 +402,20 @@ def calibrate_model_research_protocol(model,
             
             delta_L_DP = dp_loss.item() - clean_loss.item()
             
-        print(f"   • Clean model loss: {clean_loss.item():.4f}")
-        print(f"   • DP model loss:    {dp_loss.item():.4f}")
-        print(f"   • ΔL_DP = L_DP - L_clean = {delta_L_DP:+.4f}")
+        logger.info("   • Clean model loss: %.4f", clean_loss.item())
+        logger.info("   • DP model loss:    %.4f", dp_loss.item())
+        logger.info("   • ΔL_DP = L_DP - L_clean = %+0.4f", delta_L_DP)
         
         if delta_L_DP > 0:
-            print(f"   📈 DP noise caused utility degradation (higher loss)")
-            print(f"   🎯 Goal: Use calibration to recover utility loss")
+            logger.info("   📈 DP noise caused utility degradation (higher loss).")
+            logger.info("   🎯 Goal: use calibration to recover utility loss.")
         else:
-            print(f"   📉 DP model performs better than clean (unusual)")
+            logger.warn("   📉 DP model performs better than clean (unusual).")
     else:
         if clean_model is None:
-            print(f"\n⚠️  SKIPPING ΔL_DP measurement: No clean_model provided")
+            logger.warn("Skipping ΔL_DP measurement: no clean_model provided.")
         else:
-            print(f"\n⚠️  SKIPPING ΔL_DP measurement: No critical slice samples")
+            logger.warn("Skipping ΔL_DP measurement: no critical slice samples.")
 
     # ---- a) slice gradient J
     # Paper mapping — Step c(a): J = ∇_θ (1/m Σ_{s∈S_crit} ℓ(s, θ̂)) at the current θ̂
@@ -444,26 +447,31 @@ def calibrate_model_research_protocol(model,
     w = np.zeros_like(scores)
     w[idx] = 1.0
 
-    print(f"\n📊 Influence score statistics:")
-    print(f"   • Score range: [{scores.min():.4f}, {scores.max():.4f}]")
-    print(f"   • Selected {eta} samples with HIGHEST scores: [{scores[idx].min():.4f}, {scores[idx].max():.4f}]")
-    print(f"   • Mean selected score: {scores[idx].mean():.4f}")
-    print(f"   • Score std: {scores.std():.4f}")
-    print(f"   • Median score: {np.median(scores):.4f}")
-    print(f"   🎯 Goal: Select samples that help reduce evaluation slice loss (positive scores)")
+    logger.info("Influence score statistics:")
+    logger.info("   • Score range: [%.4f, %.4f]", scores.min(), scores.max())
+    logger.info(
+        "   • Selected %s samples with HIGHEST scores: [%.4f, %.4f]",
+        eta,
+        scores[idx].min(),
+        scores[idx].max(),
+    )
+    logger.info("   • Mean selected score: %.4f", scores[idx].mean())
+    logger.info("   • Score std: %.4f", scores.std())
+    logger.info("   • Median score: %.4f", np.median(scores))
+    logger.info("   🎯 Goal: Select samples that help reduce evaluation slice loss (positive scores)")
     
     # Additional diagnostic: check if we have any helpful samples
     positive_scores = scores[scores > 0]
     negative_scores = scores[scores < 0]
-    print(f"   • Helpful samples (score > 0): {len(positive_scores)} out of {len(scores)}")
-    print(f"   • Harmful samples (score < 0): {len(negative_scores)} out of {len(scores)}")
+    logger.info("   • Helpful samples (score > 0): %s out of %s", len(positive_scores), len(scores))
+    logger.info("   • Harmful samples (score < 0): %s out of %s", len(negative_scores), len(scores))
     
     if len(positive_scores) == 0:
-        print(f"   ⚠️  WARNING: No helpful public samples found! All would increase evaluation loss.")
-        print(f"   💡 This suggests domain mismatch between public and evaluation data.")
+        logger.warn("No helpful public samples found. All would increase evaluation loss.")
+        logger.warn("This suggests domain mismatch between public and evaluation data.")
     elif len(positive_scores) < eta:
-        print(f"   ⚠️  WARNING: Only {len(positive_scores)} helpful samples, but requesting {eta}")
-        print(f"   💡 Reducing eta to {len(positive_scores)} to avoid harmful samples")
+        logger.warn("Only %s helpful samples, but requesting %s", len(positive_scores), eta)
+        logger.warn("Reducing eta to %s to avoid harmful samples", len(positive_scores))
         # Only use actually helpful samples
         helpful_idx = np.where(scores > 0)[0]
         w = np.zeros_like(scores)
@@ -472,10 +480,10 @@ def calibrate_model_research_protocol(model,
 
     # 🔍 DIAGNOSTIC: Check influence vector statistics
     infl_norms = [torch.sqrt(sum(v[n].pow(2).sum() for n in v.keys())).item() for v in infl_vecs]
-    print(f"\n🔍 Influence vector diagnostics:")
-    print(f"   • Influence vector norms range: [{min(infl_norms):.4f}, {max(infl_norms):.4f}]")
-    print(f"   • Mean influence vector norm: {np.mean(infl_norms):.4f}")
-    print(f"   • Influence vectors used (nonzero weights): {np.sum(w > 0)}")
+    logger.info("Influence vector diagnostics:")
+    logger.info("   • Influence vector norms range: [%.4f, %.4f]", min(infl_norms), max(infl_norms))
+    logger.info("   • Mean influence vector norm: %.4f", np.mean(infl_norms))
+    logger.info("   • Influence vectors used (nonzero weights): %s", np.sum(w > 0))
 
     # ---- e) Bias computation
     # Paper mapping — Step d(ii): Δθ = - (1/n) H_{θ̂}^{-1} Σ_z w_z ∇ℓ(z, θ̂)
@@ -483,8 +491,8 @@ def calibrate_model_research_protocol(model,
     # Move in direction that helpful public samples suggest
     n_selected = np.sum(w > 0)  # Number of selected samples
     if n_selected == 0:
-        print(f"⚠️  WARNING: No helpful samples found for calibration - skipping update")
-        print(f"   💡 This suggests the public data can't help improve the evaluation slice")
+        logger.warn("No helpful samples found for calibration - skipping update")
+        logger.warn("This suggests the public data can't help improve the evaluation slice")
         return model
         
     delta = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
@@ -496,12 +504,12 @@ def calibrate_model_research_protocol(model,
 
     # 🔍 DIAGNOSTIC: Check delta before trust region
     delta_norm_before = _frob_norm(delta)
-    print(f"\n🔍 Parameter update diagnostics:")
-    print(f"   • Raw Δθ norm before trust region: {delta_norm_before:.4f}")
-    print(f"   • Using CORRECTED formula: Δθ = (1/η) Σ_{{helpful}} H⁻¹ ∇ℓ(public_sample)")
-    print(f"   • Helpful samples used η: {n_selected}")
-    print(f"   • Direction: Move model toward what helpful public samples suggest")
-    print(f"   • Privacy-preserving: Uses only public data + DP model output")
+    logger.info("Parameter update diagnostics:")
+    logger.info("   • Raw Δθ norm before trust region: %.4f", delta_norm_before)
+    logger.info("   • Using CORRECTED formula: Δθ = (1/η) Σ_{helpful} H⁻¹ ∇ℓ(public_sample)")
+    logger.info("   • Helpful samples used η: %s", n_selected)
+    logger.info("   • Direction: Move model toward what helpful public samples suggest")
+    logger.info("   • Privacy-preserving: Uses only public data + DP model output")
 
     # ---- f) trust-region clip (IMPROVED: more generous)
     # Paper mapping — Step d(iii): Back-tracking line search over α ∈ {1, 1/2, 1/4, ...}
@@ -510,32 +518,38 @@ def calibrate_model_research_protocol(model,
     #       ablation_optimized.calibrate_with_line_search(), which wraps this update.
     ref_norm = torch.sqrt(sum(p.pow(2).sum()
                               for p in model.parameters())).item()
-    print(f"   • Model parameter norm ‖θ‖: {ref_norm:.4f}")
-    print(f"   • Trust region limit (τ × ‖θ‖): {trust_tau * ref_norm:.4f}")
+    logger.info("   • Model parameter norm ‖θ‖: %.4f", ref_norm)
+    logger.info("   • Trust region limit (τ × ‖θ‖): %.4f", trust_tau * ref_norm)
     
     delta = apply_trust_region(delta, ref_norm, tau=trust_tau)
     delta_norm_after = _frob_norm(delta)
-    print(f"   • Final Δθ norm after trust region: {delta_norm_after:.4f}")
-    print(f"   • Trust region scaling factor: {delta_norm_after / (delta_norm_before + 1e-12):.4f}")
+    logger.info("   • Final Δθ norm after trust region: %.4f", delta_norm_after)
+    logger.info(
+        "   • Trust region scaling factor: %.4f",
+        delta_norm_after / (delta_norm_before + 1e-12),
+    )
     
     # 🔍 DIAGNOSTIC: Check relative parameter change
     relative_change = delta_norm_after / ref_norm
-    print(f"   • Relative parameter change: {relative_change:.4f} ({relative_change*100:.2f}%)")
+    logger.info("   • Relative parameter change: %.4f (%.2f%%)", relative_change, relative_change * 100)
     
     if relative_change > 0.2:
-        print(f"   ⚠️  WARNING: Large parameter change (>{20:.0f}%) may cause instability")
+        logger.warn("Large parameter change (>20%%) may cause instability")
     elif relative_change < 0.005:
-        print(f"   ⚠️  WARNING: Very small parameter change (<{0.5:.1f}%) may be ineffective")
-        print(f"   💡 SUGGESTION: Try decreasing reg parameter or increasing trust_tau")
+        logger.warn("Very small parameter change (<0.5%%) may be ineffective")
+        logger.warn("Suggestion: try decreasing reg parameter or increasing trust_tau")
 
     # ---- g) apply calibration: θ̂* = θ̂_DP + Δθ
     with torch.no_grad():
         for n, p in model.named_parameters():
             p.add_(delta[n])
 
-    print(f"✅ Privacy-preserving calibration applied (‖Δθ‖₂ ≈ {_frob_norm(delta):.4f}, "
-          f"trust τ={trust_tau})")
-    print(f"🔒 Post-processing theorem: Privacy guarantees preserved")
+    logger.success(
+        "Privacy-preserving calibration applied (‖Δθ‖₂ ≈ %.4f, trust τ=%s)",
+        _frob_norm(delta),
+        trust_tau,
+    )
+    logger.success("Post-processing theorem: privacy guarantees preserved.")
     return model
 
 

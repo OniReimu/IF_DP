@@ -20,6 +20,10 @@ import torch
 from opacus.accountants import RDPAccountant
 from opacus.accountants.utils import get_noise_multiplier
 
+from config import get_logger
+
+logger = get_logger("privacy")
+
 
 def get_privacy_params_for_target_epsilon(
     target_epsilon: float,
@@ -198,15 +202,15 @@ def print_privacy_summary(
 ) -> None:
     """Print a summary of privacy parameters."""
     
-    print(f"\n🔒 {method_name} Privacy Summary:")
-    print(f"   • Target (ε, δ): ({target_epsilon}, {delta})")
-    print(f"   • Actual ε: {actual_epsilon:.4f}")
-    print(f"   • Noise multiplier: {noise_multiplier:.4f}")
-    print(f"   • Total steps: {steps}")
-    print(f"   • Sample rate: {sample_rate:.4f}")
+    logger.highlight(f"{method_name} Privacy Summary")
+    logger.info("   • Target (ε, δ): (%.4f, %.1e)", target_epsilon, delta)
+    logger.info("   • Actual ε: %.4f", actual_epsilon)
+    logger.info("   • Noise multiplier: %.4f", noise_multiplier)
+    logger.info("   • Total steps: %s", steps)
+    logger.info("   • Sample rate: %.4f", sample_rate)
     
     if abs(actual_epsilon - target_epsilon) > 0.1:
-        print(f"   ⚠️  Privacy level differs from target!")
+        logger.warn("Privacy level differs from target.")
 
 
 # Example usage for fair comparison
@@ -232,20 +236,19 @@ def setup_fair_comparison(
         epochs=epochs
     )
     
-    print(f"\n🎯 Fair Comparison Setup:")
-    print(f"   • Target: (ε={target_epsilon}, δ={target_delta})")
-    print(f"   • Dataset size: {dataset_size}, Batch size: {batch_size}")
-    print(f"   • Sample rate: {sample_rate:.4f}")
-    print(f"   • Epochs: {epochs}, Total steps: {total_steps}")
-    print(f"   • Required noise multiplier: {noise_multiplier:.4f}")
+    logger.highlight("Fair Comparison Setup")
+    logger.info("   • Target: (ε=%s, δ=%s)", target_epsilon, target_delta)
+    logger.info("   • Dataset size: %s, Batch size: %s", dataset_size, batch_size)
+    logger.info("   • Sample rate: %.4f", sample_rate)
+    logger.info("   • Epochs: %s, Total steps: %s", epochs, total_steps)
+    logger.info("   • Required noise multiplier: %.4f", noise_multiplier)
     
     return noise_multiplier, sample_rate, total_steps
 
 
 if __name__ == "__main__":
     # Example: Calculate privacy parameters for CIFAR-10 experiment
-    print("Example: CIFAR-10 Privacy Accounting")
-    print("=" * 50)
+    logger.highlight("Example: CIFAR-10 Privacy Accounting")
     
     # Typical CIFAR-10 private training setup
     dataset_size = 10000  # Private training samples
@@ -270,7 +273,7 @@ if __name__ == "__main__":
         target_delta=target_delta
     )
     
-    print(f"\n✅ Verification:")
-    print(f"   • Computed noise multiplier: {noise_mult:.4f}")
-    print(f"   • Actual epsilon achieved: {actual_epsilon:.4f}")
-    print(f"   • Error: {abs(actual_epsilon - target_epsilon):.4f}") 
+    logger.success("Verification:")
+    logger.info("   • Computed noise multiplier: %.4f", noise_mult)
+    logger.info("   • Actual epsilon achieved: %.4f", actual_epsilon)
+    logger.info("   • Error: %.4f", abs(actual_epsilon - target_epsilon))

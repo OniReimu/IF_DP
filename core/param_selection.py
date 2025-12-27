@@ -7,6 +7,10 @@ the same parameters when using --dp-param-count, enabling fair comparison.
 from typing import List, Tuple, Optional
 import torch.nn as nn
 
+from config import get_logger
+
+logger = get_logger("param_select")
+
 
 def select_parameters_by_budget(
     model: nn.Module,
@@ -37,7 +41,7 @@ def select_parameters_by_budget(
     if dp_param_count is not None:
         # DP parameter budget mode: prioritize classifier/head parameters first
         if verbose:
-            print(f"   🎯 DP Parameter Budget Mode: selecting up to {dp_param_count} parameters (head-first)")
+            logger.info("   🎯 DP Parameter Budget Mode: selecting up to %s parameters (head-first)", dp_param_count)
         
         def _is_head_param(param_name: str) -> bool:
             parts = param_name.split(".")
@@ -99,21 +103,41 @@ def select_parameters_by_budget(
         }
         
         if verbose:
-            print(f"   ✅ Selected {len(names)} complete parameters")
-            print(f"      Budget: {dp_param_count} | Used: {total_selected} | Unused: {unused} ({efficiency:.1f}% efficiency)")
+            logger.info("   ✅ Selected %s complete parameters", len(names))
+            logger.info(
+                "      Budget: %s | Used: %s | Unused: %s (%.1f%% efficiency)",
+                dp_param_count,
+                total_selected,
+                unused,
+                efficiency,
+            )
             if head_total_params > 0:
-                print(f"      Head params: selected {head_selected} tensors (head scalars available: {head_total_params})")
+                logger.info(
+                    "      Head params: selected %s tensors (head scalars available: %s)",
+                    head_selected,
+                    head_total_params,
+                )
                 if head_selected == 0 and head_min_tensor > 0 and dp_param_count < head_min_tensor:
-                    print(f"   ⚠️  Budget too small to include even the smallest head tensor (min head tensor size={head_min_tensor}).")
-                    print(f"      Increase --dp-param-count or use --dp-layer to target the classifier/head directly.")
+                    logger.warn(
+                        "Budget too small to include the smallest head tensor (min head tensor size=%s).",
+                        head_min_tensor,
+                    )
+                    logger.warn("Increase --dp-param-count or use --dp-layer to target the classifier/head directly.")
                 elif head_skipped:
                     skipped_preview = ", ".join(f"{n}({s})" for n, s in head_skipped[:3])
                     extra = "" if len(head_skipped) <= 3 else f", +{len(head_skipped)-3} more"
-                    print(f"   ⚠️  Some head tensors were skipped under this budget: {skipped_preview}{extra}")
+                    logger.warn("Some head tensors were skipped under this budget: %s%s", skipped_preview, extra)
                     if head_oversize:
                         biggest = max(head_oversize, key=lambda x: x[1])
-                        print(f"      Budget {dp_param_count} cannot include {biggest[0]} (size={biggest[1]}), so it will be frozen.")
-                        print(f"      If you need the classifier/head to adapt (e.g., excluded classes), increase --dp-param-count or use --dp-layer backbone.classifier.")
+                        logger.warn(
+                            "Budget %s cannot include %s (size=%s), so it will be frozen.",
+                            dp_param_count,
+                            biggest[0],
+                            biggest[1],
+                        )
+                        logger.warn(
+                            "If you need the classifier/head to adapt (e.g., excluded classes), increase --dp-param-count or use --dp-layer backbone.classifier."
+                        )
         
         return names, params, stats
     

@@ -38,7 +38,8 @@ from core.device_utils import resolve_device, maybe_wrap_model_for_multi_gpu
 from data import DATASET_REGISTRY, DatasetConfig, build_dataset_builder
 from core.mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
 from core.influence_function import calibrate_model_research_protocol
-from core.config import set_random_seeds, get_random_seed, get_dataset_location
+from config import get_logger
+from config import get_dataset_location, get_random_seed, set_random_seeds
 from data.common import prepare_batch, SyntheticUserDataset, UserBatchSampler, move_to_device
 
 AVAILABLE_DATASETS = tuple(DATASET_REGISTRY.keys())
@@ -47,6 +48,7 @@ AVAILABLE_MODELS = tuple(available_models())
 set_random_seeds()  # Set reproducible random seeds
 np.random.seed(get_random_seed())
 models_dir = './saved_models'; os.makedirs(models_dir, exist_ok=True)
+logger = get_logger("ablation")
 
 # ════════════════════════════════════════════════════════════════
 # Cache helpers
@@ -103,24 +105,40 @@ def print_calibration_effect(before_stats, after_stats, target_class="all"):
     else:
         slice_description = f"Class {target_class}"
     
-    print(f"\n📊 Calibration Effect Analysis ({slice_description}):")
-    print(f"   • Samples evaluated: {before_stats['num_samples']}")
-    print(f"   • Loss before:   {before_stats['loss']:.4f}")
-    print(f"   • Loss after:    {after_stats['loss']:.4f}")
-    print(f"   • Δ Loss:        {after_stats['loss'] - before_stats['loss']:+.4f}")
-    print(f"   • Accuracy before: {before_stats['accuracy']:.2f}%")
-    print(f"   • Accuracy after:  {after_stats['accuracy']:.2f}%")
-    print(f"   • Δ Accuracy:      {after_stats['accuracy'] - before_stats['accuracy']:+.2f}%")
+    logger.info("Calibration Effect Analysis (%s):", slice_description)
+    logger.info("   • Samples evaluated: %s", before_stats["num_samples"])
+    logger.info("   • Loss before:   %.4f", before_stats["loss"])
+    logger.info("   • Loss after:    %.4f", after_stats["loss"])
+    logger.info("   • Δ Loss:        %+0.4f", after_stats["loss"] - before_stats["loss"])
+    logger.info("   • Accuracy before: %.2f%%", before_stats["accuracy"])
+    logger.info("   • Accuracy after:  %.2f%%", after_stats["accuracy"])
+    logger.info("   • Δ Accuracy:      %+0.2f%%", after_stats["accuracy"] - before_stats["accuracy"])
     
     if after_stats['loss'] < before_stats['loss']:
-        print(f"   ✅ SUCCESS: Calibration reduced evaluation slice loss!")
+        logger.success("Calibration reduced evaluation slice loss.")
     else:
-        print(f"   ⚠️  WARNING: Calibration increased evaluation slice loss")
+        logger.warn("Calibration increased evaluation slice loss.")
     
     if after_stats['accuracy'] > before_stats['accuracy']:
-        print(f"   ✅ SUCCESS: Calibration improved evaluation slice accuracy!")
+        logger.success("Calibration improved evaluation slice accuracy.")
     else:
-        print(f"   ⚠️  WARNING: Calibration reduced evaluation slice accuracy")
+        logger.warn("Calibration reduced evaluation slice accuracy.")
+
+
+def log_privacy_guarantee_summary(args, dp_epochs, steps_per_epoch, total_steps, sample_rate, noise_multiplier):
+    """Log the DP guarantee and accounting ingredients."""
+    mode = "user-level" if not args.sample_level else "sample-level"
+    logger.highlight("DP Guarantee (Accountant)")
+    logger.info("Accountant: RDP (Opacus)")
+    logger.info("Target (ε, δ): (%.4f, %.1e)", args.target_epsilon, args.delta)
+    logger.info("DP mode: %s", mode)
+    if not args.sample_level:
+        logger.info("User definition: %s synthetic users", args.users)
+    logger.info("Sampling rate q: %.6f", sample_rate)
+    logger.info("Steps: %s (dp_epochs=%s, steps/epoch=%s)", total_steps, dp_epochs, steps_per_epoch)
+    logger.info("Clip norm C: %.4f", args.clip_radius)
+    logger.info("Noise multiplier σ: %.4f", noise_multiplier)
+    logger.info("Noise std: %.4f (σ×C)", noise_multiplier * args.clip_radius)
 
 
 def count_samples(loader):
@@ -211,7 +229,7 @@ def load_state_dict_forgiving(model, state_dict, description="model"):
         # Only apply if we meaningfully improve compatibility.
         if best_rule is not None and best_matches > base_matches:
             src_prefix, dst_prefix = best_rule
-            print(f"   🔧 Remapped checkpoint keys for {description}: '{src_prefix}*' → '{dst_prefix}*' ({base_matches}→{best_matches} matching keys)")
+            logger.info(f"   🔧 Remapped checkpoint keys for {description}: '{src_prefix}*' → '{dst_prefix}*' ({base_matches}→{best_matches} matching keys)")
             state_dict = best_state
 
     compatible_state = {}
@@ -226,12 +244,12 @@ def load_state_dict_forgiving(model, state_dict, description="model"):
         compatible_state[key] = value
     model.load_state_dict(compatible_state, strict=False)
     if not compatible_state and isinstance(state_dict, dict) and len(state_dict) > 0:
-        print(f"   ⚠️  Loaded 0 parameters for {description}. The checkpoint is likely incompatible with this model wrapper/type.")
+        logger.warn(f"   ⚠️  Loaded 0 parameters for {description}. The checkpoint is likely incompatible with this model wrapper/type.")
     if skipped:
-        print(f"   ⚠️  Skipped {len(skipped)} incompatible parameters when loading {description}:")
+        logger.warn(f"   ⚠️  Skipped {len(skipped)} incompatible parameters when loading {description}:")
         for name in skipped:
-            print(f"      • {name}")
-        print("      (This is expected when switching between datasets such as CIFAR-10 and CIFAR-100.)")
+            logger.info(f"      • {name}")
+        logger.info("      (This is expected when switching between datasets such as CIFAR-10 and CIFAR-100.)")
     return skipped
 
 
@@ -338,32 +356,32 @@ def build_critical_slice(eval_loader, target_class="all", label_mapping=None, ma
 
     if use_all_classes:
         if not class_counts:
-            print("⚠️  No samples found in evaluation data")
+            logger.warn("⚠️  No samples found in evaluation data")
             return None, torch.empty(0, dtype=torch.long)
 
         ordered = sorted(class_counts.keys())
         combined_features = []
         combined_labels = []
         total_samples = 0
-        print("🎯 Using ALL CLASSES for calibration (general utility improvement)")
+        logger.info("Using ALL classes for calibration (general utility improvement).")
         for cls in ordered:
             combined_features.append(_concat_feature_chunks(class_chunks[cls]))
             combined_labels.append(torch.cat(label_chunks[cls], dim=0))
             total_samples += class_counts[cls]
-            print(f"   • {_describe(cls, class_counts[cls])}")
+            logger.info(f"   • {_describe(cls, class_counts[cls])}")
 
         crit_features = _concat_feature_chunks(combined_features)
         crit_labels = torch.cat(combined_labels, dim=0)
-        print(f"✅ Evaluation slice: {total_samples} samples across {len(ordered)} classes")
+        logger.success(f"✅ Evaluation slice: {total_samples} samples across {len(ordered)} classes")
         return crit_features, crit_labels
 
     collected = class_counts.get(target_value, 0)
     if collected == 0:
-        print(f"⚠️  No samples of class {target_value}")
+        logger.warn(f"⚠️  No samples of class {target_value}")
         return None, torch.empty(0, dtype=torch.long)
 
-    print(f"🎯 Using SINGLE CLASS {target_value} for calibration (targeted improvement)")
-    print(f"   • {_describe(target_value, collected)}")
+    logger.info(f"🎯 Using SINGLE CLASS {target_value} for calibration (targeted improvement)")
+    logger.info(f"   • {_describe(target_value, collected)}")
     crit_features = _concat_feature_chunks(class_chunks[target_value])
     crit_labels = torch.cat(label_chunks[target_value], dim=0)
     return crit_features, crit_labels
@@ -413,11 +431,11 @@ def calibrate_with_line_search(model, pub_loader, priv_loader, critical_data, cr
       3) pick α that yields the lowest L_crit on the critical slice.
     """
     
-    print(f"🔍 Line Search Calibration:")
-    print(f"   • Method: {method}")
-    print(f"   • Eta: {eta}")
-    print(f"   • Trust tau: {trust_tau}")
-    print(f"   • Regularization: {reg}")
+    logger.info(f"🔍 Line Search Calibration:")
+    logger.info(f"   • Method: {method}")
+    logger.info(f"   • Eta: {eta}")
+    logger.info(f"   • Trust tau: {trust_tau}")
+    logger.info(f"   • Regularization: {reg}")
     
     # First get the standard influence update
     # Paper mapping — Steps 3–4(b): compute α(z), select top-η, form Δθ via influence vectors
@@ -439,14 +457,14 @@ def calibrate_with_line_search(model, pub_loader, priv_loader, critical_data, cr
     candidates = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     best_loss, best_gamma = float('inf'), 0.0
     
-    print(f"   🔍 Line search over {len(candidates)} step size candidates...")
+    logger.info(f"   🔍 Line search over {len(candidates)} step size candidates...")
     
     for gamma in candidates:
         test_model = copy.deepcopy(model)
         _add_delta(test_model, delta, gamma)
         loss = _eval_slice_loss(test_model, critical_data, critical_targets, device)
         
-        print(f"     • γ={gamma:.2f}: loss={loss:.4f}")
+        logger.info(f"     • γ={gamma:.2f}: loss={loss:.4f}")
         
         if loss < best_loss:
             best_loss, best_gamma = loss, gamma
@@ -455,7 +473,7 @@ def calibrate_with_line_search(model, pub_loader, priv_loader, critical_data, cr
     final_model = copy.deepcopy(model)
     _add_delta(final_model, delta, best_gamma)
     
-    print(f"   ✅ Optimal step size: γ={best_gamma:.2f} (loss: {best_loss:.4f})")
+    logger.success(f"   ✅ Optimal step size: γ={best_gamma:.2f} (loss: {best_loss:.4f})")
     
     return final_model
 
@@ -477,21 +495,21 @@ def calibrate_with_combined_optimization(model, pub_loader, priv_loader, critica
     reselects top-η, recomputes Δθ^(t), then performs a back-tracking line search to get θ̂^(t+1).
     """
     
-    print(f"🚀 Combined Line Search + Multi-Step Calibration:")
-    print(f"   • Method: {method}")
-    print(f"   • Eta: {eta}")
-    print(f"   • Trust tau: {trust_tau}")
-    print(f"   • Max steps: {max_steps}")
+    logger.info(f"🚀 Combined Line Search + Multi-Step Calibration:")
+    logger.info(f"   • Method: {method}")
+    logger.info(f"   • Eta: {eta}")
+    logger.info(f"   • Trust tau: {trust_tau}")
+    logger.info(f"   • Max steps: {max_steps}")
     
     current_model = copy.deepcopy(model)
     best_model = copy.deepcopy(model)
     best_loss = _eval_slice_loss(model, critical_data, critical_targets, device)
     no_improvement_count = 0
     
-    print(f"   📊 Initial loss: {best_loss:.4f}")
+    logger.info(f"   📊 Initial loss: {best_loss:.4f}")
     
     for step in range(max_steps):
-        print(f"   🔄 Combined Step {step + 1}/{max_steps}:")
+        logger.info(f"   🔄 Combined Step {step + 1}/{max_steps}:")
         
         # Apply line search calibration for this step
         # Paper mapping — Step 4(d): recompute α(z) and Δθ at θ̂^(t), then line search to obtain θ̂^(t+1)
@@ -506,26 +524,26 @@ def calibrate_with_combined_optimization(model, pub_loader, priv_loader, critica
         step_loss = _eval_slice_loss(step_calibrated, critical_data, critical_targets, device)
         improvement = best_loss - step_loss
         
-        print(f"     • Loss: {step_loss:.4f}")
-        print(f"     • Improvement: {improvement:+.4f}")
+        logger.info(f"     • Loss: {step_loss:.4f}")
+        logger.info(f"     • Improvement: {improvement:+.4f}")
         
         if improvement > min_improvement:
-            print(f"     ✅ Improvement above threshold")
+            logger.success(f"     ✅ Improvement above threshold")
             best_model = copy.deepcopy(step_calibrated)
             best_loss = step_loss
             current_model = step_calibrated
             no_improvement_count = 0
         else:
-            print(f"     ⚠️  Improvement below threshold")
+            logger.warn(f"     ⚠️  Improvement below threshold")
             no_improvement_count += 1
             
             if no_improvement_count >= patience:
-                print(f"     🛑 Early stopping: {patience} steps without improvement")
+                logger.info(f"     🛑 Early stopping: {patience} steps without improvement")
                 break
     
-    print(f"   ✅ Combined optimization complete!")
-    print(f"   • Best loss: {best_loss:.4f}")
-    print(f"   • Steps completed: {step + 1}")
+    logger.success(f"   ✅ Combined optimization complete!")
+    logger.info(f"   • Best loss: {best_loss:.4f}")
+    logger.info(f"   • Steps completed: {step + 1}")
     
     return best_model
 
@@ -646,16 +664,16 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     
     # Fisher eigendecomposition (use pre-computed if available)
     if precomputed_lam is not None and precomputed_U is not None:
-        print(f"   ✅ Using pre-computed Fisher eigendecomposition")
+        logger.success(f"   ✅ Using pre-computed Fisher eigendecomposition")
         lam, U = precomputed_lam, precomputed_U
         actual_k = len(lam)
     else:
-        print(f"   🔍 Computing Fisher eigendecomposition...")
+        logger.info(f"   🔍 Computing Fisher eigendecomposition...")
         lam, U = topk_eigh_with_floor(fisher, k=k, lam_floor=lam_floor)
         lam, U = lam.to(device), U.to(device)
         actual_k = len(lam)
         if actual_k != k:
-            print(f"⚠️  Using k={actual_k} eigenpairs (requested {k}) due to matrix rank constraints")
+            logger.warn(f"⚠️  Using k={actual_k} eigenpairs (requested {k}) due to matrix rank constraints")
     
     # Compute both scaling factors
     inv_sqrt_lam = lam.rsqrt()  # 1/√λ (negatively correlated: less noise in high curvature)
@@ -674,11 +692,11 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     
     # Privacy accounting
     if sigma is not None:
-        print(f"   • Using provided sigma: {sigma:.4f}")
+        logger.info(f"   • Using provided sigma: {sigma:.4f}")
     else:
         sigma_single_epoch = math.sqrt(2*math.log(1.25/delta)) / epsilon
         sigma = sigma_single_epoch / math.sqrt(epochs)
-        print(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+        logger.info(f"   • Legacy accounting: σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
 
     # Use shared parameter selection utility for consistency across all DP methods
     # This ensures Fisher matrix and training parameter subsets are consistent (avoids U/grad mismatch)
@@ -699,7 +717,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             p.requires_grad = True
     
     if frozen_count > 0:
-        print(f"   🔒 Strict DP: Frozen {frozen_count} parameter groups (trained on public data)")
+        logger.info(f"   🔒 Strict DP: Frozen {frozen_count} parameter groups (trained on public data)")
 
     # Auto-detect DP mode if not specified
     if sample_level is None:
@@ -714,39 +732,37 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     mode_str = "Sample-level" if sample_level else "User-level"
     opt_type = "DP-SAT" if use_dp_sat else "Normal"
     
-    print(f"\n🎯 Fisher DP + {optimizer_name} Optimizer: {mode_str} DP  layers={target_layer}  ε={epsilon}")
+    logger.info(f"\n🎯 Fisher DP + {optimizer_name} Optimizer: {mode_str} DP  layers={target_layer}  ε={epsilon}")
     if sigma is not None:
-        print(f"   • Proper privacy accounting: σ={sigma:.4f}")
+        logger.info(f"   • Proper privacy accounting: σ={sigma:.4f}")
     else:
-        print(f"   • Multi-epoch privacy: T={epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
-    print(f"   • Fisher subspace: k={actual_k}, complement dim={param_dim-actual_k}")
-    print(f"   • Target Euclidean sensitivity: Δ₂ = {clip_radius:.3f} (will convert to Mahalanobis)")
-    print(f"   • Full complement noise: {full_complement_noise}")
-    print(f"   • Optimizer type: {opt_type}")
-    print(f"   • Noise scaling strategy: {strategy_name}")
+        logger.info(f"   • Multi-epoch privacy: T={epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
+    logger.info(f"   • Fisher subspace: k={actual_k}, complement dim={param_dim-actual_k}")
+    logger.info(f"   • Target Euclidean sensitivity: Δ₂ = {clip_radius:.3f} (will convert to Mahalanobis)")
+    logger.info(f"   • Full complement noise: {full_complement_noise}")
+    logger.info(f"   • Optimizer type: {opt_type}")
+    logger.info(f"   • Noise scaling strategy: {strategy_name}")
     if use_dp_sat or dp_sat_mode != "none":
-        print(f"   • DP-SAT enabled: mode={dp_sat_mode}, ρ={rho_sat}")
+        logger.info(f"   • DP-SAT enabled: mode={dp_sat_mode}, ρ={rho_sat}")
         if dp_sat_mode == "fisher":
-            print(f"   • ✨ Using Fisher-whitened weight perturbation (Fisher DP-SAT)")
+            logger.info(f"   • ✨ Using Fisher-whitened weight perturbation (Fisher DP-SAT)")
         elif dp_sat_mode == "euclidean":
-            print(f"   • ⚠️  Using Euclidean weight perturbation (Euclidean DP-SAT)")
-    print(f"   • Adaptive clipping: {adaptive_clip}")
+            logger.warn(f"   • ⚠️  Using Euclidean weight perturbation (Euclidean DP-SAT)")
+    logger.info(f"   • Adaptive clipping: {adaptive_clip}")
     
     if not sample_level:
-        print("   • User-level mode: Clipping aggregated user gradients")
+        logger.info("   • User-level mode: Clipping aggregated user gradients")
     else:
-        print("   • Sample-level mode: Clipping individual sample gradients")
+        logger.info("   • Sample-level mode: Clipping individual sample gradients")
     
     # Public rehearsal setup (uses public pretrain dataset)
     if public_loader is not None and rehearsal_lambda > 0:
-        print(f"   • Public rehearsal enabled: λ={rehearsal_lambda} (using public pretrain dataset)")
+        logger.info(f"   • Public rehearsal enabled: λ={rehearsal_lambda} (using public pretrain dataset)")
         public_iter = iter(public_loader)
     else:
         public_iter = None
         if public_loader is not None and rehearsal_lambda == 0:
-            print(f"   • Public rehearsal disabled (λ=0)")
-    print()
-
+            logger.info(f"   • Public rehearsal disabled (λ=0)")
     noise_l2, grad_norm, flatness_norm = [], [], []
     euclidean_norms = []  # Track Euclidean norms for calibration
     adaptive_radius_computed = False
@@ -760,7 +776,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     # Determine DP fine-tuning epochs
     if dp_epochs is None:
         dp_epochs = max(1, int(math.ceil(epochs / 10)))
-    print(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
+    logger.info(f"   • DP finetuning epochs: {dp_epochs} (requested {epochs})")
 
     for epoch in range(dp_epochs):
         # Reset public loader iterator each epoch
@@ -827,10 +843,10 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                             euclidean_target = euclidean_adaptive_radius  # Update target
                             adaptive_radius_computed = True
                             
-                            print(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} samples (EUCLIDEAN norms):")
-                            print(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
-                            print(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
-                            print(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
+                            logger.info(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} samples (EUCLIDEAN norms):")
+                            logger.info(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
+                            logger.info(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
+                            logger.info(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
                     
                     # Calibration: find Mahalanobis threshold that matches Euclidean sensitivity
                     if not calibration_computed and len(euclidean_norms) >= 50:
@@ -853,12 +869,12 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                         actual_radius = (maha_low + maha_high) / 2
                         calibration_computed = True
                         
-                        print(f"🎯 Ablation norm calibration completed:")
-                        print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
-                        print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                        print(f"   • Euclidean clip rate: {euclidean_clip_rate:.1%}")
-                        print(f"   • Mahalanobis clip rate: {np.mean(maha_norms > actual_radius):.1%}")
-                        print(f"   → Fair comparison: same effective sensitivity bound Δ₂\n")
+                        logger.info(f"🎯 Ablation norm calibration completed:")
+                        logger.info(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
+                        logger.info(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
+                        logger.info(f"   • Euclidean clip rate: {euclidean_clip_rate:.1%}")
+                        logger.info(f"   • Mahalanobis clip rate: {np.mean(maha_norms > actual_radius):.1%}")
+                        logger.info(f"   → Fair comparison: same effective sensitivity bound Δ₂\n")
                         
                         euclidean_norms = []  # Reset for actual training statistics
 
@@ -897,10 +913,10 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                 euclidean_target = euclidean_adaptive_radius
                                 adaptive_radius_computed = True
                                 
-                                print(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} users (EUCLIDEAN norms):")
-                                print(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
-                                print(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
-                                print(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
+                                logger.info(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} users (EUCLIDEAN norms):")
+                                logger.info(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
+                                logger.info(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
+                                logger.info(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
                         
                         # Calibration for user-level
                         if not calibration_computed and len(euclidean_norms) >= 5:
@@ -911,10 +927,10 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                             actual_radius = euclidean_target / (ratio + 1e-8)
                             calibration_computed = True
                             
-                            print(f"🎯 Ablation user-level norm calibration:")
-                            print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
-                            print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                            print(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}\n")
+                            logger.info(f"🎯 Ablation user-level norm calibration:")
+                            logger.info(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
+                            logger.info(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
+                            logger.info(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}\n")
                             
                             euclidean_norms = []  # Reset
             
@@ -997,7 +1013,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                     g_priv_norm = float(g_final.norm().item())
                     g_pub_norm = float(g_public.norm().item())
                     ratio = g_pub_norm / (g_priv_norm + 1e-12)
-                    print(f"   📌 Rehearsal strength (batch0): ‖g_priv‖={g_priv_norm:.2f}, ‖g_pub‖={g_pub_norm:.2f}, ‖g_pub‖/‖g_priv‖={ratio:.4f}")
+                    logger.info(f"   📌 Rehearsal strength (batch0): ‖g_priv‖={g_priv_norm:.2f}, ‖g_pub‖={g_pub_norm:.2f}, ‖g_pub‖/‖g_priv‖={ratio:.4f}")
                 
                 # Combine: g_total = g_final_DP + λ * g_public
                 g_final = g_final + rehearsal_lambda * g_public
@@ -1011,17 +1027,17 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             opt.step()
 
     grad_type = "‖g_user‖_Mah" if not sample_level else "‖g‖_Mah"
-    print(f"\n📊  Fisher DP + {optimizer_name} final stats:")
-    print(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f} (same as vanilla DP-SGD)")
-    print(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-    print(f"   • Median {grad_type} = {np.median(grad_norm):.2f}")
-    print(f"   • Fisher noise ℓ₂ ∈ [{min(noise_l2):.1f},{max(noise_l2):.1f}]")
+    logger.info(f"\n📊  Fisher DP + {optimizer_name} final stats:")
+    logger.info(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f} (same as vanilla DP-SGD)")
+    logger.info(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
+    logger.info(f"   • Median {grad_type} = {np.median(grad_norm):.2f}")
+    logger.info(f"   • Fisher noise ℓ₂ ∈ [{min(noise_l2):.1f},{max(noise_l2):.1f}]")
     if full_complement_noise:
-        print(f"   • Last batch: Fisher={fisher_noise_norm:.1f}, Complement={complement_noise_norm:.1f}")
+        logger.info(f"   • Last batch: Fisher={fisher_noise_norm:.1f}, Complement={complement_noise_norm:.1f}")
     else:
-        print(f"   • Last batch: Fisher only={fisher_noise_norm:.1f} (complement disabled)")
-    print(f"   • Privacy: (ε={epsilon}, δ={delta}) over {dp_epochs} DP fine-tuning epochs")
-    print(f"   • ✅ FAIR COMPARISON: Same effective sensitivity Δ₂ as vanilla DP-SGD")
+        logger.info(f"   • Last batch: Fisher only={fisher_noise_norm:.1f} (complement disabled)")
+    logger.info(f"   • Privacy: (ε={epsilon}, δ={delta}) over {dp_epochs} DP fine-tuning epochs")
+    logger.success(f"   • ✅ FAIR COMPARISON: Same effective sensitivity Δ₂ as vanilla DP-SGD")
 
     return model
 
@@ -1042,9 +1058,9 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     6. Fisher DP + DP-SAT + OPTIMIZED Calibration (Line Search + Multi-Step)
     """
     
-    print("\n" + "="*70)
-    print("🚀  OPTIMIZED ABLATION STUDY: Fisher DP-SGD with Enhanced Calibration")
-    print("="*70)
+    logger.info("\n" + "="*70)
+    logger.info("🚀  OPTIMIZED ABLATION STUDY: Fisher DP-SGD with Enhanced Calibration")
+    logger.info("="*70)
     
     # ════════════════════════════════════════════════════════════════
     # PRE-COMPUTE FISHER EIGENDECOMPOSITION (Eliminate Redundancy)
@@ -1058,16 +1074,16 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     to save massive compute time during ablation studies.
     """
     
-    print(f"\n🔍 Pre-computing Fisher eigendecomposition to avoid redundancy...")
+    logger.info(f"\n🔍 Pre-computing Fisher eigendecomposition to avoid redundancy...")
     lam, U = topk_eigh_with_floor(Fmat, k=args.k, lam_floor=5e-1)  # Use consistent lam_floor
     lam, U = lam.to(device), U.to(device)
     actual_k = len(lam)
     
     if actual_k != args.k:
-        print(f"⚠️  Using k={actual_k} eigenpairs (requested {args.k}) due to matrix rank constraints")
+        logger.warn(f"⚠️  Using k={actual_k} eigenpairs (requested {args.k}) due to matrix rank constraints")
     
-    print(f"✅ Fisher eigendecomposition complete: k={actual_k} eigenpairs")
-    print(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
+    logger.success(f"✅ Fisher eigendecomposition complete: k={actual_k} eigenpairs")
+    logger.info(f"   • Eigenvalue range: [{lam.min().item():.3e}, {lam.max().item():.3e}]")
     
     # Load baseline model for initialization
     baseline = build_model_for_device(args.model_type, model_kwargs, args, device)
@@ -1086,41 +1102,41 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
 
     loaded_baseline = False
     if os.path.exists(pretrain_path) and not args.clean:
-        print(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
+        logger.info(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
         checkpoint = safe_torch_load(pretrain_path, map_location=device)
         ck_dataset = checkpoint.get("dataset_name") if isinstance(checkpoint, dict) else None
         ck_non_iid = checkpoint.get("non_iid", False) if isinstance(checkpoint, dict) else False
         if ck_dataset is not None and ck_dataset != args.dataset_name:
-            print(f"   ⚠️  Cache dataset mismatch: checkpoint={ck_dataset} vs requested={args.dataset_name}. Retraining baseline.")
+            logger.warn(f"   ⚠️  Cache dataset mismatch: checkpoint={ck_dataset} vs requested={args.dataset_name}. Retraining baseline.")
         elif ck_non_iid != args.non_iid:
-            print(f"   ⚠️  Cache IID/non-IID mode mismatch: checkpoint={'non-IID' if ck_non_iid else 'IID'} vs requested={'non-IID' if args.non_iid else 'IID'}. Retraining baseline.")
+            logger.warn(f"   ⚠️  Cache IID/non-IID mode mismatch: checkpoint={'non-IID' if ck_non_iid else 'IID'} vs requested={'non-IID' if args.non_iid else 'IID'}. Retraining baseline.")
         else:
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline")
             baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
-            print(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
+            logger.success(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
             loaded_baseline = True
     elif os.path.exists(legacy_pretrain_path) and not args.clean:
-        print(f"\n📥 Found legacy pretrained baseline cache: {legacy_pretrain_path}")
+        logger.info(f"\n📥 Found legacy pretrained baseline cache: {legacy_pretrain_path}")
         checkpoint = safe_torch_load(legacy_pretrain_path, map_location=device)
         legacy_dataset = checkpoint.get("dataset_name") if isinstance(checkpoint, dict) else None
         if legacy_dataset is None:
-            print("   ⚠️  Legacy cache has no dataset metadata; skipping to avoid cross-dataset reuse.")
+            logger.warn("   ⚠️  Legacy cache has no dataset metadata; skipping to avoid cross-dataset reuse.")
         elif legacy_dataset != args.dataset_name:
-            print(f"   ⚠️  Legacy cache dataset mismatch: checkpoint={legacy_dataset} vs requested={args.dataset_name}. Skipping.")
+            logger.warn(f"   ⚠️  Legacy cache dataset mismatch: checkpoint={legacy_dataset} vs requested={args.dataset_name}. Skipping.")
         else:
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline (legacy cache)")
             baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
-            print(f"   ✅ Loaded baseline from legacy cache (eval accuracy: {baseline_acc_cached})")
+            logger.success(f"   ✅ Loaded baseline from legacy cache (eval accuracy: {baseline_acc_cached})")
             loaded_baseline = True
 
     if not loaded_baseline:
-        print(f'\n⚙️  Training baseline on PUBLIC data (Strict DP Setup)...')
-        print(f"   • Public data size: {len(pub_loader.dataset)} samples")
-        print(f"   • Model: {args.model_type}")
-        print(f"   • Epochs: {args.epochs}")
-        print(f"   • Private data will ONLY be used for DP-training selected layers ({args.dp_layer if not args.dp_param_count else f'budget={args.dp_param_count}'})")
+        logger.info(f'\n⚙️  Training baseline on PUBLIC data (Strict DP Setup)...')
+        logger.info(f"   • Public data size: {len(pub_loader.dataset)} samples")
+        logger.info(f"   • Model: {args.model_type}")
+        logger.info(f"   • Epochs: {args.epochs}")
+        logger.info(f"   • Private data will ONLY be used for DP-training selected layers ({args.dp_layer if not args.dp_param_count else f'budget={args.dp_param_count}'})")
         
         # Stronger from-scratch recipe for public pretrain (no ImageNet weights)
         base_lr = 0.1
@@ -1156,8 +1172,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             'non_iid': args.non_iid,
             'timestamp': __import__('time').strftime('%Y%m%d_%H%M%S')
         }, pretrain_path)
-        print(f"\n💾 Saved pretrained baseline to {pretrain_path}")
-        print(f"   • Baseline accuracy: {baseline_acc:.2f}%")
+        logger.info(f"\n💾 Saved pretrained baseline to {pretrain_path}")
+        logger.info("   • Baseline accuracy: %.2f%%", baseline_acc)
 
     # Privacy accounting setup
     if not args.use_legacy_accounting:
@@ -1182,11 +1198,18 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         sigma = noise_multiplier
         display_epsilon = args.target_epsilon
         
-        print(f"\n🔒 Privacy Accounting for Optimized Ablation Study:")
-        print(f"   • Target (ε, δ): ({args.target_epsilon}, {args.delta})")
-        print(f"   • DP fine-tuning epochs: {actual_dp_epochs} (public pretrain: {args.epochs})")
-        print(f"   • Noise multiplier: {noise_multiplier:.4f}")
-        print(f"   • Sigma: {sigma:.4f}")
+        logger.info("Privacy accounting for optimized ablation study (accountant-based).")
+        logger.info("   • DP fine-tuning epochs: %s (public pretrain: %s)", actual_dp_epochs, args.epochs)
+        logger.info("   • Noise multiplier: %.4f", noise_multiplier)
+        logger.info("   • Sigma: %.4f", sigma)
+        log_privacy_guarantee_summary(
+            args,
+            dp_epochs=actual_dp_epochs,
+            steps_per_epoch=steps_per_epoch,
+            total_steps=total_steps,
+            sample_rate=sample_rate,
+            noise_multiplier=noise_multiplier,
+        )
     else:
         sigma = None
         display_epsilon = args.epsilon
@@ -1198,9 +1221,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # Variant 1: Vanilla DP-SGD (Non-Fisher)
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*50}")
-    print("🔵 VARIANT 1: Vanilla DP-SGD (Non-Fisher)")
-    print(f"{'='*50}")
+    logger.highlight("VARIANT 1: Vanilla DP-SGD (Non-Fisher)")
     
     vanilla_dp_model = copy.deepcopy(baseline)
     vanilla_dp_model = train_with_vanilla_dp(
@@ -1225,9 +1246,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # Variant 2: Vanilla DP-SGD + DP-SAT (Non-Fisher)
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*50}")
-    print("🔵🔺 VARIANT 2: Vanilla DP-SGD + DP-SAT (Non-Fisher)")
-    print(f"{'='*50}")
+    logger.highlight("VARIANT 2: Vanilla DP-SGD + DP-SAT (Non-Fisher)")
     
     vanilla_dpsat_model = copy.deepcopy(baseline)
     vanilla_dpsat_model = train_with_dp_sat(
@@ -1253,9 +1272,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # Variant 3: Fisher DP + Normal Optimizer (USING PRE-COMPUTED EIGENDECOMPOSITION)
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*50}")
-    print("🎯 VARIANT 3: Fisher DP + Normal Optimizer")
-    print(f"{'='*50}")
+    logger.highlight("VARIANT 3: Fisher DP + Normal Optimizer")
     
     fisher_normal_model = copy.deepcopy(baseline)
     fisher_normal_model = train_fisher_dp_with_optimizer(
@@ -1286,15 +1303,13 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # Variant 4: Fisher DP + DP-SAT Optimizer (USING PRE-COMPUTED EIGENDECOMPOSITION)
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*50}")
-    print("🔺 VARIANT 4: Fisher DP + DP-SAT Optimizer")
-    print(f"{'='*50}")
+    logger.highlight("VARIANT 4: Fisher DP + DP-SAT Optimizer")
 
     # Determine DP-SAT mode for Fisher variants
     # If user didn't specify a mode, default to 'fisher' for the ablation study
     # to show the "Best vs Best" comparison (Vanilla+Euclidean vs Fisher+Fisher)
     effective_sat_mode = args.dp_sat_mode if args.dp_sat_mode != 'none' else 'fisher'
-    print(f"   ℹ️  Using DP-SAT mode: {effective_sat_mode} for Fisher variants")
+    logger.info(f"   ℹ️  Using DP-SAT mode: {effective_sat_mode} for Fisher variants")
     
     fisher_dpsat_model = copy.deepcopy(baseline)
     fisher_dpsat_model = train_fisher_dp_with_optimizer(
@@ -1338,9 +1353,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # Variant 5: Fisher DP + Normal + OPTIMIZED Calibration
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*50}")
-    print("🚀📐 VARIANT 5: Fisher DP + Normal + OPTIMIZED Calibration")
-    print(f"{'='*50}")
+    logger.highlight("VARIANT 5: Fisher DP + Normal + OPTIMIZED Calibration")
     
     fisher_normal_calibrated = copy.deepcopy(fisher_normal_model)
     
@@ -1366,7 +1379,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         after_stats = diagnose_calibration(calib_normal, critical_data, critical_targets, device)
         print_calibration_effect(before_stats, after_stats, args.target_class)
     else:
-        print(f"⚠️  No samples found for target_class {args.target_class}")
+        logger.warn(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply optimized calibration without diagnosis
         # Use small calibration set for efficiency
         calib_normal = calibrate_with_combined_optimization(
@@ -1387,9 +1400,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # Variant 6: Fisher DP + DP-SAT + OPTIMIZED Calibration
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*50}")
-    print("🔺🚀📐 VARIANT 6: Fisher DP + DP-SAT + OPTIMIZED Calibration")
-    print(f"{'='*50}")
+    logger.highlight("VARIANT 6: Fisher DP + DP-SAT + OPTIMIZED Calibration")
     
     fisher_dpsat_calibrated = copy.deepcopy(fisher_dpsat_model)
     
@@ -1416,7 +1427,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         after_stats_dpsat = diagnose_calibration(calib_dpsat, critical_data, critical_targets, device)
         print_calibration_effect(before_stats_dpsat, after_stats_dpsat, args.target_class)
     else:
-        print(f"⚠️  No samples found for target_class {args.target_class}")
+        logger.warn(f"⚠️  No samples found for target_class {args.target_class}")
         # Still apply optimized calibration without diagnosis
         # Use small calibration set for efficiency
         calib_dpsat = calibrate_with_combined_optimization(
@@ -1437,9 +1448,9 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     # Evaluation and Comparison
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*70}")
-    print("📊 OPTIMIZED ABLATION STUDY RESULTS")
-    print(f"{'='*70}")
+    logger.info(f"\n{'='*70}")
+    logger.info("📊 OPTIMIZED ABLATION STUDY RESULTS")
+    logger.info(f"{'='*70}")
     
     # Get excluded classes for per-class accuracy reporting
     excluded_classes = None
@@ -1486,7 +1497,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     ablation_results['calib_dpsat'] = calib_dpsat_acc
     
     dp_mode = "Sample-level" if args.sample_level else f"User-level ({args.users} users)"
-    print(f"\n🎯 Accuracy Comparison ({dp_mode} DP):")
+    logger.info(f"\n🎯 Accuracy Comparison ({dp_mode} DP):")
 
     def _fmt(overall, excl, rest):
         if excluded_classes and excl is not None and rest is not None:
@@ -1494,13 +1505,13 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             return f"{overall:6.2f}% (excluded {excl_str}: {excl:5.2f}%, rest: {rest:5.2f}%)"
         return f"{overall:6.2f}%"
 
-    print(f"   • Baseline (Public Only)          : {_fmt(baseline_acc, baseline_excl, baseline_rest)}")
-    print(f"   • Vanilla DP-SGD                  : {_fmt(vanilla_dp_acc, vanilla_dp_excl, vanilla_dp_rest)}")
-    print(f"   • Vanilla DP-SGD + DP-SAT          : {_fmt(vanilla_dpsat_acc, vanilla_dpsat_excl, vanilla_dpsat_rest)}")
-    print(f"   • Fisher DP + Normal              : {_fmt(fisher_normal_acc, fisher_normal_excl, fisher_normal_rest)}")
-    print(f"   • Fisher DP + DP-SAT              : {_fmt(fisher_dpsat_acc, fisher_dpsat_excl, fisher_dpsat_rest)}")
-    print(f"   • Fisher DP + Normal + OPT Calib  : {_fmt(calib_normal_acc, calib_normal_excl, calib_normal_rest)}")
-    print(f"   • Fisher DP + DP-SAT + OPT Calib  : {_fmt(calib_dpsat_acc, calib_dpsat_excl, calib_dpsat_rest)}")
+    logger.info(f"   • Baseline (Public Only)          : {_fmt(baseline_acc, baseline_excl, baseline_rest)}")
+    logger.info(f"   • Vanilla DP-SGD                  : {_fmt(vanilla_dp_acc, vanilla_dp_excl, vanilla_dp_rest)}")
+    logger.info(f"   • Vanilla DP-SGD + DP-SAT          : {_fmt(vanilla_dpsat_acc, vanilla_dpsat_excl, vanilla_dpsat_rest)}")
+    logger.info(f"   • Fisher DP + Normal              : {_fmt(fisher_normal_acc, fisher_normal_excl, fisher_normal_rest)}")
+    logger.info(f"   • Fisher DP + DP-SAT              : {_fmt(fisher_dpsat_acc, fisher_dpsat_excl, fisher_dpsat_rest)}")
+    logger.info(f"   • Fisher DP + Normal + OPT Calib  : {_fmt(calib_normal_acc, calib_normal_excl, calib_normal_rest)}")
+    logger.info(f"   • Fisher DP + DP-SAT + OPT Calib  : {_fmt(calib_dpsat_acc, calib_dpsat_excl, calib_dpsat_rest)}")
     
     # Compute improvements
     vanilla_dp_improvement = vanilla_dp_acc - baseline_acc
@@ -1515,25 +1526,25 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     opt_calib_normal_improvement = calib_normal_acc - fisher_normal_acc
     opt_calib_dpsat_improvement = calib_dpsat_acc - fisher_dpsat_acc
     
-    print(f"\n📈 Improvement Analysis:")
-    print(f"   • Vanilla DP-SGD:                 {vanilla_dp_improvement:+5.2f}% vs baseline")
-    print(f"   • Vanilla DP-SGD + DP-SAT:        {vanilla_dpsat_improvement:+5.2f}% vs baseline")
-    print(f"   • DP-SAT gain (Vanilla):          {vanilla_dpsat_vs_vanilla:+5.2f}% over vanilla DP")
-    print(f"   • Fisher benefit:                 {fisher_vs_vanilla:+5.2f}% over vanilla DP")
-    print(f"   • Fisher DP (Normal):             {normal_improvement:+5.2f}% vs baseline")
-    print(f"   • Fisher DP (DP-SAT):             {dpsat_improvement:+5.2f}% vs baseline")
-    print(f"   • Synergy Gain (DP-SAT):          {synergy_gain:+5.2f}% over normal Fisher DP")
-    print(f"   • OPTIMIZED Calibration (Normal): {opt_calib_normal_improvement:+5.2f}% over Fisher normal")
-    print(f"   • OPTIMIZED Calibration (DP-SAT): {opt_calib_dpsat_improvement:+5.2f}% over Fisher DP-SAT")
+    logger.info(f"\n📈 Improvement Analysis:")
+    logger.info(f"   • Vanilla DP-SGD:                 {vanilla_dp_improvement:+5.2f}% vs baseline")
+    logger.info(f"   • Vanilla DP-SGD + DP-SAT:        {vanilla_dpsat_improvement:+5.2f}% vs baseline")
+    logger.info(f"   • DP-SAT gain (Vanilla):          {vanilla_dpsat_vs_vanilla:+5.2f}% over vanilla DP")
+    logger.info(f"   • Fisher benefit:                 {fisher_vs_vanilla:+5.2f}% over vanilla DP")
+    logger.info(f"   • Fisher DP (Normal):             {normal_improvement:+5.2f}% vs baseline")
+    logger.info(f"   • Fisher DP (DP-SAT):             {dpsat_improvement:+5.2f}% vs baseline")
+    logger.info(f"   • Synergy Gain (DP-SAT):          {synergy_gain:+5.2f}% over normal Fisher DP")
+    logger.info(f"   • OPTIMIZED Calibration (Normal): {opt_calib_normal_improvement:+5.2f}% over Fisher normal")
+    logger.info(f"   • OPTIMIZED Calibration (DP-SAT): {opt_calib_dpsat_improvement:+5.2f}% over Fisher DP-SAT")
     
-    print(f"\n🚀 Optimized Calibration Effects Analysis:")
+    logger.info(f"\n🚀 Optimized Calibration Effects Analysis:")
     total_dpsat_gain = fisher_dpsat_acc - baseline_acc
     total_opt_calib_normal_gain = calib_normal_acc - baseline_acc
     total_opt_calib_dpsat_gain = calib_dpsat_acc - baseline_acc
     
-    print(f"   • Total DP-SAT effect:           {total_dpsat_gain:+5.2f}% (DP-SAT only)")
-    print(f"   • Total OPT Calib effect:        {total_opt_calib_normal_gain:+5.2f}% (Normal + OPT Calib)")
-    print(f"   • Total Combined effect:         {total_opt_calib_dpsat_gain:+5.2f}% (DP-SAT + OPT Calib)")
+    logger.info(f"   • Total DP-SAT effect:           {total_dpsat_gain:+5.2f}% (DP-SAT only)")
+    logger.info(f"   • Total OPT Calib effect:        {total_opt_calib_normal_gain:+5.2f}% (Normal + OPT Calib)")
+    logger.info(f"   • Total Combined effect:         {total_opt_calib_dpsat_gain:+5.2f}% (DP-SAT + OPT Calib)")
     
     best_method = max([
         ('Vanilla DP-SGD', vanilla_dp_acc),
@@ -1544,29 +1555,29 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         ('Fisher DP-SAT + OPT Calib', calib_dpsat_acc)
     ], key=lambda x: x[1])
     
-    print(f"   🏆 Best method: {best_method[0]} ({best_method[1]:.2f}%)")
+    logger.info(f"   🏆 Best method: {best_method[0]} ({best_method[1]:.2f}%)")
     
     if synergy_gain > 0.5:  # Threshold for meaningful improvement
-        print(f"   🎉 SYNERGY DETECTED: DP-SAT optimization provides meaningful benefit!")
+        logger.info(f"   🎉 SYNERGY DETECTED: DP-SAT optimization provides meaningful benefit!")
     elif synergy_gain > 0:
-        print(f"   ✅ SMALL SYNERGY: DP-SAT provides modest improvement")
+        logger.success(f"   ✅ SMALL SYNERGY: DP-SAT provides modest improvement")
     else:
-        print(f"   ⚠️  NO SYNERGY: DP-SAT may not help with Fisher-informed noise")
+        logger.warn(f"   ⚠️  NO SYNERGY: DP-SAT may not help with Fisher-informed noise")
     
     if max(opt_calib_normal_improvement, opt_calib_dpsat_improvement) > 1.0:
-        print(f"   🚀 STRONG OPTIMIZED CALIBRATION BENEFIT: Line search + multi-step significantly helps!")
+        logger.info(f"   🚀 STRONG OPTIMIZED CALIBRATION BENEFIT: Line search + multi-step significantly helps!")
     elif max(opt_calib_normal_improvement, opt_calib_dpsat_improvement) > 0.5:
-        print(f"   🚀 MODERATE OPTIMIZED CALIBRATION BENEFIT: Enhanced calibration provides meaningful improvement")
+        logger.info(f"   🚀 MODERATE OPTIMIZED CALIBRATION BENEFIT: Enhanced calibration provides meaningful improvement")
     elif max(opt_calib_normal_improvement, opt_calib_dpsat_improvement) > 0:
-        print(f"   ⚠️  WEAK OPTIMIZED CALIBRATION BENEFIT: Small improvement from enhanced calibration")
+        logger.warn(f"   ⚠️  WEAK OPTIMIZED CALIBRATION BENEFIT: Small improvement from enhanced calibration")
     else:
-        print(f"   ❌ NO OPTIMIZED CALIBRATION BENEFIT: Enhanced calibration may not help this configuration")
+        logger.error(f"   ❌ NO OPTIMIZED CALIBRATION BENEFIT: Enhanced calibration may not help this configuration")
 
     # ════════════════════════════════════════════════════════════════
     # Save Models for Further Analysis
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n💾 Saving ablation study models...")
+    logger.info(f"\n💾 Saving ablation study models...")
     ds_tag = _sanitize_cache_key(args.dataset_name)
     
     # Save Vanilla DP-SGD
@@ -1580,7 +1591,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         'clip_radius': args.clip_radius,
         'ablation_study': True
     }, vanilla_dp_path)
-    print(f"✅ Saved Vanilla DP-SGD to {vanilla_dp_path}")
+    logger.success(f"✅ Saved Vanilla DP-SGD to {vanilla_dp_path}")
     
     # Save Vanilla DP-SGD + DP-SAT
     vanilla_dpsat_path = os.path.join(models_dir, f'Vanilla_DPSAT_{ds_tag}_Ablation.pth')
@@ -1595,7 +1606,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         'dpsat_gain_vanilla': vanilla_dpsat_vs_vanilla,
         'ablation_study': True
     }, vanilla_dpsat_path)
-    print(f"✅ Saved Vanilla DP-SGD + DP-SAT to {vanilla_dpsat_path}")
+    logger.success(f"✅ Saved Vanilla DP-SGD + DP-SAT to {vanilla_dpsat_path}")
     
     # Save Fisher DP + Normal
     fisher_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Ablation.pth')
@@ -1610,7 +1621,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         'full_complement_noise': args.full_complement_noise,
         'ablation_study': True
     }, fisher_normal_path)
-    print(f"✅ Saved Fisher DP + Normal to {fisher_normal_path}")
+    logger.success(f"✅ Saved Fisher DP + Normal to {fisher_normal_path}")
     
     # Save Fisher DP + DP-SAT
     fisher_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Ablation.pth')
@@ -1629,7 +1640,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         'synergy_gain': synergy_gain,
         'ablation_study': True
     }, fisher_dpsat_path)
-    print(f"✅ Saved Fisher DP + DP-SAT ({effective_sat_mode}) to {fisher_dpsat_path}")
+    logger.success(f"✅ Saved Fisher DP + DP-SAT ({effective_sat_mode}) to {fisher_dpsat_path}")
     
     # Save Fisher DP + Normal + Calibration
     calib_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Calibrated_Ablation.pth')
@@ -1647,7 +1658,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         'full_complement_noise': args.full_complement_noise,
         'ablation_study': True
     }, calib_normal_path)
-    print(f"✅ Saved Fisher DP + Normal + Calibration to {calib_normal_path}")
+    logger.success(f"✅ Saved Fisher DP + Normal + Calibration to {calib_normal_path}")
     
     # Save Fisher DP + DP-SAT + Calibration
     calib_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Calibrated_Ablation.pth')
@@ -1670,14 +1681,14 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         'full_complement_noise': args.full_complement_noise,
         'ablation_study': True
     }, calib_dpsat_path)
-    print(f"✅ Saved Fisher DP + DP-SAT ({effective_sat_mode}) + Calibration to {calib_dpsat_path}")
+    logger.success(f"✅ Saved Fisher DP + DP-SAT ({effective_sat_mode}) + Calibration to {calib_dpsat_path}")
 
     # ════════════════════════════════════════════════════════════════
     # Optional: Comprehensive 4-Way MIA Evaluation
     # ════════════════════════════════════════════════════════════════
     
     if args.run_mia:
-        print(f"\n🛡️  Running comprehensive 4-way MIA evaluation on all ablation variants...")
+        logger.highlight("Running comprehensive MIA audit on all ablation variants.")
         
         # Prepare all models for MIA evaluation (no non-DP private comparator).
         models_to_evaluate = {
@@ -1709,30 +1720,30 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
                     f"priv_ds.base type: {type(priv_ds.base)}, len: {len(priv_ds.base) if hasattr(priv_ds.base, '__len__') else 'N/A'}\n"
                     f"priv_base type: {type(priv_base)}, len: {len(priv_base) if hasattr(priv_base, '__len__') else 'N/A'}"
                 )
-            print(f"✅ Verified: priv_ds.base is priv_base (same object reference) - MIA data source is correct")
+            logger.success("Verified: priv_ds.base is priv_base (MIA data source is correct).")
         
         # Prepare member and non-member datasets
         if args.sample_level:
-            print("📊 Sample-level MIA: Using actual private training samples as members")
+            logger.info("Sample-level MIA: using actual private training samples as members.")
             member_set, non_member_set = prepare_mia_data_sample_level(priv_base, eval_source, priv_idx, args.mia_size)
         else:
-            print("👥 User-level MIA: Using actual private users as members")
+            logger.info("User-level MIA: using actual private users as members.")
             member_set, non_member_set = prepare_mia_data_user_level(priv_ds, eval_source, args.users, args.mia_size)
         
         member_loader = DataLoader(member_set, batch_size=64, shuffle=False)
         non_member_loader = DataLoader(non_member_set, batch_size=64, shuffle=False)
         
-        print(f"   • Members: {len(member_set)} samples")
-        print(f"   • Non-members: {len(non_member_set)} samples")
+        logger.info(f"   • Members: {len(member_set)} samples")
+        logger.info(f"   • Non-members: {len(non_member_set)} samples")
         
         # Run comprehensive MIA evaluation on all models
         mia_results = {}
         
-        print(f"\n🕶️  SHADOW MODEL ATTACK RESULTS:")
-        print("-" * 50)
+        logger.info(f"\n🕶️  SHADOW MODEL ATTACK RESULTS:")
+        logger.info("-" * 50)
         
         for model_name, model in models_to_evaluate.items():
-            print(f"   Evaluating {model_name}...")
+            logger.info(f"   Evaluating {model_name}...")
             shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_source, shadow_epochs=args.shadow_epochs)
             mia_results[model_name] = {
                 'shadow_auc': shadow_result['auc'],
@@ -1740,15 +1751,15 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
                 'shadow_adv': shadow_result.get('adv', abs(shadow_result['auc'] - 0.5)),
                 'shadow_acc': shadow_result['accuracy']
             }
-            print(
+            logger.info(
                 f"     • AUC: {shadow_result['auc']:.4f} "
                 f"(AUC*: {mia_results[model_name]['shadow_auc_star']:.4f}, |AUC-0.5|: {mia_results[model_name]['shadow_adv']:.4f}), "
                 f"Accuracy: {shadow_result['accuracy']:.4f}"
             )
         
         # Comprehensive analysis
-        print(f"\n📊 COMPREHENSIVE MIA ANALYSIS")
-        print("=" * 60)
+        logger.highlight("Comprehensive MIA Analysis (audit-only)")
+        logger.info("=" * 60)
         
         # Use shadow attack AUC directly (no need for worst-case since we only have one attack)
         shadow_aucs = {}
@@ -1759,31 +1770,31 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             shadow_auc_stars[model_name] = mia_results[model_name]['shadow_auc_star']
             shadow_advs[model_name] = mia_results[model_name]['shadow_adv']
         
-        print(f"\n🎯 Shadow Attack AUC Comparison:")
+        logger.info("Shadow Attack AUC Comparison:")
         for model_name, auc in shadow_aucs.items():
-            print(f"   • {model_name:30}: {auc:.4f}")
+            logger.info(f"   • {model_name:30}: {auc:.4f}")
 
-        print(f"\n🎯 Shadow Attack AUC* (sign-invariant) Comparison:")
+        logger.info("Shadow Attack AUC* (sign-invariant) Comparison:")
         for model_name, aucs in shadow_auc_stars.items():
-            print(f"   • {model_name:30}: {aucs:.4f}")
-        print(f"\n🎯 Shadow Attack Advantage |AUC-0.5| (lower is better):")
+            logger.info(f"   • {model_name:30}: {aucs:.4f}")
+        logger.info("Shadow Attack Advantage |AUC-0.5| (lower is better):")
         for model_name, adv in shadow_advs.items():
-            print(f"   • {model_name:30}: {adv:.4f}")
+            logger.info(f"   • {model_name:30}: {adv:.4f}")
         
         # Identify best and worst models for privacy
         best_privacy_model = min(shadow_auc_stars.items(), key=lambda x: x[1])
         worst_privacy_model = max(shadow_auc_stars.items(), key=lambda x: x[1])
         
-        print(f"\n🏆 Privacy Protection Ranking:")
-        print(f"   🥇 BEST:  {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
-        print(f"   🥴 WORST: {worst_privacy_model[0]} (AUC*: {worst_privacy_model[1]:.4f})")
+        logger.info("Privacy Protection Ranking:")
+        logger.info(f"   🥇 BEST:  {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
+        logger.info(f"   🥴 WORST: {worst_privacy_model[0]} (AUC*: {worst_privacy_model[1]:.4f})")
         
         # Privacy vs Accuracy tradeoff analysis
-        print(f"\n⚖️  Privacy vs Accuracy Tradeoff:")
-        print(f"   Model                          Accuracy  AttackAUC*  |AUC-0.5|")
-        print(f"   {'─'*30} ─────────  ─────────  ─────────")
+        logger.info("Privacy vs Accuracy Tradeoff:")
+        logger.info(f"   Model                          Accuracy  AttackAUC*  |AUC-0.5|")
+        logger.info(f"   {'─'*30} ─────────  ─────────  ─────────")
         # Baseline row: show placeholder for attack metrics (not applicable as DP comparator)
-        print(f"   {'Baseline (Public Only)':30} {baseline_acc:5.1f}%     {'-':>7}    {'-':>7}")
+        logger.info(f"   {'Baseline (Public Only)':30} {baseline_acc:5.1f}%     {'-':>7}    {'-':>7}")
         for model_name in ['Vanilla DP-SGD', 'Vanilla DP-SGD + DP-SAT', 'Fisher DP + Normal', 'Fisher DP + DP-SAT', 'Fisher DP + Normal + Calib', 'Fisher DP + DP-SAT + Calib']:
             if model_name == 'Vanilla DP-SGD':
                 acc = vanilla_dp_acc
@@ -1800,10 +1811,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
 
             aucs = shadow_auc_stars[model_name]
             adv = shadow_advs[model_name]
-            print(f"   {model_name:30} {acc:5.1f}%     {aucs:.4f}    {adv:.4f}")
+            logger.info(f"   {model_name:30} {acc:5.1f}%     {aucs:.4f}    {adv:.4f}")
         
         # Key comparisons only (remove redundant analysis)
-        print(f"\n🔒 Key Privacy Effects:")
+        logger.info(f"\n🔒 Key Privacy Effects:")
         
         baseline_auc_star = shadow_auc_stars['Baseline (Public Only)']
         fisher_normal_auc_star = shadow_auc_stars['Fisher DP + Normal']
@@ -1816,12 +1827,12 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         calib_dpsat_privacy_effect = fisher_dpsat_auc_star - calib_dpsat_auc_star
         combined_effect = fisher_normal_auc_star - calib_dpsat_auc_star
         
-        print(f"   • DP-SAT effect:      {dpsat_privacy_effect:+.4f} AUC*")
-        print(f"   • Calibration effect: {max(calib_normal_privacy_effect, calib_dpsat_privacy_effect):+.4f} AUC*")
-        print(f"   • Combined effect:    {combined_effect:+.4f} AUC*")
+        logger.info(f"   • DP-SAT effect:      {dpsat_privacy_effect:+.4f} AUC*")
+        logger.info(f"   • Calibration effect: {max(calib_normal_privacy_effect, calib_dpsat_privacy_effect):+.4f} AUC*")
+        logger.info(f"   • Combined effect:    {combined_effect:+.4f} AUC*")
         
         # Final recommendation
-        print(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
+        logger.info(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
         
         # Store results for return
         ablation_results['mia_results'] = {
@@ -1842,7 +1853,9 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         ablation_results['mia_results']['fisher_worst_auc'] = fisher_normal_auc_star
         ablation_results['mia_results']['dp_sat_worst_auc'] = fisher_dpsat_auc_star
         
-        print(f"\n✅ Comprehensive MIA evaluation complete! (Shadow attack only - more powerful assessment)")
+        logger.success("Comprehensive MIA evaluation complete (shadow attack only).")
+        logger.info("Note: DP guarantees come from the accountant/mechanism; MIA is an empirical audit.")
+        logger.info("Report AUC*, |AUC-0.5|, and include no-private-training controls to catch distribution shift.")
 
     return ablation_results
 
@@ -2000,26 +2013,26 @@ def main():
     
     # Parse target_class argument - can be "all" or integer
     if args.target_class == "all":
-        print(f"📊 Using ALL CLASSES for calibration (general utility improvement)")
+        logger.info("Using ALL classes for calibration (general utility improvement).")
     else:
         try:
             args.target_class = int(args.target_class)
-            print(f"📊 Using target class {args.target_class} for calibration (targeted improvement)")
+            logger.info("Using target class %s for calibration (targeted improvement).", args.target_class)
         except ValueError:
-            print(f"❌ Error: target_class must be 'all' or an integer, got '{args.target_class}'")
+            logger.error(f"❌ Error: target_class must be 'all' or an integer, got '{args.target_class}'")
             exit(1)
     
     # Validate privacy parameters
     if args.use_legacy_accounting:
         if args.epsilon is None:
-            print("❌ Error: --use-legacy-accounting requires --epsilon parameter")
+            logger.error("❌ Error: --use-legacy-accounting requires --epsilon parameter")
             exit(1)
         if args.target_epsilon is not None:
-            print("❌ Error: Cannot use --target-epsilon with --use-legacy-accounting")
+            logger.error("❌ Error: Cannot use --target-epsilon with --use-legacy-accounting")
             exit(1)
     else:
         if args.epsilon is not None:
-            print("❌ Error: --epsilon is only for legacy accounting")
+            logger.error("❌ Error: --epsilon is only for legacy accounting")
             exit(1)
         if args.target_epsilon is None:
             args.target_epsilon = 10.0
@@ -2028,9 +2041,10 @@ def main():
     
     # Clean up if requested
     if args.clean:
-        print('Cleaning saved models…')
+        logger.info('Cleaning saved models…')
         for f in glob.glob(os.path.join(models_dir,'*Ablation*.pth')):
-            os.remove(f); print('  removed',f)
+            os.remove(f)
+            logger.info("  removed %s", f)
     
     # ════════════════════════════════════════════════════════════════
     # Data preparation (vision + language)
@@ -2111,22 +2125,22 @@ def main():
     public_samples = count_samples(pub_loader)
     eval_samples = count_samples(eval_loader)
     calibration_samples = count_samples(pub_loader_calib)
-    print(f'📊 Ablation data overview for {args.dataset_name}:')
-    print(f'   • Private samples : {len(priv_base)}')
-    print(f'   • Public samples  : {public_samples}')
-    print(f'   • Eval samples    : {eval_samples}')
-    print(f'   • Calibration subset: {calibration_samples} samples')
+    logger.info("Ablation data overview for %s:", args.dataset_name)
+    logger.info("   • Private samples : %s", len(priv_base))
+    logger.info("   • Public samples  : %s", public_samples)
+    logger.info("   • Eval samples    : %s", eval_samples)
+    logger.info("   • Calibration subset: %s samples", calibration_samples)
     
     if args.sample_level:
-        print('📊 Using SAMPLE-level DP')
+        logger.info("Using sample-level DP")
     else:
-        print(f'👥 Using USER-level DP ({args.users} synthetic users)')
+        logger.info("Using user-level DP (%s synthetic users)", args.users)
     
     # ════════════════════════════════════════════════════════════════
     # Fisher matrix computation
     # ════════════════════════════════════════════════════════════════
     
-    print('\n🔍 Computing Fisher matrix for ablation study…')
+    logger.info('\n🔍 Computing Fisher matrix for ablation study…')
     
     # Train a baseline model for Fisher computation
     fisher_baseline = build_model_for_device(args.model_type, model_kwargs, args, device)
@@ -2170,99 +2184,104 @@ def main():
     # Final summary
     # ════════════════════════════════════════════════════════════════
     
-    print(f"\n{'='*70}")
-    print("🚀 OPTIMIZED ABLATION STUDY SUMMARY")
-    print(f"{'='*70}")
+    logger.highlight("Optimized Ablation Study Summary")
     
-    print(f"🔬 Synergy Analysis:")
+    logger.info("Synergy Analysis:")
     vanilla_dpsat_gain = results['vanilla_dpsat'] - results['vanilla_dp']
     synergy_gain = results['fisher_dpsat'] - results['fisher_normal']
-    print(f"   • Vanilla DP-SGD:         {results['vanilla_dp']:6.2f}%")
-    print(f"   • Vanilla DP-SGD + DP-SAT: {results['vanilla_dpsat']:6.2f}%")
-    print(f"   • DP-SAT gain (Vanilla):   {vanilla_dpsat_gain:+5.2f}%")
-    print(f"   • Fisher DP + Normal:     {results['fisher_normal']:6.2f}%")
-    print(f"   • Fisher DP + DP-SAT:     {results['fisher_dpsat']:6.2f}%")
-    print(f"   • DP-SAT gain (Fisher):   {synergy_gain:+5.2f}%")
+    logger.info("   • Vanilla DP-SGD:          %6.2f%%", results['vanilla_dp'])
+    logger.info("   • Vanilla DP-SGD + DP-SAT: %6.2f%%", results['vanilla_dpsat'])
+    logger.info("   • DP-SAT gain (Vanilla):   %+5.2f%%", vanilla_dpsat_gain)
+    logger.info("   • Fisher DP + Normal:      %6.2f%%", results['fisher_normal'])
+    logger.info("   • Fisher DP + DP-SAT:      %6.2f%%", results['fisher_dpsat'])
+    logger.info("   • DP-SAT gain (Fisher):    %+5.2f%%", synergy_gain)
     
-    print(f"\n🚀 Optimized Calibration Analysis:")
+    logger.info("Optimized Calibration Analysis:")
     opt_calib_normal_gain = results['calib_normal'] - results['fisher_normal']
     opt_calib_dpsat_gain = results['calib_dpsat'] - results['fisher_dpsat']
-    print(f"   • Fisher DP + Normal + OPT Calib: {results['calib_normal']:6.2f}%")
-    print(f"   • Fisher DP + DP-SAT + OPT Calib: {results['calib_dpsat']:6.2f}%")
-    print(f"   • OPT Calib gain (Normal):        {opt_calib_normal_gain:+5.2f}%")
-    print(f"   • OPT Calib gain (DP-SAT):        {opt_calib_dpsat_gain:+5.2f}%")
+    logger.info("   • Fisher DP + Normal + OPT Calib: %6.2f%%", results['calib_normal'])
+    logger.info("   • Fisher DP + DP-SAT + OPT Calib: %6.2f%%", results['calib_dpsat'])
+    logger.info("   • OPT Calib gain (Normal):        %+5.2f%%", opt_calib_normal_gain)
+    logger.info("   • OPT Calib gain (DP-SAT):        %+5.2f%%", opt_calib_dpsat_gain)
     
-    print(f"\n🏆 Overall Best Performance:")
+    logger.info("Overall Best Performance:")
     best_variant = max(results['vanilla_dp'], results['vanilla_dpsat'],
                       results['fisher_normal'], results['fisher_dpsat'], 
                       results['calib_normal'], results['calib_dpsat'])
     if best_variant == results['calib_dpsat']:
-        print(f"   🥇 Fisher DP + DP-SAT + OPT Calibration: {best_variant:.2f}%")
-        print(f"   🎉 TRIPLE COMBINATION: All three techniques work together!")
+        logger.success("Best: Fisher DP + DP-SAT + OPT Calibration: %.2f%%", best_variant)
+        logger.success("Triple combination: all three techniques work together.")
     elif best_variant == results['calib_normal']:
-        print(f"   🥇 Fisher DP + Normal + OPT Calibration: {best_variant:.2f}%")
-        print(f"   🚀 OPTIMIZED CALIBRATION DOMINATES: Enhanced influence functions provide the key benefit")
+        logger.success("Best: Fisher DP + Normal + OPT Calibration: %.2f%%", best_variant)
+        logger.success("Optimized calibration dominates: enhanced influence functions provide the key benefit.")
     elif best_variant == results['fisher_dpsat']:
-        print(f"   🥇 Fisher DP + DP-SAT: {best_variant:.2f}%")
-        print(f"   🔺 DP-SAT DOMINATES: Sharpness-aware optimization is most beneficial")
+        logger.success("Best: Fisher DP + DP-SAT: %.2f%%", best_variant)
+        logger.success("DP-SAT dominates: sharpness-aware optimization is most beneficial.")
     elif best_variant == results['fisher_normal']:
-        print(f"   🥇 Fisher DP + Normal: {best_variant:.2f}%")
-        print(f"   🎯 FISHER DOMINATES: Fisher-informed noise is most beneficial")
+        logger.success("Best: Fisher DP + Normal: %.2f%%", best_variant)
+        logger.success("Fisher dominates: Fisher-informed noise is most beneficial.")
     elif best_variant == results['vanilla_dpsat']:
-        print(f"   🥇 Vanilla DP-SGD + DP-SAT: {best_variant:.2f}%")
-        print(f"   🔵🔺 SIMPLE DP-SAT: DP-SAT works best without Fisher complexity")
+        logger.success("Best: Vanilla DP-SGD + DP-SAT: %.2f%%", best_variant)
+        logger.success("Simple DP-SAT: DP-SAT works best without Fisher complexity.")
     else:
-        print(f"   🥇 Vanilla DP-SGD: {best_variant:.2f}%")
-        print(f"   🔵 VANILLA BEST: Simple DP-SGD outperforms advanced techniques")
+        logger.success("Best: Vanilla DP-SGD: %.2f%%", best_variant)
+        logger.success("Vanilla DP-SGD outperforms advanced techniques.")
     
     if synergy_gain > 1.0:
-        print(f"\n✅ STRONG DP-SAT SYNERGY: Combining Fisher + DP-SAT is highly beneficial!")
+        logger.success("Strong DP-SAT synergy: Fisher + DP-SAT is highly beneficial.")
     elif synergy_gain > 0.5:
-        print(f"\n✅ MODERATE DP-SAT SYNERGY: Fisher + DP-SAT combination shows promise")
+        logger.success("Moderate DP-SAT synergy: Fisher + DP-SAT combination shows promise.")
     elif synergy_gain > 0:
-        print(f"\n⚠️  WEAK DP-SAT SYNERGY: Minor benefit from DP-SAT combination")
+        logger.warn("Weak DP-SAT synergy: minor benefit from DP-SAT combination.")
     else:
-        print(f"\n❌ NO DP-SAT SYNERGY: DP-SAT may interfere with Fisher benefits")
+        logger.warn("No DP-SAT synergy: DP-SAT may interfere with Fisher benefits.")
     
     if max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 1.0:
-        print(f"🚀 STRONG OPTIMIZED CALIBRATION BENEFIT: Line search + multi-step significantly helps!")
+        logger.success("Strong optimized calibration benefit: line search + multi-step significantly helps.")
     elif max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 0.5:
-        print(f"🚀 MODERATE OPTIMIZED CALIBRATION BENEFIT: Enhanced calibration provides meaningful improvement")
+        logger.success("Moderate optimized calibration benefit: enhanced calibration provides meaningful improvement.")
     elif max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 0:
-        print(f"⚠️  WEAK OPTIMIZED CALIBRATION BENEFIT: Small improvement from enhanced calibration")
+        logger.warn("Weak optimized calibration benefit: small improvement from enhanced calibration.")
     else:
-        print(f"❌ NO OPTIMIZED CALIBRATION BENEFIT: Enhanced calibration may not help this configuration")
+        logger.warn("No optimized calibration benefit: enhanced calibration may not help this configuration.")
     
-    print(f"\n🔒 Key Insights:")
-    print(f"   • Fisher-informed noise shapes noise according to loss curvature")
-    print(f"   • DP-SAT guides optimization toward flatter minima")
-    print(f"   • OPTIMIZED calibration uses line search + multi-step refinement")
-    print(f"   • These approaches are orthogonal and can be combined")
-    print(f"   • DP-SAT synergy: {synergy_gain:+.2f}% suggests {'beneficial' if synergy_gain > 0 else 'neutral'} interaction")
-    print(f"   • OPT Calib benefit: {max(opt_calib_normal_gain, opt_calib_dpsat_gain):+.2f}% suggests {'beneficial' if max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 0 else 'neutral'} effect")
+    logger.info("Key Insights:")
+    logger.info("   • Fisher-informed noise shapes noise according to loss curvature.")
+    logger.info("   • DP-SAT guides optimization toward flatter minima.")
+    logger.info("   • OPTIMIZED calibration uses line search + multi-step refinement.")
+    logger.info("   • These approaches are orthogonal and can be combined.")
+    logger.info("   • DP-SAT synergy: %+0.2f%% (%s)", synergy_gain, "beneficial" if synergy_gain > 0 else "neutral")
+    logger.info(
+        "   • OPT Calib benefit: %+0.2f%% (%s)",
+        max(opt_calib_normal_gain, opt_calib_dpsat_gain),
+        "beneficial" if max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 0 else "neutral",
+    )
     
     if 'mia_results' in results:
-        print(f"\n🛡️  Privacy Summary:")
+        logger.info("Privacy Summary (audit-only):")
         best_privacy = results['mia_results']['best_privacy_model']
         effects = results['mia_results']['privacy_effects']
         
-        print(f"   • Best protection: {best_privacy[0]} (AUC: {best_privacy[1]:.4f})")
-        print(f"   • OPT Calibration improves privacy by {max(effects['calib_normal_effect'], effects['calib_dpsat_effect']):+.3f} AUC")
+        logger.info("   • Best protection: %s (AUC: %.4f)", best_privacy[0], best_privacy[1])
+        logger.info(
+            "   • OPT Calibration improves privacy by %+0.3f AUC*",
+            max(effects['calib_normal_effect'], effects['calib_dpsat_effect']),
+        )
         
         if effects['combined_effect'] > 0.02:
-            print(f"   ✅ STRONG: Combined techniques provide excellent privacy enhancement")
+            logger.success(f"   ✅ STRONG: Combined techniques provide excellent privacy enhancement")
         elif effects['combined_effect'] > 0:
-            print(f"   ✅ GOOD: Combined techniques improve privacy protection")
+            logger.success(f"   ✅ GOOD: Combined techniques improve privacy protection")
         else:
-            print(f"   ⚠️  LIMITED: Minimal privacy benefit from combined techniques")
+            logger.warn(f"   ⚠️  LIMITED: Minimal privacy benefit from combined techniques")
     
-    print(f"\n📍 Key Findings:")
-    print(f"   • DP-SAT synergy: {synergy_gain:+.2f}% accuracy improvement")
-    print(f"   • OPTIMIZED Calibration: {'beneficial' if max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 0 else 'harmful'} for accuracy")
+    logger.info(f"\n📍 Key Findings:")
+    logger.info(f"   • DP-SAT synergy: {synergy_gain:+.2f}% accuracy improvement")
+    logger.info(f"   • OPTIMIZED Calibration: {'beneficial' if max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 0 else 'harmful'} for accuracy")
     if 'mia_results' in results:
-        print(f"   • Privacy: OPT Calibration provides +{max(results['mia_results']['privacy_effects']['calib_normal_effect'], results['mia_results']['privacy_effects']['calib_dpsat_effect']):.3f} AUC protection")
+        logger.info(f"   • Privacy: OPT Calibration provides +{max(results['mia_results']['privacy_effects']['calib_normal_effect'], results['mia_results']['privacy_effects']['calib_dpsat_effect']):.3f} AUC protection")
     
-    print(f"\n✅ Optimized ablation study complete! Models saved in {models_dir}/")
+    logger.success(f"\n✅ Optimized ablation study complete! Models saved in {models_dir}/")
 
 if __name__ == "__main__":
     main() 

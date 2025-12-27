@@ -26,7 +26,7 @@ from core.privacy_accounting import (
     print_privacy_summary,
     validate_privacy_comparison,
 )
-from core.config import RANDOM_SEED, get_dataset_location, set_random_seeds
+from config import RANDOM_SEED, get_dataset_location, get_logger, set_random_seeds
 from core.device_utils import resolve_device, maybe_wrap_model_for_multi_gpu
 
 
@@ -34,6 +34,7 @@ AVAILABLE_DATASETS = tuple(DATASET_REGISTRY.keys())
 AVAILABLE_MODELS = tuple(available_models())
 VISION_PRETRAINABLE = {"resnet", "resnet18", "efficientnet", "efficientnet_b0", "vit", "vit_b16"}
 HF_SEQUENCE_MODELS = {"bert", "qwen", "llama", "llama3.1-8b"}
+logger = get_logger("training")
 
 
 def get_device(args: argparse.Namespace) -> torch.device:
@@ -69,10 +70,10 @@ def log_data_split(dataset_name: str, loaders) -> None:
     private_size = len(loaders.private_base)
     public_size = len(loaders.public.dataset) if hasattr(loaders.public, "dataset") else 0
     eval_size = len(loaders.evaluation.dataset) if hasattr(loaders.evaluation, "dataset") else 0
-    print(f"\n📊 Data split for {dataset_name}:")
-    print(f"   • Private data : {private_size} samples")
-    print(f"   • Public data  : {public_size} samples")
-    print(f"   • Evaluation   : {eval_size} samples")
+    logger.info("Data split for %s:", dataset_name)
+    logger.info("   • Private data : %s samples", private_size)
+    logger.info("   • Public data  : %s samples", public_size)
+    logger.info("   • Evaluation   : %s samples", eval_size)
 
 
 def parse_args() -> argparse.Namespace:
@@ -179,10 +180,10 @@ def main() -> None:
     os.makedirs(models_dir, exist_ok=True)
 
     if args.clean:
-        print("Cleaning saved models…")
+        logger.warn("Cleaning saved models…")
         for path in glob.glob(os.path.join(models_dir, "*.pth")):
             os.remove(path)
-            print(f"  removed {path}")
+            logger.info("  removed %s", path)
 
     dataset_root, allow_download = get_dataset_location(dataset_key=args.dataset_name)
     dataset_builder = build_dataset_builder(args.dataset_name)
@@ -210,16 +211,16 @@ def main() -> None:
     log_data_split(args.dataset_name, loaders)
 
     if args.sample_level:
-        print("📊 Using SAMPLE-level DP-SGD (traditional)")
+        logger.info("Using sample-level DP-SGD (traditional).")
         priv_ds_for_mia = None
     else:
-        print(f"👥 Using USER-level DP-SGD ({args.users} synthetic users)")
+        logger.info("Using user-level DP-SGD (%s synthetic users).", args.users)
         priv_ds_for_mia = getattr(priv_loader, "dataset", None)
 
     baseline = build_model_from_args(args, dataset_builder.num_labels).to(device)
     opt_baseline = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=0.9, weight_decay=0.0)
 
-    print("\n⚙️  Training baseline…")
+    logger.highlight("Training baseline")
     for epoch in tqdm(range(args.epochs)):
         baseline.train()
         for batch in priv_loader:
@@ -228,7 +229,7 @@ def main() -> None:
             F.cross_entropy(baseline(features), labels).backward()
             opt_baseline.step()
 
-    print("\n🔍  Fisher matrix…")
+    logger.highlight("Fisher matrix")
     fisher_matrix, _ = compute_fisher(
         baseline,
         priv_loader,
@@ -237,7 +238,7 @@ def main() -> None:
         rho=1e-2,
     )
 
-    print("\n🚀 Fisher-informed DP-SGD…")
+    logger.highlight("Fisher-informed DP-SGD")
     fisher_dp_model = copy.deepcopy(baseline)
 
     if args.use_legacy_accounting:
@@ -258,12 +259,12 @@ def main() -> None:
         )
         sigma = noise_multiplier * args.clip_radius
         display_epsilon = args.target_epsilon
-        print("\n🔒 Using Proper Privacy Accounting (Opacus RDP)")
-        print(f"   • Target (ε, δ): ({args.target_epsilon}, {args.delta})")
-        print(f"   • Sample rate    : {sample_rate:.4f}")
-        print(f"   • Noise multiplier: {noise_multiplier:.4f}")
-        print(f"   • Sigma           : {sigma:.4f}")
-        print(f"   • Total steps     : {total_steps}")
+        logger.highlight("Using Proper Privacy Accounting (Opacus RDP)")
+        logger.info("   • Target (ε, δ): (%.4f, %.1e)", args.target_epsilon, args.delta)
+        logger.info("   • Sample rate    : %.4f", sample_rate)
+        logger.info("   • Noise multiplier: %.4f", noise_multiplier)
+        logger.info("   • Sigma           : %.4f", sigma)
+        logger.info("   • Total steps     : %s", total_steps)
 
     fisher_dp_model = train_with_dp(
         fisher_dp_model,
@@ -289,7 +290,7 @@ def main() -> None:
     dp_sat_model: Optional[torch.nn.Module] = None
 
     if args.compare_others:
-        print("\n📐 Vanilla DP-SGD (comparison)…")
+        logger.highlight("Vanilla DP-SGD (comparison)")
         vanilla_dp_model = copy.deepcopy(baseline)
         vanilla_dp_model = train_with_vanilla_dp(
             vanilla_dp_model,
@@ -307,7 +308,7 @@ def main() -> None:
             dp_epochs=args.dp_epochs,
         )
 
-        print("\n🔺 DP-SAT: Sharpness-Aware Training (comparison)…")
+        logger.highlight("DP-SAT: Sharpness-Aware Training (comparison)")
         dp_sat_model = copy.deepcopy(baseline)
         dp_sat_model = train_with_dp_sat(
             dp_sat_model,
@@ -361,7 +362,7 @@ def main() -> None:
                 sample_rate=sample_rate,
             )
             if is_fair:
-                print("\n✅ Fair privacy comparison: matched ε across methods")
+                logger.success("Fair privacy comparison: matched ε across methods.")
 
     def crit_accuracy(model):
         if crit_loader is None:
@@ -374,20 +375,20 @@ def main() -> None:
     vanilla_acc = accuracy(vanilla_dp_model, test_loader, device) if vanilla_dp_model else float("nan")
     dp_sat_acc = accuracy(dp_sat_model, test_loader, device) if dp_sat_model else float("nan")
 
-    print(f"\n📊 Accuracy summary ({dp_mode})")
-    print(f" baseline   : {baseline_acc:6.2f}% (crit {crit_accuracy(baseline):5.2f}%)")
-    print(f" Fisher DP  : {fisher_acc:6.2f}% (crit {crit_accuracy(fisher_dp_model):5.2f}%)")
+    logger.highlight(f"Accuracy summary ({dp_mode})")
+    logger.info(" baseline   : %6.2f%% (crit %5.2f%%)", baseline_acc, crit_accuracy(baseline))
+    logger.info(" Fisher DP  : %6.2f%% (crit %5.2f%%)", fisher_acc, crit_accuracy(fisher_dp_model))
     if vanilla_dp_model is not None:
-        print(f" Vanilla DP : {vanilla_acc:6.2f}% (crit {crit_accuracy(vanilla_dp_model):5.2f}%)")
+        logger.info(" Vanilla DP : %6.2f%% (crit %5.2f%%)", vanilla_acc, crit_accuracy(vanilla_dp_model))
     if dp_sat_model is not None:
-        print(f" DP-SAT     : {dp_sat_acc:6.2f}% (crit {crit_accuracy(dp_sat_model):5.2f}%)")
+        logger.info(" DP-SAT     : %6.2f%% (crit %5.2f%%)", dp_sat_acc, crit_accuracy(dp_sat_model))
 
     if vanilla_dp_model is not None:
-        print(f" Fisher vs Vanilla: {fisher_acc - vanilla_acc:+5.2f}%")
+        logger.info(" Fisher vs Vanilla: %+5.2f%%", fisher_acc - vanilla_acc)
     if dp_sat_model is not None:
-        print(f" Fisher vs DP-SAT : {fisher_acc - dp_sat_acc:+5.2f}%")
+        logger.info(" Fisher vs DP-SAT : %+5.2f%%", fisher_acc - dp_sat_acc)
 
-    print("\n💾 Saving models for MIA evaluation…")
+    logger.highlight("Saving models for MIA evaluation")
     baseline_path = os.path.join(models_dir, "baseline_model.pth")
     torch.save(
         {
@@ -403,7 +404,7 @@ def main() -> None:
         },
         baseline_path,
     )
-    print(f"✅ Saved baseline model to {baseline_path}")
+    logger.success("Saved baseline model to %s", baseline_path)
 
     fisher_path = os.path.join(models_dir, "fisher_dp_model.pth")
     torch.save(
@@ -424,7 +425,7 @@ def main() -> None:
         },
         fisher_path,
     )
-    print(f"✅ Saved Fisher DP model to {fisher_path}")
+    logger.success("Saved Fisher DP model to %s", fisher_path)
 
     if vanilla_dp_model is not None:
         vanilla_path = os.path.join(models_dir, "vanilla_dp_model.pth")
@@ -446,7 +447,7 @@ def main() -> None:
             },
             vanilla_path,
         )
-        print(f"✅ Saved Vanilla DP model to {vanilla_path}")
+        logger.success("Saved Vanilla DP model to %s", vanilla_path)
 
     if dp_sat_model is not None:
         dp_sat_path = os.path.join(models_dir, "dp_sat_model.pth")
@@ -469,9 +470,9 @@ def main() -> None:
             },
             dp_sat_path,
         )
-        print(f"✅ Saved DP-SAT model to {dp_sat_path}")
+        logger.success("Saved DP-SAT model to %s", dp_sat_path)
 
-    print("\n🛡️  To evaluate privacy protection, run with --run-mia or invoke mia.py directly.")
+    logger.info("To evaluate privacy protection, run with --run-mia or invoke mia.py directly.")
 
     if args.run_mia:
         eval_dataset = getattr(test_loader, "dataset", None)

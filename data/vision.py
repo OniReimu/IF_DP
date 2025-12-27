@@ -11,6 +11,8 @@ import torchvision
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, Dataset, Subset
 
+from config import get_logger, REHEARSAL_MAX_EXCLUDED_CLASS_RATIO
+
 from .base import (
     DatasetBuilder,
     DatasetConfig,
@@ -19,6 +21,8 @@ from .base import (
 )
 from .common import SyntheticUserDataset, UserBatchSampler
 from .registry import register_dataset
+
+logger = get_logger("data")
 
 
 def _build_private_loader(private_subset: Dataset, config: DatasetConfig) -> DataLoader:
@@ -101,9 +105,9 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
         # Determine split mode
         non_iid = getattr(config, "non_iid", False)
         if non_iid:
-            print("\n🔀 Non-IID dataset split mode enabled")
+            logger.info("Non-IID dataset split mode enabled.")
         else:
-            print("\n📊 IID dataset split mode (default)")
+            logger.info("IID dataset split mode (default).")
         
         # Optional non-IID simulation:
         # - Exclude some class labels from PUBLIC PRETRAIN only
@@ -144,8 +148,6 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
             # REHEARSAL BUFFER: Add samples from non-excluded classes to private
             # to prevent catastrophic forgetting (keep excluded classes ≤ 50% of private)
             # ============================================================
-            from core.config import REHEARSAL_MAX_EXCLUDED_CLASS_RATIO
-            
             # Identify rehearsal classes (all classes NOT in excluded set)
             all_classes = set(np.unique(targets_arr))
             rehearsal_classes = sorted(all_classes - exclude_set)
@@ -185,27 +187,61 @@ class _TorchvisionClassificationBuilder(DatasetBuilder):
                         priv_idx_arr = np.concatenate([priv_idx_arr, rehearsal_selected.astype(int)], axis=0)
                         pub_idx_filtered = pub_idx_filtered[~np.isin(pub_idx_filtered, rehearsal_selected)]
                         
-                        print(f"\n📚 Rehearsal buffer: added {len(rehearsal_selected)} samples from classes {rehearsal_classes}")
-                        print(f"   • Goal: keep excluded classes ≤ {REHEARSAL_MAX_EXCLUDED_CLASS_RATIO*100:.0f}% of private")
-                        print(f"   • Before: excluded={excluded_in_private}/{total_private} ({excluded_in_private/total_private*100:.1f}%)")
+                        logger.info(
+                            "Rehearsal buffer: added %s samples from classes %s",
+                            len(rehearsal_selected),
+                            rehearsal_classes,
+                        )
+                        logger.info(
+                            "   • Goal: keep excluded classes ≤ %.0f%% of private",
+                            REHEARSAL_MAX_EXCLUDED_CLASS_RATIO * 100,
+                        )
+                        logger.info(
+                            "   • Before: excluded=%s/%s (%.1f%%)",
+                            excluded_in_private,
+                            total_private,
+                            excluded_in_private / total_private * 100,
+                        )
                         excluded_after = sum(_count_for(priv_idx_arr, cls) for cls in exclude_set)
-                        print(f"   • After:  excluded={excluded_after}/{len(priv_idx_arr)} ({excluded_after/len(priv_idx_arr)*100:.1f}%)")
+                        logger.info(
+                            "   • After:  excluded=%s/%s (%.1f%%)",
+                            excluded_after,
+                            len(priv_idx_arr),
+                            excluded_after / len(priv_idx_arr) * 100,
+                        )
                     else:
-                        print(f"\n⚠️  Rehearsal buffer: requested {rehearsal_needed} samples but only {len(rehearsal_candidates)} available in public pretrain")
+                        logger.warn(
+                            "Rehearsal buffer: requested %s samples but only %s available in public pretrain",
+                            rehearsal_needed,
+                            len(rehearsal_candidates),
+                        )
                         if len(rehearsal_candidates) > 0:
                             # Take all available
                             priv_idx_arr = np.concatenate([priv_idx_arr, rehearsal_candidates.astype(int)], axis=0)
                             pub_idx_filtered = pub_idx_filtered[~np.isin(pub_idx_filtered, rehearsal_candidates)]
-                            print(f"   • Added {len(rehearsal_candidates)} available samples")
+                            logger.info("   • Added %s available samples", len(rehearsal_candidates))
 
-            print("\n🧪 Non-IID simulation: exclude classes from public pretrain and move to private")
-            print(f"   • Excluded classes: {sorted(exclude_set)}")
-            print(f"   • Public pretrain size: {len(pub_idx_arr)} -> {len(pub_idx_filtered)} (moved {len(removed_from_public)})")
-            print(f"   • Private size: {len(priv_idx)} -> {len(priv_idx_arr)} (calibration unchanged: {len(calib_idx_arr)})")
+            logger.info("Non-IID simulation: exclude classes from public pretrain and move to private.")
+            logger.info("   • Excluded classes: %s", sorted(exclude_set))
+            logger.info(
+                "   • Public pretrain size: %s -> %s (moved %s)",
+                len(pub_idx_arr),
+                len(pub_idx_filtered),
+                len(removed_from_public),
+            )
+            logger.info(
+                "   • Private size: %s -> %s (calibration unchanged: %s)",
+                len(priv_idx),
+                len(priv_idx_arr),
+                len(calib_idx_arr),
+            )
             for cls in sorted(exclude_set):
-                print(
-                    f"   • class {cls}: public={_count_for(pub_idx_filtered, cls)} "
-                    f"private={_count_for(priv_idx_arr, cls)} calib={_count_for(calib_idx_arr, cls)}"
+                logger.info(
+                    "   • class %s: public=%s private=%s calib=%s",
+                    cls,
+                    _count_for(pub_idx_filtered, cls),
+                    _count_for(priv_idx_arr, cls),
+                    _count_for(calib_idx_arr, cls),
                 )
 
             # Replace indices with our non-IID construction.

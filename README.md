@@ -183,6 +183,39 @@ uv run ablation.py --model-type resnet18 --epochs 100 --dp-layer "resnet.layer4"
 
 This ensures the final model has a formal $(\epsilon, \delta)$-DP guarantee w.r.t. the private training dataset.
 
+## 📈 Privacy Profile Plot (ε(δ))
+
+Use the ablation-style arguments to plot an ε(δ) privacy profile with the same dataset splits and accounting logic:
+
+```bash
+# User-level DP (matches ablation-style args)
+uv run scripts/plot_privacy_profile.py \
+  --dataset cifar10 \
+  --target-epsilon 0.5 \
+  --delta 1e-5 \
+  --dp-epochs 3 \
+  --users 200 \
+  --clip-radius 2.0 \
+  --non-iid \
+  --public-pretrain-exclude-classes 0,1
+
+# Sample-level DP
+uv run scripts/plot_privacy_profile.py \
+  --dataset cifar10 \
+  --target-epsilon 1.0 \
+  --delta 1e-5 \
+  --dp-epochs 3 \
+  --sample-level \
+  --batch-size 128
+```
+
+The script rebuilds the same private/public splits as the ablation runners, computes the implied sampling rate and steps, and then plots ε(δ) with a highlighted marker at the target δ.
+
+Important accounting notes:
+- The privacy profile uses only the subsampled Gaussian mechanism parameters (q, T, C, sigma). Extra implementation details such as `--full-complement-noise`, DP-SAT, Fisher shaping, or calibration do not change the accountant curve and can only make privacy stronger in practice.
+- The plot is valid only if the implemented step matches the assumed mechanism. If `--full-complement-noise` is disabled, DP correctness requires subspace-only updates (or otherwise bounding complement sensitivity); if complement updates are allowed, enable full complement noise to keep the per-step sensitivity bounded by C.
+- User-level subsampling nuance: for “one user per step” training, a standard Poisson-subsampling approximation would use `q_user = 1 / num_users` and `T = dp_epochs × num_users`. In this repo’s current ablation runners and plotter we instead use an “effective” rate `q_eff = len(priv_loader) / len(priv_base)` (typically `num_users / num_private_samples`). This can be larger than `q_user` and therefore yields a more conservative (higher-noise) accountant solution for a fixed target ε. If you want the most standard reporting, use Poisson user subsampling (`q_user`) and state it explicitly (recommended for papers).
+
 
 
 ## 🔧 **Configuration Options**
@@ -321,7 +354,7 @@ When using `--dp-param-count N`, the code uses **head-first selection** to prior
 - **`core/mia.py`**: Membership inference attack evaluation (shadow model attack, confidence attack, etc.)
 - **`core/privacy_accounting.py`**: Privacy accounting utilities (RDP accountant, noise multiplier calculation, privacy tracking)
 - **`core/param_selection.py`**: Shared parameter selection utility (`select_parameters_by_budget`) for consistent DP parameter budgeting across all methods
-- **`core/config.py`**: Configuration utilities (random seeds, dataset location, rehearsal buffer constants)
+- **`config/config.py`**: Configuration utilities (random seeds, dataset location, rehearsal buffer constants)
 - **`core/device_utils.py`**: Device resolution utilities (MPS/CUDA/CPU detection and multi-GPU support)
 
 ## 📚 **References**

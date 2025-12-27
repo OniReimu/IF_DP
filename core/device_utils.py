@@ -6,6 +6,9 @@ from typing import List, Optional
 
 import torch
 
+from config import get_logger
+
+logger = get_logger("device")
 
 def _parse_cuda_devices(spec: Optional[str]) -> Optional[List[int]]:
     if not spec:
@@ -30,11 +33,11 @@ def resolve_device(args) -> torch.device:
     setattr(args, "_cuda_devices", requested_devices)
 
     if getattr(args, "cpu", False):
-        print("Using CPU")
+        logger.info("Using CPU")
         return torch.device("cpu")
 
     if getattr(args, "mps", False) and torch.backends.mps.is_available():
-        print("Using MPS")
+        logger.info("Using MPS")
         return torch.device("mps")
 
     if torch.cuda.is_available():
@@ -47,14 +50,14 @@ def resolve_device(args) -> torch.device:
         if device_ids:
             primary = device_ids[0]
             msg = f"Using CUDA devices {device_ids} (primary cuda:{primary})" if len(device_ids) > 1 else f"Using CUDA:{primary}"
-            print(msg)
+            logger.info(msg)
         else:
             primary = getattr(args, "cuda_id", None)
             primary = primary if primary is not None else 0
-            print(f"Using CUDA:{primary}")
+            logger.info("Using CUDA:%s", primary)
         return torch.device(f"cuda:{primary}")
 
-    print("Using CPU")
+    logger.info("Using CPU")
     return torch.device("cpu")
 
 
@@ -81,5 +84,5 @@ def maybe_wrap_model_for_multi_gpu(model: torch.nn.Module, args):
     if isinstance(model, torch.nn.DataParallel):
         return model
 
-    print(f"🔁 Enabling DataParallel on CUDA devices {device_ids}")
+    logger.info("Enabling DataParallel on CUDA devices %s", device_ids)
     return torch.nn.DataParallel(model, device_ids=device_ids)
