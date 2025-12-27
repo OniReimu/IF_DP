@@ -125,13 +125,30 @@ def print_calibration_effect(before_stats, after_stats, target_class="all"):
         logger.warn("Calibration reduced evaluation slice accuracy.")
 
 
-def log_privacy_guarantee_summary(args, dp_epochs, steps_per_epoch, total_steps, sample_rate, noise_multiplier):
+def log_privacy_guarantee_summary(
+    args,
+    dp_epochs,
+    steps_per_epoch,
+    total_steps,
+    sample_rate,
+    noise_multiplier,
+    accounting_mode=None,
+):
     """Log the DP guarantee and accounting ingredients."""
     mode = "user-level" if not args.sample_level else "sample-level"
     logger.highlight("DP Guarantee (Accountant)")
     logger.info("Accountant: RDP (Opacus)")
     logger.info("Target (ε, δ): (%.4f, %.1e)", args.target_epsilon, args.delta)
     logger.info("DP mode: %s", mode)
+    if args.sample_level:
+        logger.info("Accounting mode: sample-level (q=batch/private)")
+    else:
+        mode_label = accounting_mode or getattr(args, "accounting_mode", "user_poisson")
+        logger.info("Accounting mode: %s", mode_label)
+        if mode_label == "user_poisson":
+            logger.info("User subsampling: q=1/users (Poisson approximation)")
+        else:
+            logger.info("User subsampling: q_eff=len(priv_loader)/len(priv_base)")
     if not args.sample_level:
         logger.info("User definition: %s synthetic users", args.users)
     logger.info("Sampling rate q: %.6f", sample_rate)
@@ -1183,8 +1200,19 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         else:
             actual_dp_epochs = max(1, int(math.ceil(args.epochs / 10)))
         
-        sample_rate = len(priv_loader) / len(priv_base)
         steps_per_epoch = len(priv_loader)
+        if args.sample_level:
+            sample_rate = steps_per_epoch / len(priv_base)
+            accounting_mode_used = "sample_level"
+            if args.accounting_mode != "repo_q_eff":
+                logger.warn("Accounting mode ignored for sample-level DP; using q=batch/private.")
+        else:
+            if args.accounting_mode == "user_poisson":
+                sample_rate = 1.0 / max(1, int(args.users))
+                accounting_mode_used = "user_poisson"
+            else:
+                sample_rate = steps_per_epoch / len(priv_base)
+                accounting_mode_used = "repo_q_eff"
         
         noise_multiplier, total_steps = get_privacy_params_for_target_epsilon(
             target_epsilon=args.target_epsilon,
@@ -1209,6 +1237,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             total_steps=total_steps,
             sample_rate=sample_rate,
             noise_multiplier=noise_multiplier,
+            accounting_mode=accounting_mode_used,
         )
     else:
         sigma = None
@@ -1971,6 +2000,14 @@ def main():
     # DP mode
     parser.add_argument('--sample-level', action='store_true')
     parser.add_argument('--users', type=int, default=10)
+    parser.add_argument(
+        '--accounting-mode',
+        type=str,
+        default='user_poisson',
+        choices=['repo_q_eff', 'user_poisson'],
+        help='User-level DP accounting: repo_q_eff matches current repo behavior (q=len(loader)/len(private)); '
+             'user_poisson uses q=1/users (Poisson approximation). Ignored for --sample-level.'
+    )
     
     # Calibration arguments (now enabled)
     parser.add_argument('--method', type=str, default='linear',

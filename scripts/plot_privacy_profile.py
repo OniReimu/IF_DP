@@ -124,11 +124,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--accounting-mode",
         type=str,
-        default="repo",
-        choices=["repo", "user_poisson", "both"],
+        default="repo_q_eff",
+        choices=["repo_q_eff", "repo", "user_poisson", "both"],
         help=(
             "Which sampling-rate model to use for user-level DP. "
-            "'repo' matches current ablation scripts (q_eff=len(loader)/len(private)); "
+            "'repo_q_eff' (alias 'repo') matches current ablation scripts (q_eff=len(loader)/len(private)); "
             "'user_poisson' uses q_user=1/users (Poisson subsampling approximation); "
             "'both' overlays both curves."
         ),
@@ -236,14 +236,14 @@ def main() -> None:
             )
 
         mode = str(args.accounting_mode)
-        if mode == "repo":
+        if mode in {"repo_q_eff", "repo"}:
             sigma, total_steps, actual_epsilon = _solve_and_plot(
                 label=f"repo q_eff (q={q_eff:.4f})",
                 q=q_eff,
                 steps_per_epoch_local=steps_per_epoch,
                 color="#1f77b4",
             )
-            logger.info("Using accounting-mode=repo (matches current ablation scripts).")
+            logger.info("Using accounting-mode=repo_q_eff (matches current ablation scripts).")
             logger.info("Sampling rate q: %.6f", q_eff)
             logger.info("Steps: %s (dp_epochs=%s, steps/epoch=%s)", total_steps, dp_epochs, steps_per_epoch)
             logger.info("Noise multiplier σ: %.4f", sigma)
