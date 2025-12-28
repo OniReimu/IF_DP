@@ -36,9 +36,11 @@ def resolve_device(args) -> torch.device:
         logger.info("Using CPU")
         return torch.device("cpu")
 
-    if getattr(args, "mps", False) and torch.backends.mps.is_available():
-        logger.info("Using MPS")
-        return torch.device("mps")
+    if getattr(args, "mps", False):
+        if torch.backends.mps.is_available():
+            logger.info("Using MPS")
+            return torch.device("mps")
+        logger.warn("MPS requested but unavailable; falling back to CPU/CUDA.")
 
     if torch.cuda.is_available():
         device_ids = requested_devices

@@ -36,7 +36,19 @@ from core.privacy_accounting import (
 from models import available_models, create_model
 from core.device_utils import resolve_device, maybe_wrap_model_for_multi_gpu
 from data import DATASET_REGISTRY, DatasetConfig, build_dataset_builder
-from core.mia import evaluate_membership_inference, confidence_attack, shadow_model_attack, prepare_mia_data_sample_level, prepare_mia_data_user_level
+from core.mia import (
+    evaluate_membership_inference,
+    confidence_attack,
+    shadow_model_attack,
+    prepare_mia_data_sample_level,
+    prepare_mia_data_user_level,
+    align_mia_datasets,
+    prepare_shadow_splits,
+    prepare_user_level_groups,
+    user_level_loss_attack,
+    prepare_user_shadow_splits,
+    user_level_shadow_attack,
+)
 from core.influence_function import calibrate_model_research_protocol
 from config import get_logger
 from config import get_dataset_location, get_random_seed, set_random_seeds
@@ -1608,9 +1620,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     
     logger.info(f"\n💾 Saving ablation study models...")
     ds_tag = _sanitize_cache_key(args.dataset_name)
+    iid_tag = "noniid" if args.non_iid else "iid"
     
     # Save Vanilla DP-SGD
-    vanilla_dp_path = os.path.join(models_dir, f'Vanilla_DP_{ds_tag}_Ablation.pth')
+    vanilla_dp_path = os.path.join(models_dir, f'Vanilla_DP_{ds_tag}_Ablation_{iid_tag}.pth')
     torch.save({
         'model_state_dict': vanilla_dp_model.state_dict(),
         'model_type': 'vanilla_dp',
@@ -1623,7 +1636,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     logger.success(f"✅ Saved Vanilla DP-SGD to {vanilla_dp_path}")
     
     # Save Vanilla DP-SGD + DP-SAT
-    vanilla_dpsat_path = os.path.join(models_dir, f'Vanilla_DPSAT_{ds_tag}_Ablation.pth')
+    vanilla_dpsat_path = os.path.join(models_dir, f'Vanilla_DPSAT_{ds_tag}_Ablation_{iid_tag}.pth')
     torch.save({
         'model_state_dict': vanilla_dpsat_model.state_dict(),
         'model_type': 'vanilla_dp_dpsat',
@@ -1638,7 +1651,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     logger.success(f"✅ Saved Vanilla DP-SGD + DP-SAT to {vanilla_dpsat_path}")
     
     # Save Fisher DP + Normal
-    fisher_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Ablation.pth')
+    fisher_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Ablation_{iid_tag}.pth')
     torch.save({
         'model_state_dict': fisher_normal_model.state_dict(),
         'model_type': 'fisher_dp_normal',
@@ -1653,7 +1666,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     logger.success(f"✅ Saved Fisher DP + Normal to {fisher_normal_path}")
     
     # Save Fisher DP + DP-SAT
-    fisher_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Ablation.pth')
+    fisher_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Ablation_{iid_tag}.pth')
     torch.save({
         'model_state_dict': fisher_dpsat_model.state_dict(),
         'model_type': 'fisher_dp_dpsat',
@@ -1672,7 +1685,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     logger.success(f"✅ Saved Fisher DP + DP-SAT ({effective_sat_mode}) to {fisher_dpsat_path}")
     
     # Save Fisher DP + Normal + Calibration
-    calib_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Calibrated_Ablation.pth')
+    calib_normal_path = os.path.join(models_dir, f'Fisher_Normal_{ds_tag}_Calibrated_Ablation_{iid_tag}.pth')
     torch.save({
         'model_state_dict': calib_normal.state_dict(),
         'model_type': 'fisher_dp_normal_calibrated',
@@ -1690,7 +1703,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
     logger.success(f"✅ Saved Fisher DP + Normal + Calibration to {calib_normal_path}")
     
     # Save Fisher DP + DP-SAT + Calibration
-    calib_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Calibrated_Ablation.pth')
+    calib_dpsat_path = os.path.join(models_dir, f'Fisher_DPSAT_{ds_tag}_Calibrated_Ablation_{iid_tag}.pth')
     torch.save({
         'model_state_dict': calib_dpsat.state_dict(),
         'model_type': 'fisher_dp_dpsat_calibrated',
@@ -1733,156 +1746,285 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         eval_source = eval_dataset if eval_dataset is not None else getattr(eval_loader, "dataset", None)
         if eval_source is None:
             raise RuntimeError("Evaluation dataset is required for MIA sampling. Ensure dataset builder provides it.")
+
+        mia_train_data, mia_priv_ds, transform_aligned = align_mia_datasets(
+            priv_base, priv_ds, eval_source, args.users
+        )
+        if transform_aligned:
+            logger.info("MIA transforms: aligned to eval.")
+
+        mia_use_user = False
+        mia_use_sample = False
+        if args.mia_level == "auto":
+            mia_use_sample = args.sample_level
+            mia_use_user = not args.sample_level
+        elif args.mia_level == "sample":
+            mia_use_sample = True
+        elif args.mia_level == "user":
+            mia_use_user = True
+
+        if mia_use_user and mia_priv_ds is None:
+            logger.warn("User-level MIA requested but priv_ds is unavailable; falling back to sample-level.")
+            mia_use_user = False
+            mia_use_sample = True
+
+        logger.info("MIA mode: %s", "user-level" if mia_use_user else "sample-level")
+        if mia_use_user:
+            logger.info("User-level MIA attack: %s", args.mia_attack)
         
         # CRITICAL ASSERTION: Verify that MIA member extraction uses the exact same dataset that models were trained on
-        if not args.sample_level:
+        if mia_use_user:
             # For user-level DP, priv_ds must wrap the exact priv_base used for training
-            if priv_ds is None:
+            if mia_priv_ds is None:
                 raise RuntimeError("priv_ds is None in user-level mode. Cannot prepare MIA data.")
-            if not hasattr(priv_ds, 'base'):
-                raise RuntimeError(f"priv_ds ({type(priv_ds)}) does not have 'base' attribute. Expected SyntheticUserDataset.")
-            if priv_ds.base is not priv_base:
+            if not hasattr(mia_priv_ds, 'base'):
+                raise RuntimeError(f"priv_ds ({type(mia_priv_ds)}) does not have 'base' attribute. Expected SyntheticUserDataset.")
+            if not transform_aligned and mia_priv_ds.base is not priv_base:
                 raise RuntimeError(
-                    f"CRITICAL MIA BUG: priv_ds.base ({id(priv_ds.base)}) is not the same object as priv_base ({id(priv_base)}).\n"
+                    f"CRITICAL MIA BUG: priv_ds.base ({id(mia_priv_ds.base)}) is not the same object as priv_base ({id(priv_base)}).\n"
                     f"This means MIA will extract 'members' from a different dataset than what the models were trained on,\n"
                     f"leading to incorrect AUC (likely ~0.5 or inverted).\n"
-                    f"priv_ds.base type: {type(priv_ds.base)}, len: {len(priv_ds.base) if hasattr(priv_ds.base, '__len__') else 'N/A'}\n"
+                    f"priv_ds.base type: {type(mia_priv_ds.base)}, len: {len(mia_priv_ds.base) if hasattr(mia_priv_ds.base, '__len__') else 'N/A'}\n"
                     f"priv_base type: {type(priv_base)}, len: {len(priv_base) if hasattr(priv_base, '__len__') else 'N/A'}"
                 )
-            logger.success("Verified: priv_ds.base is priv_base (MIA data source is correct).")
+            logger.success("MIA member source verified.")
         
         # Prepare member and non-member datasets
-        if args.sample_level:
+        if mia_use_sample:
             logger.info("Sample-level MIA: using actual private training samples as members.")
-            member_set, non_member_set = prepare_mia_data_sample_level(priv_base, eval_source, priv_idx, args.mia_size)
+            member_set, non_member_set = prepare_mia_data_sample_level(mia_train_data, eval_source, priv_idx, args.mia_size)
         else:
             logger.info("User-level MIA: using actual private users as members.")
-            member_set, non_member_set = prepare_mia_data_user_level(priv_ds, eval_source, args.users, args.mia_size)
+            member_set, non_member_set = prepare_mia_data_user_level(mia_priv_ds, eval_source, args.users, args.mia_size)
         
         member_loader = DataLoader(member_set, batch_size=64, shuffle=False)
         non_member_loader = DataLoader(non_member_set, batch_size=64, shuffle=False)
         
         logger.info(f"   • Members: {len(member_set)} samples")
         logger.info(f"   • Non-members: {len(non_member_set)} samples")
+
+        shadow_splits = None
+        if mia_use_sample:
+            shadow_splits = prepare_shadow_splits(mia_train_data, eval_source, seed=get_random_seed())
+            logger.info(
+                "Shadow split fixed: %s members / %s non-members",
+                len(shadow_splits["shadow_indices"]),
+                len(shadow_splits["shadow_non_member_indices"]),
+            )
+        user_groups = None
+        user_shadow_splits = None
+        if mia_use_user:
+            user_groups = prepare_user_level_groups(mia_priv_ds, eval_source, args.users, args.mia_size)
+            logger.info("User-level audit: %s users", len(user_groups[0]))
+            if args.mia_attack == "shadow":
+                _, _, non_member_user_ds = user_groups
+                user_shadow_splits = prepare_user_shadow_splits(
+                    mia_priv_ds,
+                    eval_source,
+                    args.users,
+                    seed=get_random_seed(),
+                    eval_user_ds=non_member_user_ds,
+                )
+                logger.info(
+                    "User shadow split fixed: %s member users / %s non-members",
+                    len(user_shadow_splits["shadow_user_ids"]),
+                    len(user_shadow_splits["shadow_non_member_user_ids"]),
+                )
         
-        # Run comprehensive MIA evaluation on all models
+        # Run MIA evaluation on all models (single mode)
         mia_results = {}
-        
-        logger.info(f"\n🕶️  SHADOW MODEL ATTACK RESULTS:")
-        logger.info("-" * 50)
+        if mia_use_sample:
+            logger.info("Shadow attack (sample-level) results:")
+        else:
+            label = "User-level shadow attack results:" if args.mia_attack == "shadow" else "User-level loss attack results:"
+            logger.info(label)
         
         for model_name, model in models_to_evaluate.items():
-            logger.info(f"   Evaluating {model_name}...")
-            shadow_result = shadow_model_attack(model, member_loader, non_member_loader, priv_base, device, eval_source, shadow_epochs=args.shadow_epochs)
-            mia_results[model_name] = {
-                'shadow_auc': shadow_result['auc'],
-                'shadow_auc_star': shadow_result.get('auc_star', max(shadow_result['auc'], 1.0 - shadow_result['auc'])),
-                'shadow_adv': shadow_result.get('adv', abs(shadow_result['auc'] - 0.5)),
-                'shadow_acc': shadow_result['accuracy']
-            }
-            logger.info(
-                f"     • AUC: {shadow_result['auc']:.4f} "
-                f"(AUC*: {mia_results[model_name]['shadow_auc_star']:.4f}, |AUC-0.5|: {mia_results[model_name]['shadow_adv']:.4f}), "
-                f"Accuracy: {shadow_result['accuracy']:.4f}"
-            )
+            logger.info("   Evaluating %s...", model_name)
+            mia_results[model_name] = {}
+            if mia_use_sample:
+                shadow_result = shadow_model_attack(
+                    model,
+                    member_loader,
+                    non_member_loader,
+                    mia_train_data,
+                    device,
+                    eval_source,
+                    shadow_epochs=args.shadow_epochs,
+                    shadow_splits=shadow_splits,
+                )
+                mia_results[model_name]['shadow_auc'] = shadow_result['auc']
+                mia_results[model_name]['shadow_auc_star'] = shadow_result.get(
+                    'auc_star',
+                    max(shadow_result['auc'], 1.0 - shadow_result['auc']),
+                )
+                mia_results[model_name]['shadow_adv'] = shadow_result.get(
+                    'adv',
+                    abs(shadow_result['auc'] - 0.5),
+                )
+                logger.info(
+                    "     • AUC*: %.4f  |AUC-0.5|: %.4f",
+                    mia_results[model_name]['shadow_auc_star'],
+                    mia_results[model_name]['shadow_adv'],
+                )
+            if user_groups is not None:
+                member_groups, non_member_groups, non_member_user_ds = user_groups
+                if args.mia_attack == "shadow":
+                    user_result = user_level_shadow_attack(
+                        model,
+                        member_groups,
+                        non_member_groups,
+                        mia_priv_ds,
+                        non_member_user_ds,
+                        device,
+                        shadow_epochs=args.shadow_epochs,
+                        shadow_splits=user_shadow_splits,
+                    )
+                else:
+                    user_result = user_level_loss_attack(
+                        model,
+                        member_groups,
+                        non_member_groups,
+                        mia_priv_ds,
+                        non_member_user_ds,
+                        device,
+                    )
+                mia_results[model_name]['user_auc_star'] = user_result['auc_star']
+                mia_results[model_name]['user_adv'] = user_result['adv']
+                logger.info(
+                    "     • User AUC*: %.4f  |AUC-0.5|: %.4f",
+                    mia_results[model_name]['user_auc_star'],
+                    mia_results[model_name]['user_adv'],
+                )
         
         # Comprehensive analysis
         logger.highlight("Comprehensive MIA Analysis (audit-only)")
         logger.info("=" * 60)
-        
-        # Use shadow attack AUC directly (no need for worst-case since we only have one attack)
-        shadow_aucs = {}
-        shadow_auc_stars = {}
-        shadow_advs = {}
-        for model_name in models_to_evaluate.keys():
-            shadow_aucs[model_name] = mia_results[model_name]['shadow_auc']
-            shadow_auc_stars[model_name] = mia_results[model_name]['shadow_auc_star']
-            shadow_advs[model_name] = mia_results[model_name]['shadow_adv']
-        
-        logger.info("Shadow Attack AUC Comparison:")
-        for model_name, auc in shadow_aucs.items():
-            logger.info(f"   • {model_name:30}: {auc:.4f}")
 
-        logger.info("Shadow Attack AUC* (sign-invariant) Comparison:")
-        for model_name, aucs in shadow_auc_stars.items():
-            logger.info(f"   • {model_name:30}: {aucs:.4f}")
-        logger.info("Shadow Attack Advantage |AUC-0.5| (lower is better):")
-        for model_name, adv in shadow_advs.items():
-            logger.info(f"   • {model_name:30}: {adv:.4f}")
-        
-        # Identify best and worst models for privacy
-        best_privacy_model = min(shadow_auc_stars.items(), key=lambda x: x[1])
-        worst_privacy_model = max(shadow_auc_stars.items(), key=lambda x: x[1])
-        
-        logger.info("Privacy Protection Ranking:")
-        logger.info(f"   🥇 BEST:  {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
-        logger.info(f"   🥴 WORST: {worst_privacy_model[0]} (AUC*: {worst_privacy_model[1]:.4f})")
-        
-        # Privacy vs Accuracy tradeoff analysis
-        logger.info("Privacy vs Accuracy Tradeoff:")
-        logger.info(f"   Model                          Accuracy  AttackAUC*  |AUC-0.5|")
-        logger.info(f"   {'─'*30} ─────────  ─────────  ─────────")
-        # Baseline row: show placeholder for attack metrics (not applicable as DP comparator)
-        logger.info(f"   {'Baseline (Public Only)':30} {baseline_acc:5.1f}%     {'-':>7}    {'-':>7}")
-        for model_name in ['Vanilla DP-SGD', 'Vanilla DP-SGD + DP-SAT', 'Fisher DP + Normal', 'Fisher DP + DP-SAT', 'Fisher DP + Normal + Calib', 'Fisher DP + DP-SAT + Calib']:
-            if model_name == 'Vanilla DP-SGD':
-                acc = vanilla_dp_acc
-            elif model_name == 'Vanilla DP-SGD + DP-SAT':
-                acc = vanilla_dpsat_acc
-            elif model_name == 'Fisher DP + Normal':
-                acc = fisher_normal_acc
-            elif model_name == 'Fisher DP + DP-SAT':
-                acc = fisher_dpsat_acc
-            elif model_name == 'Fisher DP + Normal + Calib':
-                acc = calib_normal_acc
-            else:  # Fisher DP + DP-SAT + Calib
-                acc = calib_dpsat_acc
+        if mia_use_sample:
+            shadow_auc_stars = {}
+            shadow_advs = {}
+            for model_name in models_to_evaluate.keys():
+                shadow_auc_stars[model_name] = mia_results[model_name]['shadow_auc_star']
+                shadow_advs[model_name] = mia_results[model_name]['shadow_adv']
 
-            aucs = shadow_auc_stars[model_name]
-            adv = shadow_advs[model_name]
-            logger.info(f"   {model_name:30} {acc:5.1f}%     {aucs:.4f}    {adv:.4f}")
-        
-        # Key comparisons only (remove redundant analysis)
-        logger.info(f"\n🔒 Key Privacy Effects:")
-        
-        baseline_auc_star = shadow_auc_stars['Baseline (Public Only)']
-        fisher_normal_auc_star = shadow_auc_stars['Fisher DP + Normal']
-        fisher_dpsat_auc_star = shadow_auc_stars['Fisher DP + DP-SAT']
-        calib_normal_auc_star = shadow_auc_stars['Fisher DP + Normal + Calib']
-        calib_dpsat_auc_star = shadow_auc_stars['Fisher DP + DP-SAT + Calib']
-        
-        dpsat_privacy_effect = fisher_normal_auc_star - fisher_dpsat_auc_star
-        calib_normal_privacy_effect = fisher_normal_auc_star - calib_normal_auc_star
-        calib_dpsat_privacy_effect = fisher_dpsat_auc_star - calib_dpsat_auc_star
-        combined_effect = fisher_normal_auc_star - calib_dpsat_auc_star
-        
-        logger.info(f"   • DP-SAT effect:      {dpsat_privacy_effect:+.4f} AUC*")
-        logger.info(f"   • Calibration effect: {max(calib_normal_privacy_effect, calib_dpsat_privacy_effect):+.4f} AUC*")
-        logger.info(f"   • Combined effect:    {combined_effect:+.4f} AUC*")
-        
-        # Final recommendation
-        logger.info(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
-        
-        # Store results for return
-        ablation_results['mia_results'] = {
-            'shadow_aucs': shadow_aucs,
-            'shadow_auc_stars': shadow_auc_stars,
-            'shadow_advs': shadow_advs,
-            'best_privacy_model': best_privacy_model,
-            'detailed_results': mia_results,
-            'privacy_effects': {
-                'dpsat_effect': dpsat_privacy_effect,
-                'calib_normal_effect': calib_normal_privacy_effect,
-                'calib_dpsat_effect': calib_dpsat_privacy_effect,
-                'combined_effect': combined_effect
+            logger.info("Sample-level audit AUC*:")
+            for model_name, aucs in shadow_auc_stars.items():
+                logger.info(f"   • {model_name:30}: {aucs:.4f}")
+            logger.info("Sample-level audit |AUC-0.5|:")
+            for model_name, adv in shadow_advs.items():
+                logger.info(f"   • {model_name:30}: {adv:.4f}")
+
+            best_privacy_model = min(shadow_auc_stars.items(), key=lambda x: x[1])
+            worst_privacy_model = max(shadow_auc_stars.items(), key=lambda x: x[1])
+            logger.info("Privacy Protection Ranking (sample-level):")
+            logger.info(f"   🥇 BEST:  {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
+            logger.info(f"   🥴 WORST: {worst_privacy_model[0]} (AUC*: {worst_privacy_model[1]:.4f})")
+
+            logger.info("Privacy vs Accuracy Tradeoff (sample-level):")
+            logger.info(f"   Model                          Accuracy  AttackAUC*  |AUC-0.5|")
+            logger.info(f"   {'─'*30} ─────────  ─────────  ─────────")
+            logger.info(f"   {'Baseline (Public Only)':30} {baseline_acc:5.1f}%     {'-':>6}    {'-':>7}")
+            for model_name in ['Vanilla DP-SGD', 'Vanilla DP-SGD + DP-SAT', 'Fisher DP + Normal', 'Fisher DP + DP-SAT', 'Fisher DP + Normal + Calib', 'Fisher DP + DP-SAT + Calib']:
+                if model_name == 'Vanilla DP-SGD':
+                    acc = vanilla_dp_acc
+                elif model_name == 'Vanilla DP-SGD + DP-SAT':
+                    acc = vanilla_dpsat_acc
+                elif model_name == 'Fisher DP + Normal':
+                    acc = fisher_normal_acc
+                elif model_name == 'Fisher DP + DP-SAT':
+                    acc = fisher_dpsat_acc
+                elif model_name == 'Fisher DP + Normal + Calib':
+                    acc = calib_normal_acc
+                else:
+                    acc = calib_dpsat_acc
+
+                aucs = shadow_auc_stars[model_name]
+                adv = shadow_advs[model_name]
+                logger.info(f"   {model_name:30} {acc:5.1f}%     {aucs:.4f}   {adv:.4f}")
+
+            baseline_auc_star = shadow_auc_stars['Baseline (Public Only)']
+            fisher_normal_auc_star = shadow_auc_stars['Fisher DP + Normal']
+            fisher_dpsat_auc_star = shadow_auc_stars['Fisher DP + DP-SAT']
+            calib_normal_auc_star = shadow_auc_stars['Fisher DP + Normal + Calib']
+            calib_dpsat_auc_star = shadow_auc_stars['Fisher DP + DP-SAT + Calib']
+
+            dpsat_privacy_effect = fisher_normal_auc_star - fisher_dpsat_auc_star
+            calib_normal_privacy_effect = fisher_normal_auc_star - calib_normal_auc_star
+            calib_dpsat_privacy_effect = fisher_dpsat_auc_star - calib_dpsat_auc_star
+            combined_effect = fisher_normal_auc_star - calib_dpsat_auc_star
+
+            logger.info("\n🔒 Key Privacy Effects:")
+            logger.info(f"   • DP-SAT effect:      {dpsat_privacy_effect:+.4f} AUC*")
+            logger.info(f"   • Calibration effect: {max(calib_normal_privacy_effect, calib_dpsat_privacy_effect):+.4f} AUC*")
+            logger.info(f"   • Combined effect:    {combined_effect:+.4f} AUC*")
+            logger.info(f"\n🎯 Best Privacy Protection: {best_privacy_model[0]} (AUC*: {best_privacy_model[1]:.4f})")
+            baseline_auc_star = shadow_auc_stars.get("Baseline (Public Only)")
+            if baseline_auc_star is not None:
+                logger.info("MIA sanity (baseline AUC*): %.4f (target ~0.5).", baseline_auc_star)
+                if abs(baseline_auc_star - 0.5) > 0.05:
+                    logger.warn("MIA sanity: baseline deviates from 0.5; check member/non-member matching.")
+
+            ablation_results['mia_results'] = {
+                'shadow_auc_stars': shadow_auc_stars,
+                'shadow_advs': shadow_advs,
+                'best_privacy_model': best_privacy_model,
+                'detailed_results': mia_results,
+                'privacy_effects': {
+                    'dpsat_effect': dpsat_privacy_effect,
+                    'calib_normal_effect': calib_normal_privacy_effect,
+                    'calib_dpsat_effect': calib_dpsat_privacy_effect,
+                    'combined_effect': combined_effect
+                }
             }
-        }
+            ablation_results['mia_results']['fisher_worst_auc'] = fisher_normal_auc_star
+            ablation_results['mia_results']['dp_sat_worst_auc'] = fisher_dpsat_auc_star
+        else:
+            user_auc_stars = {k: v['user_auc_star'] for k, v in mia_results.items()}
+            user_advs = {k: v['user_adv'] for k, v in mia_results.items()}
+            label = "User-level shadow AUC*:" if args.mia_attack == "shadow" else "User-level loss AUC*:"
+            logger.info(label)
+            for model_name, aucs in user_auc_stars.items():
+                logger.info(f"   • {model_name:30}: {aucs:.4f}")
+            label = "User-level shadow |AUC-0.5|:" if args.mia_attack == "shadow" else "User-level loss |AUC-0.5|:"
+            logger.info(label)
+            for model_name, adv in user_advs.items():
+                logger.info(f"   • {model_name:30}: {adv:.4f}")
+            baseline_auc_star = user_auc_stars.get("Baseline (Public Only)")
+            if baseline_auc_star is not None:
+                logger.info("MIA sanity (baseline AUC*): %.4f (target ~0.5).", baseline_auc_star)
+                if abs(baseline_auc_star - 0.5) > 0.05:
+                    logger.warn("MIA sanity: baseline deviates from 0.5; check member/non-member matching.")
+
+            logger.info("Privacy vs Accuracy Tradeoff (user-level):")
+            logger.info(f"   Model                          Accuracy  AttackAUC*  |AUC-0.5|")
+            logger.info(f"   {'─'*30} ─────────  ─────────  ─────────")
+            logger.info(f"   {'Baseline (Public Only)':30} {baseline_acc:5.1f}%     {'-':>6}    {'-':>7}")
+            for model_name in ['Vanilla DP-SGD', 'Vanilla DP-SGD + DP-SAT', 'Fisher DP + Normal', 'Fisher DP + DP-SAT', 'Fisher DP + Normal + Calib', 'Fisher DP + DP-SAT + Calib']:
+                if model_name == 'Vanilla DP-SGD':
+                    acc = vanilla_dp_acc
+                elif model_name == 'Vanilla DP-SGD + DP-SAT':
+                    acc = vanilla_dpsat_acc
+                elif model_name == 'Fisher DP + Normal':
+                    acc = fisher_normal_acc
+                elif model_name == 'Fisher DP + DP-SAT':
+                    acc = fisher_dpsat_acc
+                elif model_name == 'Fisher DP + Normal + Calib':
+                    acc = calib_normal_acc
+                else:
+                    acc = calib_dpsat_acc
+
+                aucs = user_auc_stars[model_name]
+                adv = user_advs[model_name]
+                logger.info(f"   {model_name:30} {acc:5.1f}%     {aucs:.4f}   {adv:.4f}")
+
+            ablation_results['mia_results'] = {
+                'user_auc_stars': user_auc_stars,
+                'user_advs': user_advs,
+                'detailed_results': mia_results,
+            }
         
-        # Update legacy fields for compatibility
-        ablation_results['mia_results']['fisher_worst_auc'] = fisher_normal_auc_star
-        ablation_results['mia_results']['dp_sat_worst_auc'] = fisher_dpsat_auc_star
-        
-        logger.success("Comprehensive MIA evaluation complete (shadow attack only).")
+        logger.success("MIA audit complete.")
         logger.info("Note: DP guarantees come from the accountant/mechanism; MIA is an empirical audit.")
         logger.info("Report AUC*, |AUC-0.5|, and include no-private-training controls to catch distribution shift.")
 
@@ -2039,6 +2181,20 @@ def main():
     # MIA evaluation
     parser.add_argument('--run-mia', action='store_true')
     parser.add_argument('--mia-size', type=int, default=1000)
+    parser.add_argument(
+        '--mia-level',
+        type=str,
+        default='auto',
+        choices=['auto', 'sample', 'user'],
+        help='MIA mode: auto follows DP mode; sample forces sample-level; user forces user-level.',
+    )
+    parser.add_argument(
+        '--mia-attack',
+        type=str,
+        default='shadow',
+        choices=['shadow', 'loss'],
+        help='User-level MIA attack: shadow (default) or loss. Ignored for sample-level MIA.',
+    )
     parser.add_argument('--shadow-epochs', type=int, default=3,
                        help='Number of training epochs for each shadow model in MIA attack (default: 3)')
     
@@ -2296,27 +2452,42 @@ def main():
     
     if 'mia_results' in results:
         logger.info("Privacy Summary (audit-only):")
-        best_privacy = results['mia_results']['best_privacy_model']
-        effects = results['mia_results']['privacy_effects']
-        
-        logger.info("   • Best protection: %s (AUC: %.4f)", best_privacy[0], best_privacy[1])
-        logger.info(
-            "   • OPT Calibration improves privacy by %+0.3f AUC*",
-            max(effects['calib_normal_effect'], effects['calib_dpsat_effect']),
-        )
-        
-        if effects['combined_effect'] > 0.02:
-            logger.success(f"   ✅ STRONG: Combined techniques provide excellent privacy enhancement")
-        elif effects['combined_effect'] > 0:
-            logger.success(f"   ✅ GOOD: Combined techniques improve privacy protection")
-        else:
-            logger.warn(f"   ⚠️  LIMITED: Minimal privacy benefit from combined techniques")
+        mia_results = results['mia_results']
+        if 'best_privacy_model' in mia_results and 'privacy_effects' in mia_results:
+            best_privacy = mia_results['best_privacy_model']
+            effects = mia_results['privacy_effects']
+
+            logger.info("   • Best protection: %s (AUC*: %.4f)", best_privacy[0], best_privacy[1])
+            logger.info(
+                "   • OPT Calibration improves privacy by %+0.3f AUC*",
+                max(effects['calib_normal_effect'], effects['calib_dpsat_effect']),
+            )
+
+            if effects['combined_effect'] > 0.02:
+                logger.success("   ✅ STRONG: Combined techniques provide excellent privacy enhancement")
+            elif effects['combined_effect'] > 0:
+                logger.success("   ✅ GOOD: Combined techniques improve privacy protection")
+            else:
+                logger.warn("   ⚠️  LIMITED: Minimal privacy benefit from combined techniques")
+        elif 'user_auc_stars' in mia_results:
+            user_auc_stars = mia_results['user_auc_stars']
+            if user_auc_stars:
+                best_privacy = min(user_auc_stars.items(), key=lambda x: x[1])
+                logger.info("   • Best protection (user-level): %s (AUC*: %.4f)", best_privacy[0], best_privacy[1])
+        elif 'shadow_auc_stars' in mia_results:
+            shadow_auc_stars = mia_results['shadow_auc_stars']
+            if shadow_auc_stars:
+                best_privacy = min(shadow_auc_stars.items(), key=lambda x: x[1])
+                logger.info("   • Best protection (sample-level): %s (AUC*: %.4f)", best_privacy[0], best_privacy[1])
     
     logger.info(f"\n📍 Key Findings:")
     logger.info(f"   • DP-SAT synergy: {synergy_gain:+.2f}% accuracy improvement")
     logger.info(f"   • OPTIMIZED Calibration: {'beneficial' if max(opt_calib_normal_gain, opt_calib_dpsat_gain) > 0 else 'harmful'} for accuracy")
-    if 'mia_results' in results:
-        logger.info(f"   • Privacy: OPT Calibration provides +{max(results['mia_results']['privacy_effects']['calib_normal_effect'], results['mia_results']['privacy_effects']['calib_dpsat_effect']):.3f} AUC protection")
+    if 'mia_results' in results and 'privacy_effects' in results['mia_results']:
+        logger.info(
+            "   • Privacy: OPT Calibration provides +%.3f AUC* protection",
+            max(results['mia_results']['privacy_effects']['calib_normal_effect'], results['mia_results']['privacy_effects']['calib_dpsat_effect']),
+        )
     
     logger.success(f"\n✅ Optimized ablation study complete! Models saved in {models_dir}/")
 

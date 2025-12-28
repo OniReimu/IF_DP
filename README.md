@@ -304,6 +304,8 @@ Use **sample-level DP** if you care about individual examples, and **user-level 
 
 # MIA evaluation
 --run-mia --shadow-epochs 3             # Run membership inference attack (default: 3 shadow epochs)
+--mia-level auto|sample|user           # Choose MIA granularity (auto follows DP mode)
+--mia-attack shadow|loss               # User-level attack type (ignored for sample-level)
 
 # Target specific layers (Strict DP: other layers are frozen)
 --dp-layer "conv1,conv2"               # CNN: matches prefixes conv1, conv2, ...
@@ -316,6 +318,29 @@ Use **sample-level DP** if you care about individual examples, and **user-level 
 ```
 
 **Note**: When using `--dp-layer`, the specified layers are trained with DP on private data, while all other layers are **frozen** (pre-trained on public data). This ensures strict $(\epsilon, \delta)$-DP for the entire model.
+
+**MIA audit notes**:
+- Shadow splits are fixed per run and reused across variants for fair comparison.
+- Member/non-member transforms are aligned to eval transforms to reduce train/test shift artifacts.
+- Non-members are label-matched to member distributions to reduce class-mix confounds (especially in non-IID runs).
+- In user-level DP mode, select the audit style via `--mia-attack shadow|loss` (default: shadow).
+
+**MIA-only runner**:
+```bash
+uv run training/mia_only.py \
+  --dataset cifar10 \
+  --model-type efficientnet \
+  --epochs 100 \
+  --non-iid --public-pretrain-exclude-classes 0,1 \
+  --users 200 \
+  --mia-level user \
+  --mia-attack shadow \
+  --shadow-epochs 3
+```
+
+**Cached model naming**:
+- Ablation model checkpoints include an IID tag: `*_Ablation_{iid|noniid}.pth`
+- Calibrated checkpoints include the tag: `*_Calibrated_Ablation_{iid|noniid}.pth`
 
 When using `--dp-param-count N`, the code uses **head-first selection** to prioritize classifier/head parameters, then fills remaining budget with backbone parameters. This ensures:
 - Classifier parameters are always included when budget allows (critical for learning new classes)

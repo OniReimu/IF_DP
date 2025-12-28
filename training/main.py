@@ -145,6 +145,20 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--run-mia", action="store_true")
     parser.add_argument("--mia-size", type=int, default=1000)
+    parser.add_argument(
+        "--mia-level",
+        type=str,
+        default="auto",
+        choices=["auto", "sample", "user"],
+        help="MIA mode: auto follows DP mode; sample forces sample-level; user forces user-level.",
+    )
+    parser.add_argument(
+        "--mia-attack",
+        type=str,
+        default="shadow",
+        choices=["shadow", "loss"],
+        help="User-level MIA attack: shadow (default) or loss. Ignored for sample-level MIA.",
+    )
     parser.add_argument("--compare-others", action="store_true")
 
     privacy_group = parser.add_mutually_exclusive_group()
@@ -490,6 +504,8 @@ def main() -> None:
             vanilla_dp_model,
             dp_sat_model,
             None,
+            mia_level=args.mia_level,
+            mia_attack=args.mia_attack,
         )
 
 

@@ -7,16 +7,17 @@
 # ================================================================
 
 import os, argparse, copy
+from collections import defaultdict
 import numpy as np
 import torch, torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_recall_curve
 
-from data.common import prepare_batch
+from data.common import SyntheticUserDataset, prepare_batch
 from models.model import CNN
 from config import get_logger
 
@@ -43,6 +44,432 @@ dataset_root, allow_download = get_dataset_location(
 NUM_RUNS = 5 
 logger = get_logger("mia")
 
+
+class _TransformOverrideDataset(Dataset):
+    """Wrap a dataset but force a specific transform during __getitem__."""
+
+    def __init__(self, base: Dataset, transform) -> None:
+        self.base = base
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+        if not hasattr(self.base, "transform"):
+            return self.base[idx]
+        original = getattr(self.base, "transform")
+        setattr(self.base, "transform", self.transform)
+        try:
+            return self.base[idx]
+        finally:
+            setattr(self.base, "transform", original)
+
+
+def _get_dataset_transform(dataset) -> object:
+    if isinstance(dataset, Subset):
+        dataset = dataset.dataset
+    return getattr(dataset, "transform", None)
+
+
+def _apply_transform_override(dataset, transform):
+    if transform is None:
+        return dataset
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        if not hasattr(base, "transform"):
+            return dataset
+        wrapped = _TransformOverrideDataset(base, transform)
+        return Subset(wrapped, dataset.indices)
+    if hasattr(dataset, "transform"):
+        return _TransformOverrideDataset(dataset, transform)
+    return dataset
+
+
+def align_mia_datasets(train_data, priv_ds, eval_data, num_users):
+    """Align member/non-member transforms to eval_data when possible."""
+    eval_transform = _get_dataset_transform(eval_data)
+    if eval_transform is None:
+        return train_data, priv_ds, False
+
+    train_data_aligned = _apply_transform_override(train_data, eval_transform)
+    priv_ds_aligned = priv_ds
+    if priv_ds is not None and hasattr(priv_ds, "base"):
+        base_aligned = _apply_transform_override(priv_ds.base, eval_transform)
+        priv_ds_aligned = SyntheticUserDataset(base_aligned, num_users)
+    return train_data_aligned, priv_ds_aligned, True
+
+
+def prepare_shadow_splits(train_data, eval_data, seed=None, shadow_size=None):
+    """Prepare a fixed shadow split (members/non-members) for fair comparisons."""
+    rng = np.random.RandomState(seed) if seed is not None else np.random
+    shadow_size = shadow_size or min(len(train_data) // 2, 2000)
+    shadow_indices = rng.choice(len(train_data), shadow_size, replace=False)
+    if eval_data is not None:
+        shadow_non_member_size = min(len(eval_data), shadow_size)
+        shadow_non_member_indices = rng.choice(len(eval_data), shadow_non_member_size, replace=False)
+        source = "eval"
+    else:
+        remaining_indices = np.setdiff1d(np.arange(len(train_data)), shadow_indices)
+        shadow_non_member_indices = remaining_indices[:shadow_size]
+        source = "train_fallback"
+    return {
+        "shadow_indices": shadow_indices,
+        "shadow_non_member_indices": shadow_non_member_indices,
+        "shadow_size": shadow_size,
+        "non_member_source": source,
+    }
+
+
+def _extract_user_id(sample) -> int:
+    if isinstance(sample, dict):
+        uid_value = sample.get("user_ids", sample.get("user_id"))
+        if isinstance(uid_value, torch.Tensor):
+            return int(uid_value.item())
+        return int(uid_value) if uid_value is not None else 0
+    if isinstance(sample, (list, tuple)) and len(sample) >= 3:
+        uid_value = sample[2]
+        if isinstance(uid_value, torch.Tensor):
+            return int(uid_value.item())
+        return int(uid_value)
+    return 0
+
+
+def _extract_label(sample) -> int:
+    if isinstance(sample, dict):
+        label_value = sample.get("labels", sample.get("label"))
+    elif isinstance(sample, (list, tuple)) and len(sample) >= 2:
+        label_value = sample[1]
+    else:
+        raise ValueError("Sample is missing label information for MIA matching.")
+
+    if isinstance(label_value, torch.Tensor):
+        label_value = label_value.item()
+    return int(label_value)
+
+
+def _collect_label_counts(dataset, indices):
+    counts = defaultdict(int)
+    for idx in indices:
+        label = _extract_label(dataset[idx])
+        counts[label] += 1
+    return counts
+
+
+def _build_label_index_map(dataset):
+    label_map = defaultdict(list)
+    for idx in range(len(dataset)):
+        label = _extract_label(dataset[idx])
+        label_map[label].append(idx)
+    return label_map
+
+
+def _sample_indices_by_label(dataset, target_counts):
+    target_total = sum(target_counts.values()) if target_counts else 0
+    if target_total == 0:
+        return []
+
+    label_map = _build_label_index_map(dataset)
+    all_indices = list(range(len(dataset)))
+    selected = []
+
+    for label, count in target_counts.items():
+        pool = label_map.get(label, [])
+        if not pool:
+            logger.warn("MIA non-member matching: no eval samples for label %s; using full eval pool.", label)
+            pool = all_indices
+        replace = len(pool) < count
+        if replace:
+            logger.warn(
+                "MIA non-member matching: eval label %s has %s < %s; sampling with replacement.",
+                label,
+                len(pool),
+                count,
+            )
+        chosen = np.random.choice(pool, count, replace=replace).tolist()
+        selected.extend(chosen)
+
+    np.random.shuffle(selected)
+    return selected
+
+
+def _collect_user_groups(dataset):
+    user_samples = defaultdict(list)
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        uid = _extract_user_id(sample)
+        user_samples[uid].append(idx)
+    return user_samples
+
+
+def prepare_user_level_groups(priv_ds, eval_data, num_users, mia_users):
+    """Prepare fixed user groups for a user-level audit attack."""
+    member_groups_map = _collect_user_groups(priv_ds)
+    eval_user_ds = SyntheticUserDataset(eval_data, num_users)
+
+    n_users = min(mia_users, len(member_groups_map))
+    member_user_ids = np.random.choice(list(member_groups_map.keys()), n_users, replace=False)
+    member_groups = [member_groups_map[uid] for uid in member_user_ids]
+
+    member_indices = [idx for group in member_groups for idx in group]
+    target_counts = _collect_label_counts(priv_ds, member_indices)
+    non_member_indices = _sample_indices_by_label(eval_user_ds, target_counts)
+    if len(non_member_indices) < len(member_indices):
+        missing = len(member_indices) - len(non_member_indices)
+        fallback = np.random.choice(len(eval_user_ds), missing, replace=True).tolist()
+        non_member_indices.extend(fallback)
+
+    non_member_groups = []
+    cursor = 0
+    for group in member_groups:
+        size = len(group)
+        non_member_groups.append(non_member_indices[cursor:cursor + size])
+        cursor += size
+
+    logger.info("   • Non-members: label-matched to member distribution (user-level).")
+    return member_groups, non_member_groups, eval_user_ds
+
+
+def _compute_group_scores(model, dataset, groups, device, batch_size=64):
+    scores = []
+    model.eval()
+    with torch.no_grad():
+        for indices in groups:
+            subset = Subset(dataset, indices)
+            loader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+            total_loss = 0.0
+            total_count = 0
+            for batch_data in loader:
+                features, labels, _ = prepare_batch(batch_data, device)
+                output = model(features)
+                loss = F.cross_entropy(output, labels, reduction="sum")
+                total_loss += float(loss.item())
+                total_count += int(labels.size(0))
+            if total_count == 0:
+                scores.append(0.0)
+            else:
+                scores.append(-total_loss / total_count)
+    return scores
+
+
+def user_level_loss_attack(model, member_groups, non_member_groups, member_dataset, non_member_dataset, device):
+    """User-level audit attack using mean per-user loss (higher score => more likely member)."""
+    member_scores = _compute_group_scores(model, member_dataset, member_groups, device)
+    non_member_scores = _compute_group_scores(model, non_member_dataset, non_member_groups, device)
+
+    if not member_scores or not non_member_scores:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base)}
+
+    y_true = np.array([1] * len(member_scores) + [0] * len(non_member_scores))
+    scores = np.array(member_scores + non_member_scores)
+    if np.std(scores) < 1e-8:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base)}
+
+    auc_score = roc_auc_score(y_true, scores)
+    return {"auc": auc_score, "auc_star": auc_star(auc_score), "adv": auc_advantage(auc_score)}
+
+
+def _compute_group_features(model, dataset, groups, device, batch_size=64):
+    feature_rows = []
+    model.eval()
+    with torch.no_grad():
+        for indices in groups:
+            subset = Subset(dataset, indices)
+            loader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+            group_features = []
+            for batch_data in loader:
+                inputs, labels, _ = prepare_batch(batch_data, device)
+                output = model(inputs)
+                probs = F.softmax(output, dim=1)
+                probs = torch.clamp(probs, min=1e-8, max=1.0 - 1e-8)
+                max_prob = torch.max(probs, dim=1)[0]
+                entropy = -torch.sum(probs * torch.log(probs), dim=1)
+                entropy = torch.clamp(entropy, min=0.0, max=10.0)
+                top3_probs, _ = torch.topk(probs, min(3, probs.size(1)), dim=1)
+                if top3_probs.size(1) < 3:
+                    padding = torch.zeros(top3_probs.size(0), 3 - top3_probs.size(1), device=device)
+                    top3_probs = torch.cat([top3_probs, padding], dim=1)
+                batch_features = torch.cat(
+                    [max_prob.unsqueeze(1), entropy.unsqueeze(1), top3_probs],
+                    dim=1,
+                )
+                group_features.append(batch_features)
+            if not group_features:
+                feature_rows.append(np.zeros(5, dtype=np.float32))
+            else:
+                group_mat = torch.cat(group_features, dim=0)
+                feature_rows.append(group_mat.mean(dim=0).cpu().numpy())
+    return np.vstack(feature_rows) if feature_rows else np.array([])
+
+
+def prepare_user_shadow_splits(priv_ds, eval_data, num_users, seed=0, shadow_users=None, eval_user_ds=None):
+    rng = np.random.RandomState(seed)
+    priv_groups = _collect_user_groups(priv_ds)
+    if eval_user_ds is None:
+        eval_user_ds = SyntheticUserDataset(eval_data, num_users)
+    eval_groups = _collect_user_groups(eval_user_ds)
+
+    max_users = min(len(priv_groups), len(eval_groups))
+    if max_users == 0:
+        return {
+            "shadow_user_ids": [],
+            "shadow_non_member_user_ids": [],
+            "eval_user_ds": eval_user_ds,
+        }
+
+    if shadow_users is None:
+        shadow_users = min(max_users // 2, 200)
+    shadow_users = max(1, min(shadow_users, max_users))
+
+    shadow_user_ids = rng.choice(list(priv_groups.keys()), shadow_users, replace=False)
+    shadow_non_member_ids = rng.choice(list(eval_groups.keys()), shadow_users, replace=False)
+
+    return {
+        "shadow_user_ids": list(shadow_user_ids),
+        "shadow_non_member_user_ids": list(shadow_non_member_ids),
+        "eval_user_ds": eval_user_ds,
+    }
+
+
+def user_level_shadow_attack(
+    target_model,
+    member_groups,
+    non_member_groups,
+    priv_ds,
+    eval_user_ds,
+    device,
+    shadow_epochs=3,
+    num_shadows=3,
+    shadow_splits=None,
+):
+    """User-level shadow attack using aggregated per-user features."""
+    if not member_groups or not non_member_groups:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+
+    priv_groups = _collect_user_groups(priv_ds)
+    if shadow_splits is None:
+        eval_groups = _collect_user_groups(eval_user_ds)
+        shadow_user_ids = list(priv_groups.keys())
+        non_member_user_ids = list(eval_groups.keys())
+        max_users = min(len(shadow_user_ids), len(non_member_user_ids))
+        if max_users == 0:
+            base = 0.5
+            return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+        shadow_users = min(max_users // 2, 200)
+        shadow_users = max(1, shadow_users)
+        shadow_user_ids = np.random.choice(shadow_user_ids, shadow_users, replace=False)
+        non_member_user_ids = np.random.choice(non_member_user_ids, shadow_users, replace=False)
+        eval_groups = _collect_user_groups(eval_user_ds)
+    else:
+        shadow_user_ids = shadow_splits.get("shadow_user_ids", [])
+        non_member_user_ids = shadow_splits.get("shadow_non_member_user_ids", [])
+        eval_user_ds = shadow_splits.get("eval_user_ds", eval_user_ds)
+        eval_groups = _collect_user_groups(eval_user_ds)
+
+    shadow_member_groups = [priv_groups[uid] for uid in shadow_user_ids if uid in priv_groups]
+    shadow_non_member_groups = [eval_groups[uid] for uid in non_member_user_ids if uid in eval_groups]
+
+    if not shadow_member_groups or not shadow_non_member_groups:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+
+    shadow_member_indices = [idx for group in shadow_member_groups for idx in group]
+    shadow_non_member_indices = [idx for group in shadow_non_member_groups for idx in group]
+    shadow_trainset = Subset(priv_ds, shadow_member_indices)
+    shadow_non_trainset = Subset(eval_user_ds, shadow_non_member_indices)
+
+    logger.info("   🔧 Training %s shadow models with %s epochs each...", num_shadows, shadow_epochs)
+    shadow_models = train_shadow_models(
+        shadow_trainset, target_model, num_shadows=num_shadows, epochs=shadow_epochs, device=device
+    )
+
+    shadow_features = []
+    shadow_labels = []
+
+    for shadow_model in shadow_models:
+        member_features = _compute_group_features(shadow_model, priv_ds, shadow_member_groups, device)
+        non_member_features = _compute_group_features(shadow_model, eval_user_ds, shadow_non_member_groups, device)
+
+        if member_features.size > 0 and non_member_features.size > 0:
+            shadow_features.append(member_features)
+            shadow_features.append(non_member_features)
+            shadow_labels.extend([1] * len(member_features))
+            shadow_labels.extend([0] * len(non_member_features))
+
+    if not shadow_features:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+
+    X_shadow = np.vstack(shadow_features)
+    y_shadow = np.array(shadow_labels)
+    X_shadow, y_shadow = validate_and_clean_features(X_shadow, y_shadow, "user-level shadow training data")
+
+    if len(X_shadow) < 10 or len(np.unique(y_shadow)) < 2:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_shadow, y_shadow, test_size=0.3, random_state=42, stratify=y_shadow
+    )
+
+    attack_pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", LogisticRegression(
+            random_state=42,
+            max_iter=1000,
+            C=1.0,
+            solver="liblinear",
+            class_weight="balanced",
+        )),
+    ])
+
+    try:
+        attack_pipeline.fit(X_train, y_train)
+        shadow_predictions = attack_pipeline.predict_proba(X_test)[:, 1]
+        shadow_auc = roc_auc_score(y_test, shadow_predictions)
+    except Exception:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+
+    target_member_features = _compute_group_features(target_model, priv_ds, member_groups, device)
+    target_non_member_features = _compute_group_features(target_model, eval_user_ds, non_member_groups, device)
+    if target_member_features.size == 0 or target_non_member_features.size == 0:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+
+    X_target = np.vstack([target_member_features, target_non_member_features])
+    y_target = np.concatenate([
+        np.ones(len(target_member_features)),
+        np.zeros(len(target_non_member_features)),
+    ])
+
+    try:
+        target_predictions_proba = attack_pipeline.predict_proba(X_target)[:, 1]
+        target_predictions = attack_pipeline.predict(X_target)
+        auc_score = roc_auc_score(y_target, target_predictions_proba)
+        attack_accuracy = accuracy_score(y_target, target_predictions)
+    except Exception:
+        base = 0.5
+        return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
+
+    return {
+        "auc": auc_score,
+        "auc_star": auc_star(auc_score),
+        "adv": auc_advantage(auc_score),
+        "accuracy": attack_accuracy,
+        "shadow_auc": shadow_auc,
+        "n_shadow_users": len(shadow_user_ids),
+        "n_target_users": len(target_member_features) + len(target_non_member_features),
+    }
+
 # ════════════════════════════════════════════════════════════════
 # MIA Data Preparation Functions
 # ════════════════════════════════════════════════════════════════
@@ -59,20 +486,18 @@ def prepare_mia_data_sample_level(train_data, eval_data, private_indices, mia_si
         member_indices = np.random.choice(len(train_data), max_members, replace=False).tolist()
     
     member_set = Subset(train_data, member_indices)
-    
-    # Use random sampling from evaluation data as non-members
-    if hasattr(eval_data, 'indices'):
-        # eval_data is a Subset, use random sampling from the subset
-        max_non_members = min(mia_size, len(eval_data))
-        non_member_indices = np.random.choice(len(eval_data), max_non_members, replace=False).tolist()
-    else:
-        max_non_members = min(mia_size, len(eval_data))
-        non_member_indices = np.random.choice(len(eval_data), max_non_members, replace=False).tolist()
-    
+
+    target_counts = _collect_label_counts(train_data, member_indices)
+    non_member_indices = _sample_indices_by_label(eval_data, target_counts)
+    if len(non_member_indices) < len(member_indices):
+        missing = len(member_indices) - len(non_member_indices)
+        fallback = np.random.choice(len(eval_data), missing, replace=True).tolist()
+        non_member_indices.extend(fallback)
+
     non_member_set = Subset(eval_data, non_member_indices)
-    
-    logger.info("   • Members: %s random samples from training data", len(member_set))
-    logger.info("   • Non-members: %s random samples from evaluation data", len(non_member_set))
+
+    logger.info("   • Members: %s samples from training data", len(member_set))
+    logger.info("   • Non-members: %s label-matched samples from evaluation data", len(non_member_set))
     
     return member_set, non_member_set
 
@@ -104,24 +529,22 @@ def prepare_mia_data_user_level(priv_ds, eval_data, num_users, mia_size):
     max_members = min(mia_size, len(all_member_indices))
     member_indices = np.random.choice(all_member_indices, max_members, replace=False).tolist()
     member_set = Subset(priv_ds, member_indices)
-    
-    # Use random sampling from evaluation data as non-members
-    if hasattr(eval_data, 'indices'):
-        # eval_data is a Subset, use random sampling from the subset
-        max_non_members = min(mia_size, len(eval_data))
-        non_member_indices = np.random.choice(len(eval_data), max_non_members, replace=False).tolist()
-    else:
-        max_non_members = min(mia_size, len(eval_data))
-        non_member_indices = np.random.choice(len(eval_data), max_non_members, replace=False).tolist()
-        
+
+    target_counts = _collect_label_counts(priv_ds, member_indices)
+    non_member_indices = _sample_indices_by_label(eval_data, target_counts)
+    if len(non_member_indices) < len(member_indices):
+        missing = len(member_indices) - len(non_member_indices)
+        fallback = np.random.choice(len(eval_data), missing, replace=True).tolist()
+        non_member_indices.extend(fallback)
+
     non_member_set = Subset(eval_data, non_member_indices)
-    
+
     logger.info(
-        "   • Members: %s random samples from %s training users",
+        "   • Members: %s samples from %s training users",
         len(member_set),
         len(available_users),
     )
-    logger.info("   • Non-members: %s random samples from evaluation data", len(non_member_set))
+    logger.info("   • Non-members: %s label-matched samples from evaluation data", len(non_member_set))
     
     return member_set, non_member_set
 
@@ -300,7 +723,16 @@ def validate_and_clean_features(features, labels, name="features"):
     
     return features, labels
 
-def shadow_model_attack(target_model, member_loader, non_member_loader, train_data, device, eval_data=None, shadow_epochs=3):
+def shadow_model_attack(
+    target_model,
+    member_loader,
+    non_member_loader,
+    train_data,
+    device,
+    eval_data=None,
+    shadow_epochs=3,
+    shadow_splits=None,
+):
     """
     Shokri et al. shadow model attack.
     Uses shadow models to learn attack patterns.
@@ -309,26 +741,33 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
     shadow_epochs: Number of training epochs for each shadow model (default: 3)
     """
     
-    # Prepare shadow training data from the actual training data
-    # Use a subset of the actual training data for shadow models
-    shadow_size = min(len(train_data) // 2, 2000)  # Use at most half of training data
-    shadow_indices = np.random.choice(len(train_data), shadow_size, replace=False)
-    shadow_trainset = Subset(train_data, shadow_indices)
-    
-    # 🔧 FIX: Use eval_data for shadow non-members to match target evaluation setup
-    # If eval_data is provided, use it for shadow non-members
-    # Otherwise, fall back to remaining train_data (original buggy behavior)
-    if eval_data is not None:
-        # Use eval_data for shadow non-members (correct approach)
-        shadow_non_member_size = min(len(eval_data), shadow_size)
-        shadow_non_member_indices = np.random.choice(len(eval_data), shadow_non_member_size, replace=False)
-        shadow_non_trainset = Subset(eval_data, shadow_non_member_indices)
-        logger.info("Shadow attack: Using eval_data for non-members (correct).")
+    if shadow_splits is None:
+        shadow_size = min(len(train_data) // 2, 2000)
+        shadow_indices = np.random.choice(len(train_data), shadow_size, replace=False)
+        shadow_trainset = Subset(train_data, shadow_indices)
+
+        if eval_data is not None:
+            shadow_non_member_size = min(len(eval_data), shadow_size)
+            shadow_non_member_indices = np.random.choice(len(eval_data), shadow_non_member_size, replace=False)
+            shadow_non_trainset = Subset(eval_data, shadow_non_member_indices)
+            logger.info("Shadow attack: Using eval_data for non-members.")
+        else:
+            remaining_indices = np.setdiff1d(np.arange(len(train_data)), shadow_indices)
+            shadow_non_trainset = Subset(train_data, remaining_indices[:shadow_size])
+            logger.warn("Shadow attack: Using train_data for non-members.")
     else:
-        # Fallback to original approach (for backward compatibility)
-        remaining_indices = np.setdiff1d(np.arange(len(train_data)), shadow_indices)
-        shadow_non_trainset = Subset(train_data, remaining_indices[:shadow_size])
-        logger.warn("Shadow attack: Using train_data for non-members (may be inaccurate).")
+        shadow_indices = shadow_splits["shadow_indices"]
+        shadow_trainset = Subset(train_data, shadow_indices)
+        shadow_non_member_indices = shadow_splits["shadow_non_member_indices"]
+        if eval_data is not None and shadow_splits.get("non_member_source") == "eval":
+            shadow_non_trainset = Subset(eval_data, shadow_non_member_indices)
+        else:
+            shadow_non_trainset = Subset(train_data, shadow_non_member_indices)
+        logger.info(
+            "Shadow attack: Using shared shadow split (%s members / %s non-members).",
+            len(shadow_trainset),
+            len(shadow_non_trainset),
+        )
     
     # Train shadow models
     logger.info("   🔧 Training %s shadow models with %s epochs each...", 3, shadow_epochs)
@@ -465,9 +904,24 @@ def shadow_model_attack(target_model, member_loader, non_member_loader, train_da
 # Main Evaluation Function
 # ════════════════════════════════════════════════════════════════
 
-def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, eval_data, 
-                                private_indices, priv_ds, num_users, 
-                                mia_size, sample_level, device, vanilla_dp_model=None, dp_sat_model=None, l2_baseline_model=None, shadow_epochs=3):
+def evaluate_membership_inference(
+    baseline_model,
+    fisher_dp_model,
+    train_data,
+    eval_data,
+    private_indices,
+    priv_ds,
+    num_users,
+    mia_size,
+    sample_level,
+    device,
+    vanilla_dp_model=None,
+    dp_sat_model=None,
+    l2_baseline_model=None,
+    shadow_epochs=3,
+    mia_level="auto",
+    mia_attack="shadow",
+):
     """Evaluate membership inference attacks on baseline, Fisher DP, and optionally Vanilla DP & DP-SAT models
     
     Args:
@@ -484,6 +938,7 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         vanilla_dp_model: Optional vanilla DP model for comparison
         dp_sat_model: Optional DP-SAT model for comparison
         l2_baseline_model: Optional L2 regularized baseline model for comparison
+        mia_attack: User-level attack type ("shadow" or "loss")
     """
     
     logger.highlight("Membership Inference Attack Evaluation (audit-only)")
@@ -497,9 +952,34 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     if dp_sat_model is not None:
         methods.append("DP-SAT")
     logger.info("Comparing: %s", " vs ".join(methods))
+
+    train_data, priv_ds, aligned = align_mia_datasets(train_data, priv_ds, eval_data, num_users)
+    if aligned:
+        logger.info("MIA transforms: aligned to eval.")
+
+    mia_use_user = False
+    mia_use_sample = False
+    if mia_level == "auto":
+        mia_use_sample = sample_level
+        mia_use_user = not sample_level
+    elif mia_level == "sample":
+        mia_use_sample = True
+    elif mia_level == "user":
+        mia_use_user = True
+
+    if mia_use_user and priv_ds is None:
+        logger.warn("User-level MIA requested but priv_ds is unavailable; falling back to sample-level MIA.")
+        mia_use_user = False
+        mia_use_sample = True
+
+    if mia_use_sample:
+        logger.info("MIA mode: sample-level.")
+    else:
+        logger.info("MIA mode: user-level.")
+        logger.info("User-level MIA attack: %s.", mia_attack)
     
     # Prepare member and non-member datasets
-    if sample_level:
+    if mia_use_sample:
         logger.info("Sample-level MIA: using actual private training samples as members.")
         member_set, non_member_set = prepare_mia_data_sample_level(train_data, eval_data, private_indices, mia_size)
     else:
@@ -515,46 +995,222 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
     # Track results across multiple runs for statistical analysis
     num_runs = NUM_RUNS  # Multiple runs for statistical robustness
     all_results = {
-        'baseline': {'shadow': []},
-        'fisher_dp': {'shadow': []},
+        'baseline': {},
+        'fisher_dp': {},
     }
     if l2_baseline_model is not None:
-        all_results['l2_baseline'] = {'shadow': []}
+        all_results['l2_baseline'] = {}
     if vanilla_dp_model is not None:
-        all_results['vanilla_dp'] = {'shadow': []}
+        all_results['vanilla_dp'] = {}
     if dp_sat_model is not None:
-        all_results['dp_sat'] = {'shadow': []}
+        all_results['dp_sat'] = {}
+
+    if mia_use_sample:
+        for key in all_results.keys():
+            all_results[key]['shadow'] = []
+    if mia_use_user:
+        for key in all_results.keys():
+            all_results[key]['user_attack_star'] = []
     
     for run_idx in range(num_runs):
         # Re-sample for each run to get different member/non-member sets
-        if sample_level:
+        if mia_use_sample:
             member_set, non_member_set = prepare_mia_data_sample_level(train_data, eval_data, private_indices, mia_size)
         else:
             member_set, non_member_set = prepare_mia_data_user_level(priv_ds, eval_data, num_users, mia_size)
         
         member_loader = DataLoader(member_set, batch_size=64, shuffle=False)
         non_member_loader = DataLoader(non_member_set, batch_size=64, shuffle=False)
+        shadow_splits = prepare_shadow_splits(train_data, eval_data, seed=run_idx)
+        user_shadow_splits = None
+        if mia_use_user:
+            member_groups, non_member_groups, non_member_user_ds = prepare_user_level_groups(
+                priv_ds, eval_data, num_users, mia_size
+            )
+            if mia_attack == "shadow":
+                user_shadow_splits = prepare_user_shadow_splits(
+                    priv_ds,
+                    eval_data,
+                    num_users,
+                    seed=run_idx,
+                    eval_user_ds=non_member_user_ds,
+                )
         
-        # Shadow Model Attack for all models (only attack we use now)
-        logger.highlight(f"Shadow Model Attack (Run {run_idx + 1}/{num_runs})")
+        if mia_use_sample:
+            logger.highlight(f"Shadow Model Attack (Run {run_idx + 1}/{num_runs})")
         
-        baseline_shadow = shadow_model_attack(baseline_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
-        fisher_shadow = shadow_model_attack(fisher_dp_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
-        
-        all_results['baseline']['shadow'].append(baseline_shadow['auc'])
-        all_results['fisher_dp']['shadow'].append(fisher_shadow['auc'])
+        if mia_use_sample:
+            baseline_shadow = shadow_model_attack(
+                baseline_model,
+                member_loader,
+                non_member_loader,
+                train_data,
+                device,
+                eval_data,
+                shadow_epochs=shadow_epochs,
+                shadow_splits=shadow_splits,
+            )
+            fisher_shadow = shadow_model_attack(
+                fisher_dp_model,
+                member_loader,
+                non_member_loader,
+                train_data,
+                device,
+                eval_data,
+                shadow_epochs=shadow_epochs,
+                shadow_splits=shadow_splits,
+            )
+            all_results['baseline']['shadow'].append(baseline_shadow['auc_star'])
+            all_results['fisher_dp']['shadow'].append(fisher_shadow['auc_star'])
+        if mia_use_user:
+            if mia_attack == "shadow":
+                baseline_user = user_level_shadow_attack(
+                    baseline_model,
+                    member_groups,
+                    non_member_groups,
+                    priv_ds,
+                    non_member_user_ds,
+                    device,
+                    shadow_epochs=shadow_epochs,
+                    shadow_splits=user_shadow_splits,
+                )
+                fisher_user = user_level_shadow_attack(
+                    fisher_dp_model,
+                    member_groups,
+                    non_member_groups,
+                    priv_ds,
+                    non_member_user_ds,
+                    device,
+                    shadow_epochs=shadow_epochs,
+                    shadow_splits=user_shadow_splits,
+                )
+            else:
+                baseline_user = user_level_loss_attack(
+                    baseline_model,
+                    member_groups,
+                    non_member_groups,
+                    priv_ds,
+                    non_member_user_ds,
+                    device,
+                )
+                fisher_user = user_level_loss_attack(
+                    fisher_dp_model,
+                    member_groups,
+                    non_member_groups,
+                    priv_ds,
+                    non_member_user_ds,
+                    device,
+                )
+            all_results['baseline']['user_attack_star'].append(baseline_user['auc_star'])
+            all_results['fisher_dp']['user_attack_star'].append(fisher_user['auc_star'])
         
         if l2_baseline_model is not None:
-            l2_baseline_shadow = shadow_model_attack(l2_baseline_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
-            all_results['l2_baseline']['shadow'].append(l2_baseline_shadow['auc'])
+            if mia_use_sample:
+                l2_baseline_shadow = shadow_model_attack(
+                    l2_baseline_model,
+                    member_loader,
+                    non_member_loader,
+                    train_data,
+                    device,
+                    eval_data,
+                    shadow_epochs=shadow_epochs,
+                    shadow_splits=shadow_splits,
+                )
+                all_results['l2_baseline']['shadow'].append(l2_baseline_shadow['auc_star'])
+            if mia_use_user:
+                if mia_attack == "shadow":
+                    l2_user = user_level_shadow_attack(
+                        l2_baseline_model,
+                        member_groups,
+                        non_member_groups,
+                        priv_ds,
+                        non_member_user_ds,
+                        device,
+                        shadow_epochs=shadow_epochs,
+                        shadow_splits=user_shadow_splits,
+                    )
+                else:
+                    l2_user = user_level_loss_attack(
+                        l2_baseline_model,
+                        member_groups,
+                        non_member_groups,
+                        priv_ds,
+                        non_member_user_ds,
+                        device,
+                    )
+                all_results['l2_baseline']['user_attack_star'].append(l2_user['auc_star'])
         
         if vanilla_dp_model is not None:
-            vanilla_shadow = shadow_model_attack(vanilla_dp_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
-            all_results['vanilla_dp']['shadow'].append(vanilla_shadow['auc'])
+            if mia_use_sample:
+                vanilla_shadow = shadow_model_attack(
+                    vanilla_dp_model,
+                    member_loader,
+                    non_member_loader,
+                    train_data,
+                    device,
+                    eval_data,
+                    shadow_epochs=shadow_epochs,
+                    shadow_splits=shadow_splits,
+                )
+                all_results['vanilla_dp']['shadow'].append(vanilla_shadow['auc_star'])
+            if mia_use_user:
+                if mia_attack == "shadow":
+                    vanilla_user = user_level_shadow_attack(
+                        vanilla_dp_model,
+                        member_groups,
+                        non_member_groups,
+                        priv_ds,
+                        non_member_user_ds,
+                        device,
+                        shadow_epochs=shadow_epochs,
+                        shadow_splits=user_shadow_splits,
+                    )
+                else:
+                    vanilla_user = user_level_loss_attack(
+                        vanilla_dp_model,
+                        member_groups,
+                        non_member_groups,
+                        priv_ds,
+                        non_member_user_ds,
+                        device,
+                    )
+                all_results['vanilla_dp']['user_attack_star'].append(vanilla_user['auc_star'])
         
         if dp_sat_model is not None:
-            dp_sat_shadow = shadow_model_attack(dp_sat_model, member_loader, non_member_loader, train_data, device, eval_data, shadow_epochs=shadow_epochs)
-            all_results['dp_sat']['shadow'].append(dp_sat_shadow['auc'])
+            if mia_use_sample:
+                dp_sat_shadow = shadow_model_attack(
+                    dp_sat_model,
+                    member_loader,
+                    non_member_loader,
+                    train_data,
+                    device,
+                    eval_data,
+                    shadow_epochs=shadow_epochs,
+                    shadow_splits=shadow_splits,
+                )
+                all_results['dp_sat']['shadow'].append(dp_sat_shadow['auc_star'])
+            if mia_use_user:
+                if mia_attack == "shadow":
+                    dp_sat_user = user_level_shadow_attack(
+                        dp_sat_model,
+                        member_groups,
+                        non_member_groups,
+                        priv_ds,
+                        non_member_user_ds,
+                        device,
+                        shadow_epochs=shadow_epochs,
+                        shadow_splits=user_shadow_splits,
+                    )
+                else:
+                    dp_sat_user = user_level_loss_attack(
+                        dp_sat_model,
+                        member_groups,
+                        non_member_groups,
+                        priv_ds,
+                        non_member_user_ds,
+                        device,
+                    )
+                all_results['dp_sat']['user_attack_star'].append(dp_sat_user['auc_star'])
     
     # Statistical analysis of results
     logger.highlight("Final MIA Results (audit-only)")
@@ -565,46 +1221,64 @@ def evaluate_membership_inference(baseline_model, fisher_dp_model, train_data, e
         logger.info("%s: %.4f ± %.4f", name, mean_val, std_val)
         return mean_val, std_val
     
-    logger.info("Shadow Attack AUC:")
-    baseline_shadow_mean, baseline_shadow_std = print_stats("  Baseline", all_results['baseline']['shadow'])
-    fisher_shadow_mean, fisher_shadow_std = print_stats("  Fisher DP", all_results['fisher_dp']['shadow'])
-    if l2_baseline_model is not None:
-        l2_baseline_shadow_mean, l2_baseline_shadow_std = print_stats("  L2 Baseline", all_results['l2_baseline']['shadow'])
-    if vanilla_dp_model is not None:
-        vanilla_shadow_mean, vanilla_shadow_std = print_stats("  Vanilla DP", all_results['vanilla_dp']['shadow'])
-    
-    if dp_sat_model is not None:
-        dp_sat_shadow_mean, dp_sat_shadow_std = print_stats("  DP-SAT", all_results['dp_sat']['shadow'])
+    if mia_use_sample:
+        logger.info("Shadow Attack AUC*:")
+        baseline_shadow_mean, baseline_shadow_std = print_stats("  Baseline", all_results['baseline']['shadow'])
+        fisher_shadow_mean, fisher_shadow_std = print_stats("  Fisher DP", all_results['fisher_dp']['shadow'])
+        if l2_baseline_model is not None:
+            l2_baseline_shadow_mean, l2_baseline_shadow_std = print_stats("  L2 Baseline", all_results['l2_baseline']['shadow'])
+        if vanilla_dp_model is not None:
+            vanilla_shadow_mean, vanilla_shadow_std = print_stats("  Vanilla DP", all_results['vanilla_dp']['shadow'])
+        if dp_sat_model is not None:
+            dp_sat_shadow_mean, dp_sat_shadow_std = print_stats("  DP-SAT", all_results['dp_sat']['shadow'])
+
+    if mia_use_user:
+        label = "User-level Shadow AUC*" if mia_attack == "shadow" else "User-level Loss AUC*"
+        logger.info("%s:", label)
+        print_stats("  Baseline", all_results['baseline']['user_attack_star'])
+        print_stats("  Fisher DP", all_results['fisher_dp']['user_attack_star'])
+        if l2_baseline_model is not None:
+            print_stats("  L2 Baseline", all_results['l2_baseline']['user_attack_star'])
+        if vanilla_dp_model is not None:
+            print_stats("  Vanilla DP", all_results['vanilla_dp']['user_attack_star'])
+        if dp_sat_model is not None:
+            print_stats("  DP-SAT", all_results['dp_sat']['user_attack_star'])
+
+    if not mia_use_sample:
+        return {
+            'statistical_results': all_results,
+        }
     
     # Statistical significance tests (t-tests)
-    from scipy import stats
-    
-    logger.info("Statistical Significance Tests (p-values):")
-    
-    # Fisher DP vs Baseline
-    _, p_shadow_fisher_base = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['baseline']['shadow'])
-    logger.info("  Fisher DP vs Baseline (Shadow): p = %.4f", p_shadow_fisher_base)
-    
-    # L2 baseline tests (for regularization hypothesis)
-    if l2_baseline_model is not None:
-        # L2 baseline vs regular baseline
-        _, p_shadow_l2_base = stats.ttest_rel(all_results['l2_baseline']['shadow'], all_results['baseline']['shadow'])
-        logger.info("  L2 Baseline vs Baseline (Shadow): p = %.4f", p_shadow_l2_base)
+    if mia_use_sample:
+        from scipy import stats
         
-        # Fisher DP vs L2 baseline (key L2 regularization hypothesis test!)
-        _, p_shadow_fisher_l2 = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['l2_baseline']['shadow'])
-        logger.info("  Fisher DP vs L2 Baseline (Shadow): p = %.4f", p_shadow_fisher_l2)
-    
-    if vanilla_dp_model is not None:
-        # Vanilla DP vs Baseline
-        _, p_shadow_vanilla_base = stats.ttest_rel(all_results['vanilla_dp']['shadow'], all_results['baseline']['shadow'])
-        logger.info("  Vanilla DP vs Baseline (Shadow): p = %.4f", p_shadow_vanilla_base)
+        logger.info("Statistical Significance Tests (p-values):")
         
-        # Fisher DP vs Vanilla DP (the key comparison!)
-        _, p_shadow_fisher_vanilla = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['vanilla_dp']['shadow'])
-        logger.info("  Fisher DP vs Vanilla DP (Shadow): p = %.4f", p_shadow_fisher_vanilla)
+        # Fisher DP vs Baseline
+        _, p_shadow_fisher_base = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['baseline']['shadow'])
+        logger.info("  Fisher DP vs Baseline (Shadow): p = %.4f", p_shadow_fisher_base)
         
-        # L2 baseline vs Vanilla DP (if both available)
+        # L2 baseline tests (for regularization hypothesis)
+        if l2_baseline_model is not None:
+            # L2 baseline vs regular baseline
+            _, p_shadow_l2_base = stats.ttest_rel(all_results['l2_baseline']['shadow'], all_results['baseline']['shadow'])
+            logger.info("  L2 Baseline vs Baseline (Shadow): p = %.4f", p_shadow_l2_base)
+            
+            # Fisher DP vs L2 baseline (key L2 regularization hypothesis test!)
+            _, p_shadow_fisher_l2 = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['l2_baseline']['shadow'])
+            logger.info("  Fisher DP vs L2 Baseline (Shadow): p = %.4f", p_shadow_fisher_l2)
+        
+        if vanilla_dp_model is not None:
+            # Vanilla DP vs Baseline
+            _, p_shadow_vanilla_base = stats.ttest_rel(all_results['vanilla_dp']['shadow'], all_results['baseline']['shadow'])
+            logger.info("  Vanilla DP vs Baseline (Shadow): p = %.4f", p_shadow_vanilla_base)
+            
+            # Fisher DP vs Vanilla DP (the key comparison!)
+            _, p_shadow_fisher_vanilla = stats.ttest_rel(all_results['fisher_dp']['shadow'], all_results['vanilla_dp']['shadow'])
+            logger.info("  Fisher DP vs Vanilla DP (Shadow): p = %.4f", p_shadow_fisher_vanilla)
+            
+            # L2 baseline vs Vanilla DP (if both available)
         if l2_baseline_model is not None:
             _, p_shadow_l2_vanilla = stats.ttest_rel(all_results['l2_baseline']['shadow'], all_results['vanilla_dp']['shadow'])
             logger.info("  L2 Baseline vs Vanilla DP (Shadow): p = %.4f", p_shadow_l2_vanilla)
