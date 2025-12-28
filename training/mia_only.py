@@ -31,10 +31,25 @@ from core.mia import (
     user_level_shadow_attack,
 )
 from data import DATASET_REGISTRY, DatasetConfig, build_dataset_builder
+from data.common import prepare_batch
 from models import create_model
 
 logger = get_logger("mia_only")
 AVAILABLE_DATASETS = tuple(DATASET_REGISTRY.keys())
+
+
+def accuracy(model, loader, device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_data in loader:
+            inputs, labels, _ = prepare_batch(batch_data, device)
+            outputs = model(inputs)
+            preds = outputs.argmax(dim=1)
+            correct += int((preds == labels).sum().item())
+            total += int(labels.size(0))
+    return 100.0 * correct / total if total > 0 else 0.0
 
 
 def _sanitize_cache_key(value: str) -> str:
@@ -356,6 +371,39 @@ def main() -> None:
         logger.info("MIA sanity (baseline AUC*): %.4f (target ~0.5).", baseline_auc_star)
         if abs(baseline_auc_star - 0.5) > 0.05:
             logger.warn("MIA sanity: baseline deviates from 0.5; check member/non-member matching.")
+
+    acc_results = {}
+    for model_name, model in models_to_evaluate.items():
+        acc_results[model_name] = accuracy(model, eval_loader, device)
+
+    logger.info("Privacy vs Accuracy Tradeoff (%s):", "user-level" if mia_use_user else "sample-level")
+    logger.info("   Model                          Accuracy  AttackAUC*  |AUC-0.5|")
+    logger.info(f"   {'─'*30} ─────────  ─────────  ─────────")
+
+    model_order = [
+        "Baseline (Public Only)",
+        "Vanilla DP-SGD",
+        "Vanilla DP-SGD + DP-SAT",
+        "Fisher DP + Normal",
+        "Fisher DP + DP-SAT",
+        "Fisher DP + Normal + Calib",
+        "Fisher DP + DP-SAT + Calib",
+    ]
+
+    for name in model_order:
+        if name not in acc_results:
+            continue
+        acc = acc_results[name]
+        if name == "Baseline (Public Only)":
+            logger.info(f"   {name:30} {acc:5.1f}%     {'-':>6}    {'-':>7}")
+            continue
+        if mia_use_sample:
+            aucs = mia_results[name]["shadow_auc_star"]
+            adv = mia_results[name]["shadow_adv"]
+        else:
+            aucs = mia_results[name]["user_auc_star"]
+            adv = mia_results[name]["user_adv"]
+        logger.info(f"   {name:30} {acc:5.1f}%     {aucs:.4f}   {adv:.4f}")
 
 
 if __name__ == "__main__":
