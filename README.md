@@ -225,6 +225,9 @@ Important accounting notes:
 # Privacy levels
 --target-epsilon 1.0    # High privacy
 --target-epsilon 10.0   # Moderate privacy
+# Legacy privacy flags (--use-legacy-accounting/--epsilon) have been removed.
+# Adaptive clipping flags (--adaptive-clip/--quantile) have been removed.
+# Deprecated calibration fallback flag (--calibration-subset) has been removed.
 
 # Dataset sizes (IID mode default)
 --dataset-size 30000   # Size of PRIVATE dataset (from CIFAR-10 trainset, default: 30,000 for IID)
@@ -289,7 +292,6 @@ Use **sample-level DP** if you care about individual examples, and **user-level 
 ### Advanced Features
 ```bash
 # Adaptive clipping (disabled by default)
---adaptive-clip --quantile 0.95
 
 # DP-SAT configuration
 --dp-sat-mode fisher      # Fisher DP-SAT (for Fisher DP variants) or euclidean (for Vanilla DP-SGD)

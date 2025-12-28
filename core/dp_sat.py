@@ -21,7 +21,7 @@ logger = get_logger("dp_sat")
 
 def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                       clip_radius=10.0, device="cuda", target_layer="conv1",
-                      adaptive_clip=True, quantile=0.95, sample_level=None,
+                      sample_level=None,
                       epochs=1, sigma=None, rho_sat=0.001, lambda_flatness=None,
                       dp_param_count=None, dp_epochs=None, use_approximate_method=False,
                       lr=1e-3, public_loader=None, rehearsal_lambda=1.0):
@@ -39,8 +39,6 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         clip_radius: Clipping radius for gradients (L2 norm)
         device: Device to run on
         target_layer: Which layer(s) to apply DP to
-        adaptive_clip: Whether to use adaptive clipping
-        quantile: Quantile for adaptive clipping
         sample_level: If True, use sample-level DP (clip per sample).
                      If False, use user-level DP (clip per user).
                      If None, auto-detect from batch structure.
@@ -116,7 +114,6 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     logger.info("   • Euclidean clipping with radius %s", clip_radius)
     logger.info("   • Isotropic Gaussian noise")
     logger.info("   • EXACT DP-SAT: Weight perturbation with radius ρ=%s", rho_sat)
-    logger.info("   • Adaptive clipping: %s", adaptive_clip)
     
     if not sample_level:
         logger.info("   • User-level mode: Clipping aggregated user gradients")
@@ -134,7 +131,6 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
     logger.info(" ")
     
     noise_l2, grad_norm = [], []
-    adaptive_radius_computed = False
     actual_radius = clip_radius  # Start with provided radius
     
     # Initialize previous step's noisy gradient for DP-SAT
@@ -184,30 +180,6 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                     per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
                 per_g = torch.stack(per_g)
                 
-                # Adaptive clipping: collect norms from first batch to compute quantile
-                if adaptive_clip and not adaptive_radius_computed:
-                    batch_norms = []
-                    for i in range(per_g.size(0)):
-                        # Compute Euclidean norm
-                        euclidean_norm = per_g[i].norm().item()
-                        batch_norms.append(euclidean_norm)
-                    grad_norm.extend(batch_norms)
-                    
-                    # If we have enough samples or it's a large batch, compute adaptive radius
-                    if len(grad_norm) >= 100 or batch_idx == 0:
-                        adaptive_radius = np.quantile(grad_norm, quantile)
-                        actual_radius = adaptive_radius
-                        adaptive_radius_computed = True
-                        
-                        logger.info("DP-SAT adaptive clipping from %s samples:", len(grad_norm))
-                        logger.info("   • Mean: %.3f", np.mean(grad_norm))
-                        logger.info("   • Median: %.3f", np.median(grad_norm))
-                        logger.info("   • %.1f%% quantile: %.3f", quantile * 100, adaptive_radius)
-                        logger.info("   • Max: %.3f", np.max(grad_norm))
-                        logger.info("   → Using adaptive radius: %.3f", actual_radius)
-                        
-                        grad_norm = []  # Reset for actual training statistics
-                
                 # Vanilla Euclidean clipping for each sample
                 for i in range(per_g.size(0)):
                     norm = per_g[i].norm()
@@ -236,25 +208,6 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
                     user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
                     user_gradients.append(user_grad_flat)
                     
-                    # Adaptive clipping
-                    if adaptive_clip and not adaptive_radius_computed:
-                        user_norm = user_grad_flat.norm().item()
-                        grad_norm.append(user_norm)
-                        
-                        if len(grad_norm) >= min(10, len(train_loader)) or batch_idx == 0:
-                            adaptive_radius = np.quantile(grad_norm, quantile)
-                            actual_radius = adaptive_radius
-                            adaptive_radius_computed = True
-                            
-                            logger.info("DP-SAT adaptive clipping from %s users:", len(grad_norm))
-                            logger.info("   • Mean user grad norm: %.3f", np.mean(grad_norm))
-                            logger.info("   • Median user grad norm: %.3f", np.median(grad_norm))
-                            logger.info("   • %.1f%% quantile: %.3f", quantile * 100, adaptive_radius)
-                            logger.info("   • Max user grad norm: %.3f", np.max(grad_norm))
-                            logger.info("   → Using adaptive radius: %.3f", actual_radius)
-                            
-                            grad_norm = []
-                
                 if len(user_gradients) != 1:
                     logger.warn("Expected 1 user per batch, got %s users", len(user_gradients))
                 

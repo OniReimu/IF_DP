@@ -1602,7 +1602,7 @@ def main():
             
     except FileNotFoundError as e:
         logger.error("Model files not found: %s", e)
-        logger.error("Please first train the models using: python main.py --mps --adaptive-clip --quantile 0.95")
+        logger.error("Please first train the models using: uv run training/main.py --mps")
 
 if __name__ == "__main__":
     main() 

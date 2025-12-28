@@ -133,9 +133,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dp-layer", type=str, default="conv1")
     parser.add_argument("--lambda-flatness", type=float, default=0.01)
 
-    parser.add_argument("--adaptive-clip", action="store_true")
-    parser.add_argument("--quantile", type=float, default=0.95)
-
     parser.add_argument("--sample-level", action="store_true")
     parser.add_argument("--users", type=int, default=10)
     parser.add_argument("--full-complement-noise", action="store_true")
@@ -161,27 +158,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--compare-others", action="store_true")
 
-    privacy_group = parser.add_mutually_exclusive_group()
-    privacy_group.add_argument("--use-legacy-accounting", action="store_true")
-
-    epsilon_group = parser.add_mutually_exclusive_group()
-    epsilon_group.add_argument("--epsilon", type=float, default=None)
-    epsilon_group.add_argument("--target-epsilon", type=float, default=None)
+    parser.add_argument("--target-epsilon", type=float, default=None)
 
     return parser.parse_args()
 
 
 def validate_privacy_args(args: argparse.Namespace) -> None:
-    if args.use_legacy_accounting:
-        if args.epsilon is None:
-            raise SystemExit("❌ --use-legacy-accounting requires --epsilon")
-        if args.target_epsilon is not None:
-            raise SystemExit("❌ Cannot set --target-epsilon with legacy accounting")
-    else:
-        if args.epsilon is not None:
-            raise SystemExit("❌ --epsilon is only valid with --use-legacy-accounting")
-        if args.target_epsilon is None:
-            args.target_epsilon = 10.0
+    if args.target_epsilon is None:
+        args.target_epsilon = 10.0
 
 
 def main() -> None:
@@ -255,30 +239,23 @@ def main() -> None:
     logger.highlight("Fisher-informed DP-SGD")
     fisher_dp_model = copy.deepcopy(baseline)
 
-    if args.use_legacy_accounting:
-        sigma = math.sqrt(2 * math.log(1.25 / args.delta)) / args.epsilon
-        display_epsilon = args.epsilon
-        noise_multiplier = None
-        total_steps = args.epochs * len(priv_loader)
-        sample_rate = len(priv_loader) / len(priv_base)
-    else:
-        sample_rate = len(priv_loader) / len(priv_base)
-        steps_per_epoch = len(priv_loader)
-        noise_multiplier, total_steps = get_privacy_params_for_target_epsilon(
-            target_epsilon=args.target_epsilon,
-            target_delta=args.delta,
-            sample_rate=sample_rate,
-            epochs=args.epochs,
-            steps_per_epoch=steps_per_epoch,
-        )
-        sigma = noise_multiplier * args.clip_radius
-        display_epsilon = args.target_epsilon
-        logger.highlight("Using Proper Privacy Accounting (Opacus RDP)")
-        logger.info("   • Target (ε, δ): (%.4f, %.1e)", args.target_epsilon, args.delta)
-        logger.info("   • Sample rate    : %.4f", sample_rate)
-        logger.info("   • Noise multiplier: %.4f", noise_multiplier)
-        logger.info("   • Sigma           : %.4f", sigma)
-        logger.info("   • Total steps     : %s", total_steps)
+    sample_rate = len(priv_loader) / len(priv_base)
+    steps_per_epoch = len(priv_loader)
+    noise_multiplier, total_steps = get_privacy_params_for_target_epsilon(
+        target_epsilon=args.target_epsilon,
+        target_delta=args.delta,
+        sample_rate=sample_rate,
+        epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
+    )
+    sigma = noise_multiplier * args.clip_radius
+    display_epsilon = args.target_epsilon
+    logger.highlight("Using Proper Privacy Accounting (Opacus RDP)")
+    logger.info("   • Target (ε, δ): (%.4f, %.1e)", args.target_epsilon, args.delta)
+    logger.info("   • Sample rate    : %.4f", sample_rate)
+    logger.info("   • Noise multiplier: %.4f", noise_multiplier)
+    logger.info("   • Sigma           : %.4f", sigma)
+    logger.info("   • Total steps     : %s", total_steps)
 
     fisher_dp_model = train_with_dp(
         fisher_dp_model,
@@ -292,8 +269,6 @@ def main() -> None:
         k=args.k,
         device=device,
         target_layer=args.dp_layer,
-        adaptive_clip=args.adaptive_clip,
-        quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
         positive_noise_correlation=args.positively_correlated_noise,
@@ -311,12 +286,10 @@ def main() -> None:
             priv_loader,
             epsilon=display_epsilon,
             delta=args.delta,
-            sigma=None if args.use_legacy_accounting else sigma,
+            sigma=sigma,
             clip_radius=args.clip_radius,
             device=device,
             target_layer=args.dp_layer,
-            adaptive_clip=args.adaptive_clip,
-            quantile=args.quantile,
             sample_level=args.sample_level,
             epochs=args.epochs,
             dp_epochs=args.dp_epochs,
@@ -329,18 +302,16 @@ def main() -> None:
             priv_loader,
             epsilon=display_epsilon,
             delta=args.delta,
-            sigma=None if args.use_legacy_accounting else sigma,
+            sigma=sigma,
             clip_radius=args.clip_radius,
             device=device,
             target_layer=args.dp_layer,
-            adaptive_clip=args.adaptive_clip,
-            quantile=args.quantile,
             sample_level=args.sample_level,
             epochs=args.epochs,
             lambda_flatness=args.lambda_flatness,
         )
 
-        if not args.use_legacy_accounting and noise_multiplier is not None:
+        if noise_multiplier is not None:
             actual_eps = compute_actual_epsilon(
                 noise_multiplier=noise_multiplier,
                 sample_rate=sample_rate,
@@ -430,8 +401,6 @@ def main() -> None:
             "critical_accuracy": crit_accuracy(fisher_dp_model),
             "epsilon": display_epsilon,
             "clip_radius": args.clip_radius,
-            "adaptive_clip": args.adaptive_clip,
-            "quantile": args.quantile if args.adaptive_clip else None,
             "training_indices": priv_indices,
             "dataset_size": args.dataset_size,
             "sample_level": args.sample_level,
@@ -452,8 +421,6 @@ def main() -> None:
                 "critical_accuracy": crit_accuracy(vanilla_dp_model),
                 "epsilon": display_epsilon,
                 "clip_radius": args.clip_radius,
-                "adaptive_clip": args.adaptive_clip,
-                "quantile": args.quantile if args.adaptive_clip else None,
                 "training_indices": priv_indices,
                 "dataset_size": args.dataset_size,
                 "sample_level": args.sample_level,
@@ -474,8 +441,6 @@ def main() -> None:
                 "critical_accuracy": crit_accuracy(dp_sat_model),
                 "epsilon": display_epsilon,
                 "clip_radius": args.clip_radius,
-                "adaptive_clip": args.adaptive_clip,
-                "quantile": args.quantile if args.adaptive_clip else None,
                 "lambda_flatness": args.lambda_flatness,
                 "training_indices": priv_indices,
                 "dataset_size": args.dataset_size,

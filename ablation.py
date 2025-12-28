@@ -282,12 +282,14 @@ def load_state_dict_forgiving(model, state_dict, description="model"):
     return skipped
 
 
+DEFAULT_CALIBRATION_SUBSET = 5000
+
 def build_calibration_loader(public_loader, args):
     dataset = getattr(public_loader, "dataset", None)
     if dataset is None:
         return public_loader
     total = len(dataset)
-    take = min(args.calibration_subset, total)
+    take = min(DEFAULT_CALIBRATION_SUBSET, total)
     if take <= 0 or take >= total:
         return public_loader
     indices = torch.randperm(total)[:take].tolist()
@@ -649,8 +651,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                                   epsilon=8.0, delta=1e-6,
                                   clip_radius=10.0, k=32, lam_floor=5e-1,
                                   device="cuda", target_layer="conv1",
-                                  adaptive_clip=True, quantile=0.95, sample_level=None,
-                                  epochs=1, sigma=None, full_complement_noise=False,
+                                  sample_level=None, epochs=1, sigma=None, full_complement_noise=False,
                                   use_dp_sat=False,
                                   optimizer_name="Normal", positive_noise_correlation=False,
                                   precomputed_lam=None, precomputed_U=None,
@@ -777,7 +778,6 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             logger.info(f"   • ✨ Using Fisher-whitened weight perturbation (Fisher DP-SAT)")
         elif dp_sat_mode == "euclidean":
             logger.warn(f"   • ⚠️  Using Euclidean weight perturbation (Euclidean DP-SAT)")
-    logger.info(f"   • Adaptive clipping: {adaptive_clip}")
     
     if not sample_level:
         logger.info("   • User-level mode: Clipping aggregated user gradients")
@@ -794,7 +794,6 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
             logger.info(f"   • Public rehearsal disabled (λ=0)")
     noise_l2, grad_norm, flatness_norm = [], [], []
     euclidean_norms = []  # Track Euclidean norms for calibration
-    adaptive_radius_computed = False
     euclidean_target = clip_radius  # Store the target Euclidean sensitivity
     actual_radius = clip_radius  # Will be calibrated to Mahalanobis space
     calibration_computed = False  # Flag for norm calibration
@@ -849,8 +848,8 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                     per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
                 per_g = torch.stack(per_g)
 
-                # Calibration or adaptive clipping: collect EUCLIDEAN norms (like vanilla DP-SGD)
-                if (adaptive_clip and not adaptive_radius_computed) or not calibration_computed:
+                # Calibration: collect EUCLIDEAN norms (like vanilla DP-SGD)
+                if not calibration_computed:
                     batch_euclidean_norms = []
                     batch_mahalanobis_norms = []
                     
@@ -864,18 +863,6 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                         batch_mahalanobis_norms.append(mahalanobis_norm)
                     
                     euclidean_norms.extend(batch_euclidean_norms)
-                    
-                    # Adaptive clipping: use Euclidean norms (like vanilla DP-SGD)
-                    if adaptive_clip and not adaptive_radius_computed:
-                        if len(euclidean_norms) >= 100 or batch_idx == 0:
-                            euclidean_adaptive_radius = np.quantile(euclidean_norms, quantile)
-                            euclidean_target = euclidean_adaptive_radius  # Update target
-                            adaptive_radius_computed = True
-                            
-                            logger.info(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} samples (EUCLIDEAN norms):")
-                            logger.info(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
-                            logger.info(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
-                            logger.info(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
                     
                     # Calibration: find Mahalanobis threshold that matches Euclidean sensitivity
                     if not calibration_computed and len(euclidean_norms) >= 50:
@@ -931,21 +918,10 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                     user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
                     user_gradients.append(user_grad_flat)
                     
-                    # Calibration or adaptive clipping: collect EUCLIDEAN norms
-                    if (adaptive_clip and not adaptive_radius_computed) or not calibration_computed:
+                    # Calibration: collect EUCLIDEAN norms
+                    if not calibration_computed:
                         euclidean_norm = user_grad_flat.norm().item()
                         euclidean_norms.append(euclidean_norm)
-                        
-                        if adaptive_clip and not adaptive_radius_computed:
-                            if len(euclidean_norms) >= min(10, len(train_loader)) or batch_idx == 0:
-                                euclidean_adaptive_radius = np.quantile(euclidean_norms, quantile)
-                                euclidean_target = euclidean_adaptive_radius
-                                adaptive_radius_computed = True
-                                
-                                logger.info(f"📊 Fisher + {opt_type} adaptive clipping from {len(euclidean_norms)} users (EUCLIDEAN norms):")
-                                logger.info(f"   • Mean Euclidean: {np.mean(euclidean_norms):.3f}")
-                                logger.info(f"   • {quantile:.1%} quantile: {euclidean_adaptive_radius:.3f}")
-                                logger.info(f"   → Using Euclidean target: Δ₂ = {euclidean_target:.3f}")
                         
                         # Calibration for user-level
                         if not calibration_computed and len(euclidean_norms) >= 5:
@@ -1205,55 +1181,49 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         logger.info("   • Baseline accuracy: %.2f%%", baseline_acc)
 
     # Privacy accounting setup
-    if not args.use_legacy_accounting:
-        # Determine actual DP fine-tuning epochs (same logic as in training functions)
-        if args.dp_epochs is not None:
-            actual_dp_epochs = args.dp_epochs
-        else:
-            actual_dp_epochs = max(1, int(math.ceil(args.epochs / 10)))
-        
-        steps_per_epoch = len(priv_loader)
-        if args.sample_level:
-            sample_rate = steps_per_epoch / len(priv_base)
-            accounting_mode_used = "sample_level"
-            if args.accounting_mode != "repo_q_eff":
-                logger.warn("Accounting mode ignored for sample-level DP; using q=batch/private.")
-        else:
-            if args.accounting_mode == "user_poisson":
-                sample_rate = 1.0 / max(1, int(args.users))
-                accounting_mode_used = "user_poisson"
-            else:
-                sample_rate = steps_per_epoch / len(priv_base)
-                accounting_mode_used = "repo_q_eff"
-        
-        noise_multiplier, total_steps = get_privacy_params_for_target_epsilon(
-            target_epsilon=args.target_epsilon,
-            target_delta=args.delta,
-            sample_rate=sample_rate,
-            epochs=actual_dp_epochs,  # Use DP fine-tuning epochs, not public pretraining epochs
-            steps_per_epoch=steps_per_epoch
-        )
-        
-        # sigma = noise_multiplier * args.clip_radius
-        sigma = noise_multiplier
-        display_epsilon = args.target_epsilon
-        
-        logger.info("Privacy accounting for optimized ablation study (accountant-based).")
-        logger.info("   • DP fine-tuning epochs: %s (public pretrain: %s)", actual_dp_epochs, args.epochs)
-        logger.info("   • Noise multiplier: %.4f", noise_multiplier)
-        logger.info("   • Sigma: %.4f", sigma)
-        log_privacy_guarantee_summary(
-            args,
-            dp_epochs=actual_dp_epochs,
-            steps_per_epoch=steps_per_epoch,
-            total_steps=total_steps,
-            sample_rate=sample_rate,
-            noise_multiplier=noise_multiplier,
-            accounting_mode=accounting_mode_used,
-        )
+    if args.dp_epochs is not None:
+        actual_dp_epochs = args.dp_epochs
     else:
-        sigma = None
-        display_epsilon = args.epsilon
+        actual_dp_epochs = max(1, int(math.ceil(args.epochs / 10)))
+
+    steps_per_epoch = len(priv_loader)
+    if args.sample_level:
+        sample_rate = steps_per_epoch / len(priv_base)
+        accounting_mode_used = "sample_level"
+        if args.accounting_mode != "repo_q_eff":
+            logger.warn("Accounting mode ignored for sample-level DP; using q=batch/private.")
+    else:
+        if args.accounting_mode == "user_poisson":
+            sample_rate = 1.0 / max(1, int(args.users))
+            accounting_mode_used = "user_poisson"
+        else:
+            sample_rate = steps_per_epoch / len(priv_base)
+            accounting_mode_used = "repo_q_eff"
+
+    noise_multiplier, total_steps = get_privacy_params_for_target_epsilon(
+        target_epsilon=args.target_epsilon,
+        target_delta=args.delta,
+        sample_rate=sample_rate,
+        epochs=actual_dp_epochs,  # Use DP fine-tuning epochs, not public pretraining epochs
+        steps_per_epoch=steps_per_epoch
+    )
+
+    sigma = noise_multiplier
+    display_epsilon = args.target_epsilon
+
+    logger.info("Privacy accounting for optimized ablation study (accountant-based).")
+    logger.info("   • DP fine-tuning epochs: %s (public pretrain: %s)", actual_dp_epochs, args.epochs)
+    logger.info("   • Noise multiplier: %.4f", noise_multiplier)
+    logger.info("   • Sigma: %.4f", sigma)
+    log_privacy_guarantee_summary(
+        args,
+        dp_epochs=actual_dp_epochs,
+        steps_per_epoch=steps_per_epoch,
+        total_steps=total_steps,
+        sample_rate=sample_rate,
+        noise_multiplier=noise_multiplier,
+        accounting_mode=accounting_mode_used,
+    )
 
     # Initialize results storage
     ablation_results = {}
@@ -1272,8 +1242,6 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         clip_radius=args.clip_radius,
         device=device,
         target_layer=args.dp_layer,
-        adaptive_clip=args.adaptive_clip,
-        quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
         dp_param_count=args.dp_param_count,
@@ -1297,8 +1265,6 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         clip_radius=args.clip_radius,
         device=device,
         target_layer=args.dp_layer,
-        adaptive_clip=args.adaptive_clip,
-        quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
         rho_sat=args.rho_sat,  # Use consistent perturbation radius
@@ -1324,8 +1290,6 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         clip_radius=args.clip_radius,
         k=args.k, device=device,
         target_layer=args.dp_layer,
-        adaptive_clip=args.adaptive_clip,
-        quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
         use_dp_sat=False,  # Normal optimizer
@@ -1361,8 +1325,6 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         clip_radius=args.clip_radius,
         k=args.k, device=device,
         target_layer=args.dp_layer,
-        adaptive_clip=args.adaptive_clip,
-        quantile=args.quantile,
         sample_level=args.sample_level,
         epochs=args.epochs,
         use_dp_sat=True,  # Force DP-SAT enabled for this variant
@@ -2099,15 +2061,8 @@ def main():
                        help='Remove all saved models before training')
     
     # Privacy arguments
-    privacy_group = parser.add_mutually_exclusive_group()
-    privacy_group.add_argument('--use-legacy-accounting', action='store_true',
-                              help='Use legacy privacy accounting (not recommended)')
-    
-    epsilon_group = parser.add_mutually_exclusive_group()
-    epsilon_group.add_argument('--epsilon', type=float, default=None,
-                              help='Privacy epsilon (legacy accounting only)')
-    epsilon_group.add_argument('--target-epsilon', type=float, default=None,
-                              help='Target epsilon for DP (proper accounting)')
+    parser.add_argument('--target-epsilon', type=float, default=None,
+                        help='Target epsilon for DP (proper accounting)')
     
     parser.add_argument('--delta', type=float, default=1e-5)
     parser.add_argument('--clip-radius', type=float, default=1.0)
@@ -2135,10 +2090,6 @@ def main():
                        choices=['none', 'euclidean', 'fisher'],
                        help='DP-SAT mode: none (default), euclidean (Exact Euclidean), fisher (Exact Fisher)')
     
-    # Adaptive clipping
-    parser.add_argument('--adaptive-clip', action='store_true')
-    parser.add_argument('--quantile', type=float, default=0.95)
-    
     # DP mode
     parser.add_argument('--sample-level', action='store_true')
     parser.add_argument('--users', type=int, default=10)
@@ -2155,10 +2106,6 @@ def main():
     parser.add_argument('--method', type=str, default='linear',
                        choices=['linear', 'public-fisher'],
                        help='Calibration method: linear (fast regularization) or public-fisher (uses public data Fisher matrix)')
-    parser.add_argument('--calibration-subset', type=int, default=5000,
-                       help='[DEPRECATED] Number of public samples used to build the calibration loader. '
-                            'Not used in standard setup: dataset builders provide a separate calibration loader '
-                            'with zero overlap from pretraining data. Only used as fallback if calibration loader is missing.')
     parser.add_argument('--calibration-k', type=int, default=100,
                        help='Number of top-k samples to use for calibration')
     parser.add_argument('--trust-tau', type=float, default=0.005,
@@ -2216,19 +2163,8 @@ def main():
             exit(1)
     
     # Validate privacy parameters
-    if args.use_legacy_accounting:
-        if args.epsilon is None:
-            logger.error("❌ Error: --use-legacy-accounting requires --epsilon parameter")
-            exit(1)
-        if args.target_epsilon is not None:
-            logger.error("❌ Error: Cannot use --target-epsilon with --use-legacy-accounting")
-            exit(1)
-    else:
-        if args.epsilon is not None:
-            logger.error("❌ Error: --epsilon is only for legacy accounting")
-            exit(1)
-        if args.target_epsilon is None:
-            args.target_epsilon = 10.0
+    if args.target_epsilon is None:
+        args.target_epsilon = 10.0
     
     device = get_device(args)
     
