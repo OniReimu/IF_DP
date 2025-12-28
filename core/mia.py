@@ -29,6 +29,9 @@ def auc_advantage(auc: float) -> float:
     """Membership advantage over random guessing (0.0 is best)."""
     return float(abs(auc - 0.5))
 
+def _mia_fallback(reason: str) -> None:
+    logger.warn("MIA fallback: %s", reason)
+
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -258,12 +261,14 @@ def user_level_loss_attack(model, member_groups, non_member_groups, member_datas
     non_member_scores = _compute_group_scores(model, non_member_dataset, non_member_groups, device)
 
     if not member_scores or not non_member_scores:
+        _mia_fallback("user-loss: empty member/non-member scores")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base)}
 
     y_true = np.array([1] * len(member_scores) + [0] * len(non_member_scores))
     scores = np.array(member_scores + non_member_scores)
     if np.std(scores) < 1e-8:
+        _mia_fallback("user-loss: zero-variance scores")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base)}
 
@@ -346,6 +351,7 @@ def user_level_shadow_attack(
 ):
     """User-level shadow attack using aggregated per-user features."""
     if not member_groups or not non_member_groups:
+        _mia_fallback("user-shadow: empty member/non-member groups")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
 
@@ -356,6 +362,7 @@ def user_level_shadow_attack(
         non_member_user_ids = list(eval_groups.keys())
         max_users = min(len(shadow_user_ids), len(non_member_user_ids))
         if max_users == 0:
+            _mia_fallback("user-shadow: no users in shadow pool")
             base = 0.5
             return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
         shadow_users = min(max_users // 2, 200)
@@ -373,6 +380,7 @@ def user_level_shadow_attack(
     shadow_non_member_groups = [eval_groups[uid] for uid in non_member_user_ids if uid in eval_groups]
 
     if not shadow_member_groups or not shadow_non_member_groups:
+        _mia_fallback("user-shadow: empty shadow groups")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
 
@@ -400,6 +408,7 @@ def user_level_shadow_attack(
             shadow_labels.extend([0] * len(non_member_features))
 
     if not shadow_features:
+        _mia_fallback("user-shadow: no shadow features")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
 
@@ -408,6 +417,7 @@ def user_level_shadow_attack(
     X_shadow, y_shadow = validate_and_clean_features(X_shadow, y_shadow, "user-level shadow training data")
 
     if len(X_shadow) < 10 or len(np.unique(y_shadow)) < 2:
+        _mia_fallback("user-shadow: insufficient shadow samples")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
 
@@ -436,12 +446,14 @@ def user_level_shadow_attack(
         shadow_predictions = attack_pipeline.predict_proba(X_test)[:, 1]
         shadow_auc = roc_auc_score(y_test, shadow_predictions)
     except Exception:
+        _mia_fallback("user-shadow: attack training failed")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
 
     target_member_features = _compute_group_features(target_model, priv_ds, member_groups, device)
     target_non_member_features = _compute_group_features(target_model, eval_user_ds, non_member_groups, device)
     if target_member_features.size == 0 or target_non_member_features.size == 0:
+        _mia_fallback("user-shadow: empty target features")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
 
@@ -457,6 +469,7 @@ def user_level_shadow_attack(
         auc_score = roc_auc_score(y_target, target_predictions_proba)
         attack_accuracy = accuracy_score(y_target, target_predictions)
     except Exception:
+        _mia_fallback("user-shadow: attack eval failed")
         base = 0.5
         return {"auc": base, "auc_star": auc_star(base), "adv": auc_advantage(base), "accuracy": 0.5}
 
@@ -597,11 +610,11 @@ def confidence_attack(model, member_loader, non_member_loader, device):
     
     # Check if we have valid data
     if len(set(all_labels)) < 2:
-        logger.warn("Only one class in labels for attack evaluation.")
+        _mia_fallback("confidence attack: single-class labels")
         return {'auc': 0.5, 'accuracy': 0.5, 'member_conf_mean': 0.0, 'non_member_conf_mean': 0.0}
     
     if np.std(all_confidences) < 1e-8:
-        logger.warn("No variance in confidence scores.")
+        _mia_fallback("confidence attack: zero-variance scores")
         return {'auc': 0.5, 'accuracy': 0.5, 'member_conf_mean': np.mean(member_confidences), 'non_member_conf_mean': np.mean(non_member_confidences)}
     
     auc_score = roc_auc_score(all_labels, all_confidences)
@@ -796,6 +809,7 @@ def shadow_model_attack(
             shadow_labels.extend([0] * len(non_member_features))  # Non-members
     
     if not shadow_features:
+        _mia_fallback("shadow: no features")
         base = 0.5
         return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5}
     
@@ -807,6 +821,7 @@ def shadow_model_attack(
     X_shadow, y_shadow = validate_and_clean_features(X_shadow, y_shadow, "shadow training data")
     
     if len(X_shadow) < 10:  # Need minimum samples for training
+        _mia_fallback("shadow: insufficient samples")
         base = 0.5
         return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
@@ -814,12 +829,14 @@ def shadow_model_attack(
     unique_labels, label_counts = np.unique(y_shadow, return_counts=True)
     
     if len(unique_labels) < 2:
+        _mia_fallback("shadow: single-class labels")
         base = 0.5
         return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
     # Ensure minimum samples per class
     min_class_size = min(label_counts)
     if min_class_size < 5:
+        _mia_fallback("shadow: tiny class size")
         base = 0.5
         return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
@@ -855,6 +872,7 @@ def shadow_model_attack(
         shadow_auc = roc_auc_score(y_test, shadow_predictions)
         
     except Exception as e:
+        _mia_fallback("shadow: attack training failed")
         base = 0.5
         return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': base}
     
@@ -863,6 +881,7 @@ def shadow_model_attack(
     target_non_member_features = extract_attack_features(target_model, non_member_loader, device)
     
     if target_member_features.size == 0 or target_non_member_features.size == 0:
+        _mia_fallback("shadow: empty target features")
         base = 0.5
         return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': shadow_auc}
     
@@ -887,6 +906,7 @@ def shadow_model_attack(
         attack_accuracy = accuracy_score(y_target, target_predictions)
         
     except Exception as e:
+        _mia_fallback("shadow: attack eval failed")
         base = 0.5
         return {'auc': base, 'auc_star': auc_star(base), 'adv': auc_advantage(base), 'accuracy': 0.5, 'shadow_auc': shadow_auc}
     
