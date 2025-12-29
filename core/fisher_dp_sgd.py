@@ -160,6 +160,13 @@ def maha_clip(vec, U, inv_sqrt_lam, radius):
     if norm > radius: vec.mul_(radius / norm)
     return vec, norm.item()
 
+
+def l2_clip(vec, radius):
+    norm = vec.norm() + 1e-10
+    if norm > radius:
+        vec.mul_(radius / norm)
+    return vec, norm.item()
+
 # ============================================================
 # 4.  DP-SGD with curvature-aware low-rank noise
 # ============================================================
@@ -267,6 +274,7 @@ def train_with_dp(model, train_loader, fisher,
         logger.info("   • Multi-epoch privacy: T=%s, σ_single=%.3f, σ_adjusted=%.3f", epochs, sigma_single_epoch, sigma)
     logger.info("   • Fisher subspace: k=%s, complement dim=%s", actual_k, param_dim - actual_k)
     logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f (will convert to Mahalanobis)", clip_radius)
+    logger.info("   • Full-space L2 clipping: enabled (Δ₂ bound)")
     logger.info("   • Full complement noise: %s", full_complement_noise)
     logger.info("   • Noise scaling strategy: %s", strategy_name)
     
@@ -400,11 +408,15 @@ def train_with_dp(model, train_loader, fisher,
                     
                     euclidean_norms = []  # Reset for actual training statistics
 
-            # Mahalanobis clipping with calibrated threshold
-            for i in range(per_g.size(0)):
-                per_g[i], nrm = maha_clip(per_g[i], U, clip_scaling, actual_radius)
-                grad_norm.append(nrm)
-            g_bar = per_g.mean(0)
+                # Full-space L2 clipping (DP sensitivity bound)
+                for i in range(per_g.size(0)):
+                    per_g[i], _ = l2_clip(per_g[i], euclidean_target)
+
+                # Mahalanobis clipping with calibrated threshold
+                for i in range(per_g.size(0)):
+                    per_g[i], nrm = maha_clip(per_g[i], U, clip_scaling, actual_radius)
+                    grad_norm.append(nrm)
+                g_bar = per_g.mean(0)
 
         else:
             # USER-LEVEL DP: Compute gradient per user (more robust approach)
@@ -453,12 +465,19 @@ def train_with_dp(model, train_loader, fisher,
                 logger.warn("Expected 1 user per batch, got %s users", len(user_gradients))
                 logger.warn("   Unique users in batch: %s", unique_users.tolist())
             
-            # Clip each user's gradient
-            clipped_user_grads = []
-            for user_grad_flat in user_gradients:
-                clipped_grad, user_norm = maha_clip(user_grad_flat, U, clip_scaling, actual_radius)
-                grad_norm.append(user_norm)
-                clipped_user_grads.append(clipped_grad)
+                # Full-space L2 clipping (DP sensitivity bound)
+                clipped_user_grads = []
+                for user_grad_flat in user_gradients:
+                    user_grad_flat, _ = l2_clip(user_grad_flat, euclidean_target)
+                    clipped_user_grads.append(user_grad_flat)
+
+                # Clip each user's gradient in Mahalanobis norm
+                user_gradients = clipped_user_grads
+                clipped_user_grads = []
+                for user_grad_flat in user_gradients:
+                    clipped_grad, user_norm = maha_clip(user_grad_flat, U, clip_scaling, actual_radius)
+                    grad_norm.append(user_norm)
+                    clipped_user_grads.append(clipped_grad)
             
             # Average across users in batch (should be just one user for UserBatchSampler)
             g_bar = torch.stack(clipped_user_grads).mean(0)

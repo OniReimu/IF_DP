@@ -26,7 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Project-specific helpers
-from core.fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip
+from core.fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip, l2_clip
 from core.dp_sgd import train_with_vanilla_dp
 from core.dp_sat import train_with_dp_sat
 from core.param_selection import select_parameters_by_budget
@@ -825,6 +825,7 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         logger.info(f"   • Multi-epoch privacy: T={epochs}, σ_single={sigma_single_epoch:.3f}, σ_adjusted={sigma:.3f}")
     logger.info(f"   • Fisher subspace: k={actual_k}, complement dim={param_dim-actual_k}")
     logger.info(f"   • Target Euclidean sensitivity: Δ₂ = {clip_radius:.3f} (will convert to Mahalanobis)")
+    logger.info("   • Full-space L2 clipping: enabled (Δ₂ bound)")
     logger.info(f"   • Full complement noise: {full_complement_noise}")
     logger.info(f"   • Optimizer type: {opt_type}")
     logger.info(f"   • Noise scaling strategy: {strategy_name}")
@@ -950,6 +951,10 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                         
                         euclidean_norms = []  # Reset for actual training statistics
 
+                # Full-space L2 clipping (DP sensitivity bound)
+                for i in range(per_g.size(0)):
+                    per_g[i], _ = l2_clip(per_g[i], euclidean_target)
+
                 # Mahalanobis clipping with calibrated threshold
                 for i in range(per_g.size(0)):
                     per_g[i], nrm = maha_clip(per_g[i], U, clip_scaling, actual_radius)
@@ -995,7 +1000,14 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                             
                             euclidean_norms = []  # Reset
             
+                # Full-space L2 clipping (DP sensitivity bound)
+                clipped_user_grads = []
+                for user_grad_flat in user_gradients:
+                    user_grad_flat, _ = l2_clip(user_grad_flat, euclidean_target)
+                    clipped_user_grads.append(user_grad_flat)
+
                 # Mahalanobis clipping for each user gradient
+                user_gradients = clipped_user_grads
                 clipped_user_grads = []
                 for user_grad_flat in user_gradients:
                     clipped_grad, user_norm = maha_clip(user_grad_flat, U, clip_scaling, actual_radius)
