@@ -309,7 +309,7 @@ Use **sample-level DP** if you care about individual examples, and **user-level 
 
 **For fairer comparison with vanilla DP-SGD**: Use `--full-complement-noise` to add isotropic noise in the **orthogonal complement** (remaining $P-k$ dimensions) in addition to the Fisher subspace noise. This makes total noise magnitude similar to vanilla DP-SGD ($\sqrt{P} \times \sigma \times C$) while still preserving curvature-aware benefits in the Fisher subspace. The tradeoff: utility may drop closer to vanilla levels, but privacy accounting becomes more aligned with standard DP-SGD mechanisms.
 
-**Important**: Fisher DP uses **norm calibration** to ensure fair comparison. The `--clip-radius` argument sets the target Euclidean sensitivity Δ₂ (same as vanilla DP-SGD). During training, the code automatically calibrates a Mahalanobis threshold (`actual_radius`) that achieves the same effective sensitivity in Fisher space. Both clipping and noise scaling use this calibrated `actual_radius` to ensure the same privacy-utility tradeoff as vanilla DP-SGD.
+**Important**: Fisher DP uses **norm calibration** to ensure fair comparison. The `--clip-radius` argument sets the target Euclidean sensitivity Δ₂ (same as vanilla DP-SGD). During training, the code calibrates a Mahalanobis threshold (`actual_radius`) using **public data only** (e.g., the public pretrain split) and then applies that threshold throughout DP fine-tuning. Both clipping and noise scaling use this calibrated `actual_radius` to ensure the same privacy-utility tradeoff as vanilla DP-SGD.
 
 ### Advanced Features
 ```bash

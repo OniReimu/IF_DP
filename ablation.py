@@ -26,7 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Project-specific helpers
-from core.fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip, l2_clip
+from core.fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip, l2_clip, calibrate_mahalanobis_radius
 from core.dp_sgd import train_with_vanilla_dp
 from core.dp_sat import train_with_dp_sat
 from core.param_selection import select_parameters_by_budget
@@ -850,10 +850,18 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         if public_loader is not None and rehearsal_lambda == 0:
             logger.info(f"   • Public rehearsal disabled (λ=0)")
     noise_l2, grad_norm, flatness_norm = [], [], []
-    euclidean_norms = []  # Track Euclidean norms for calibration
     euclidean_target = clip_radius  # Store the target Euclidean sensitivity
-    actual_radius = clip_radius  # Will be calibrated to Mahalanobis space
-    calibration_computed = False  # Flag for norm calibration
+    actual_radius, _ = calibrate_mahalanobis_radius(
+        model,
+        public_loader,
+        params,
+        U,
+        clip_scaling,
+        euclidean_target,
+        sample_level,
+        device,
+    )
+    calibration_computed = True  # Avoid private-data calibration in the training loop
     
     # Initialize previous step's Fisher-noisy gradient for DP-SAT
     g_fisher_priv_prev = None
@@ -905,52 +913,6 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                     per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
                 per_g = torch.stack(per_g)
 
-                # Calibration: collect EUCLIDEAN norms (like vanilla DP-SGD)
-                if not calibration_computed:
-                    batch_euclidean_norms = []
-                    batch_mahalanobis_norms = []
-                    
-                    for i in range(per_g.size(0)):
-                        # Compute both norms for calibration
-                        euclidean_norm = per_g[i].norm().item()
-                        proj = (U.T @ per_g[i]) * clip_scaling
-                        mahalanobis_norm = proj.norm().item()
-                        
-                        batch_euclidean_norms.append(euclidean_norm)
-                        batch_mahalanobis_norms.append(mahalanobis_norm)
-                    
-                    euclidean_norms.extend(batch_euclidean_norms)
-                    
-                    # Calibration: find Mahalanobis threshold that matches Euclidean sensitivity
-                    if not calibration_computed and len(euclidean_norms) >= 50:
-                        # Find what Mahalanobis threshold gives similar clipping behavior as Euclidean target
-                        euclidean_clip_rate = np.mean(np.array(batch_euclidean_norms) > euclidean_target)
-                        
-                        # Binary search for Mahalanobis threshold that gives similar clip rate
-                        maha_norms = np.array(batch_mahalanobis_norms)
-                        maha_low, maha_high = maha_norms.min(), maha_norms.max()
-                        
-                        for _ in range(10):  # Binary search iterations
-                            maha_mid = (maha_low + maha_high) / 2
-                            maha_clip_rate = np.mean(maha_norms > maha_mid)
-                            
-                            if maha_clip_rate > euclidean_clip_rate:
-                                maha_low = maha_mid
-                            else:
-                                maha_high = maha_mid
-                        
-                        actual_radius = (maha_low + maha_high) / 2
-                        calibration_computed = True
-                        
-                        logger.info(f"🎯 Ablation norm calibration completed:")
-                        logger.info(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
-                        logger.info(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                        logger.info(f"   • Euclidean clip rate: {euclidean_clip_rate:.1%}")
-                        logger.info(f"   • Mahalanobis clip rate: {np.mean(maha_norms > actual_radius):.1%}")
-                        logger.info(f"   → Fair comparison: same effective sensitivity bound Δ₂\n")
-                        
-                        euclidean_norms = []  # Reset for actual training statistics
-
                 # Full-space L2 clipping (DP sensitivity bound)
                 for i in range(per_g.size(0)):
                     per_g[i], _ = l2_clip(per_g[i], euclidean_target)
@@ -979,27 +941,6 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
                     user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
                     user_gradients.append(user_grad_flat)
                     
-                    # Calibration: collect EUCLIDEAN norms
-                    if not calibration_computed:
-                        euclidean_norm = user_grad_flat.norm().item()
-                        euclidean_norms.append(euclidean_norm)
-                        
-                        # Calibration for user-level
-                        if not calibration_computed and len(euclidean_norms) >= 5:
-                            # Simple heuristic: use median ratio for calibration
-                            proj = (U.T @ user_grad_flat) * inv_sqrt_lam
-                            mahalanobis_norm = proj.norm().item()
-                            ratio = euclidean_norm / (mahalanobis_norm + 1e-8)
-                            actual_radius = euclidean_target / (ratio + 1e-8)
-                            calibration_computed = True
-                            
-                            logger.info(f"🎯 Ablation user-level norm calibration:")
-                            logger.info(f"   • Target Euclidean sensitivity: Δ₂ = {euclidean_target:.3f}")
-                            logger.info(f"   • Calibrated Mahalanobis threshold: {actual_radius:.3f}")
-                            logger.info(f"   • Sample ratio: ||g||₂/||g||_{{F⁻¹}} ≈ {ratio:.3f}\n")
-                            
-                            euclidean_norms = []  # Reset
-            
                 # Full-space L2 clipping (DP sensitivity bound)
                 clipped_user_grads = []
                 for user_grad_flat in user_gradients:
