@@ -14,7 +14,7 @@ import numpy as np
 from typing import List, Optional
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 from torch.autograd import grad  # Required for per-sample gradients
 
@@ -336,9 +336,62 @@ def _concat_feature_chunks(chunks):
     raise TypeError(f"Unsupported feature type for concatenation: {type(first)}")
 
 
-def build_critical_slice(eval_loader, target_class="all", label_mapping=None, max_samples_per_class=200):
+class _TransformOverrideDataset(Dataset):
+    """Wrap a dataset but force a specific transform during __getitem__."""
+
+    def __init__(self, base: Dataset, transform) -> None:
+        self.base = base
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+        if not hasattr(self.base, "transform"):
+            return self.base[idx]
+        original = getattr(self.base, "transform")
+        setattr(self.base, "transform", self.transform)
+        try:
+            return self.base[idx]
+        finally:
+            setattr(self.base, "transform", original)
+
+
+def _get_dataset_transform(dataset) -> object:
+    if isinstance(dataset, Subset):
+        dataset = dataset.dataset
+    return getattr(dataset, "transform", None)
+
+
+def _wrap_dataset_with_transform(dataset, transform):
+    if transform is None:
+        return dataset
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        if not hasattr(base, "transform"):
+            return dataset
+        wrapped = _TransformOverrideDataset(base, transform)
+        return Subset(wrapped, dataset.indices)
+    if hasattr(dataset, "transform"):
+        return _TransformOverrideDataset(dataset, transform)
+    return dataset
+
+
+def _align_loader_to_eval_transform(loader, eval_loader):
+    eval_transform = _get_dataset_transform(eval_loader.dataset) if eval_loader is not None else None
+    if eval_transform is None:
+        return loader, False
+    dataset = _wrap_dataset_with_transform(loader.dataset, eval_transform)
+    if dataset is loader.dataset:
+        return loader, False
+    batch_size = getattr(loader, "batch_size", None) or 1
+    aligned_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    return aligned_loader, True
+
+
+def build_critical_slice(slice_loader, target_class="all", label_mapping=None, max_samples_per_class=200):
     """
-    Collect a balanced critical slice from the evaluation loader that works for
+    Collect a balanced critical slice from the provided loader that works for
     both tensor (vision) and dictionary (language) features.
     """
     cpu = torch.device("cpu")
@@ -348,7 +401,7 @@ def build_critical_slice(eval_loader, target_class="all", label_mapping=None, ma
     label_chunks = defaultdict(list)
     class_counts = defaultdict(int)
 
-    for batch_data in eval_loader:
+    for batch_data in slice_loader:
         features, labels, _ = prepare_batch(batch_data, cpu)
         if labels.ndim == 0:
             labels = labels.unsqueeze(0)
@@ -385,7 +438,7 @@ def build_critical_slice(eval_loader, target_class="all", label_mapping=None, ma
 
     if use_all_classes:
         if not class_counts:
-            logger.warn("⚠️  No samples found in evaluation data")
+            logger.warn("⚠️  No samples found in critical-slice data")
             return None, torch.empty(0, dtype=torch.long)
 
         ordered = sorted(class_counts.keys())
@@ -401,13 +454,13 @@ def build_critical_slice(eval_loader, target_class="all", label_mapping=None, ma
 
         crit_features = _concat_feature_chunks(combined_features)
         crit_labels = torch.cat(combined_labels, dim=0)
-        logger.success(f"✅ Evaluation slice: {total_samples} samples across {len(ordered)} classes")
+        logger.success(f"✅ Critical slice: {total_samples} samples across {len(ordered)} classes")
         return crit_features, crit_labels
 
     collected = class_counts.get(target_value, 0)
     if collected == 0:
-        logger.warn(f"⚠️  No samples of class {target_value}")
-        return None, torch.empty(0, dtype=torch.long)
+    logger.warn(f"⚠️  No samples of class {target_value}")
+    return None, torch.empty(0, dtype=torch.long)
 
     logger.info(f"🎯 Using SINGLE CLASS {target_value} for calibration (targeted improvement)")
     logger.info(f"   • {_describe(target_value, collected)}")
