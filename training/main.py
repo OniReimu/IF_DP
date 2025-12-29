@@ -201,6 +201,8 @@ def main() -> None:
     )
     loaders = dataset_builder.build(dataset_config)
     priv_loader = loaders.private
+    pub_loader = loaders.public
+    calib_loader = getattr(loaders, "calibration", None)
     test_loader = loaders.evaluation
     crit_loader = loaders.critical_eval
     priv_base = loaders.private_base
@@ -218,19 +220,27 @@ def main() -> None:
     baseline = build_model_from_args(args, dataset_builder.num_labels).to(device)
     opt_baseline = torch.optim.SGD(baseline.parameters(), lr=1e-3, momentum=0.9, weight_decay=0.0)
 
-    logger.highlight("Training baseline")
+    baseline_loader = pub_loader
+    if baseline_loader is None:
+        raise ValueError("Public loader is required for baseline pretrain in training/main.py.")
+
+    logger.highlight("Training baseline (public-only)")
     for epoch in tqdm(range(args.epochs)):
         baseline.train()
-        for batch in priv_loader:
+        for batch in baseline_loader:
             features, labels, _ = prepare_batch(batch, device)
             opt_baseline.zero_grad()
             F.cross_entropy(baseline(features), labels).backward()
             opt_baseline.step()
 
     logger.highlight("Fisher matrix")
+    fisher_loader = pub_loader
+    if fisher_loader is None:
+        raise ValueError("Public loader is required for Fisher estimation but was not available.")
+    logger.info("Fisher estimation: using public pretrain data.")
     fisher_matrix, _ = compute_fisher(
         baseline,
-        priv_loader,
+        fisher_loader,
         device,
         target_layer=args.dp_layer,
         rho=1e-2,
@@ -239,7 +249,10 @@ def main() -> None:
     logger.highlight("Fisher-informed DP-SGD")
     fisher_dp_model = copy.deepcopy(baseline)
 
-    sample_rate = len(priv_loader) / len(priv_base)
+    if args.sample_level:
+        sample_rate = float(args.batch_size) / float(len(priv_base))
+    else:
+        sample_rate = len(priv_loader) / len(priv_base)
     steps_per_epoch = len(priv_loader)
     noise_multiplier, total_steps = get_privacy_params_for_target_epsilon(
         target_epsilon=args.target_epsilon,
@@ -248,13 +261,14 @@ def main() -> None:
         epochs=args.epochs,
         steps_per_epoch=steps_per_epoch,
     )
-    sigma = noise_multiplier * args.clip_radius
+    sigma = noise_multiplier
     display_epsilon = args.target_epsilon
     logger.highlight("Using Proper Privacy Accounting (Opacus RDP)")
     logger.info("   • Target (ε, δ): (%.4f, %.1e)", args.target_epsilon, args.delta)
     logger.info("   • Sample rate    : %.4f", sample_rate)
     logger.info("   • Noise multiplier: %.4f", noise_multiplier)
-    logger.info("   • Sigma           : %.4f", sigma)
+    logger.info("   • Sigma (multiplier): %.4f", sigma)
+    logger.info("   • Noise std (σ×C): %.4f", sigma * args.clip_radius)
     logger.info("   • Total steps     : %s", total_steps)
 
     fisher_dp_model = train_with_dp(

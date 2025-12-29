@@ -1241,7 +1241,8 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
 
     steps_per_epoch = len(priv_loader)
     if args.sample_level:
-        sample_rate = steps_per_epoch / len(priv_base)
+        batch_size = getattr(priv_loader, "batch_size", None) or args.batch_size
+        sample_rate = float(batch_size) / float(len(priv_base))
         accounting_mode_used = "sample_level"
         if args.accounting_mode != "repo_q_eff":
             logger.warn("Accounting mode ignored for sample-level DP; using q=batch/private.")
@@ -2341,20 +2342,25 @@ def main():
     
     logger.info('\n🔍 Computing Fisher matrix for ablation study…')
     
-    # Train a baseline model for Fisher computation
+    # Train a baseline model for Fisher computation (public-only)
     fisher_baseline = build_model_for_device(args.model_type, model_kwargs, args, device)
     ensure_model_dataset_compatibility(fisher_baseline, dataset_task_type, args.dataset_name, args.model_type)
     fisher_opt = torch.optim.SGD(fisher_baseline.parameters(), lr=1e-3, momentum=.9)
+
+    fisher_loader = pub_loader
+    if fisher_loader is None:
+        raise ValueError("Public loader is required for Fisher estimation but was not available.")
+    logger.info("Fisher estimation: using public pretrain data.")
     
     for epoch in tqdm(range(5), desc="Training Fisher baseline"):  # Fewer epochs for Fisher
         fisher_baseline.train()
-        for batch_data in priv_loader:
+        for batch_data in fisher_loader:
             features, labels, _ = prepare_batch(batch_data, device)
             fisher_opt.zero_grad()
             F.cross_entropy(fisher_baseline(features), labels).backward()
             fisher_opt.step()
     
-    Fmat, _ = compute_fisher(fisher_baseline, priv_loader, device,
+    Fmat, _ = compute_fisher(fisher_baseline, fisher_loader, device,
                             target_layer=args.dp_layer, rho=1e-2,
                             dp_param_count=args.dp_param_count)
     

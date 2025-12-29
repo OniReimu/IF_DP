@@ -208,7 +208,8 @@ def main() -> None:
     logger.info("Steps/epoch (training loop): %s", steps_per_epoch)
 
     if args.sample_level:
-        q_sample = steps_per_epoch / private_size
+        batch_size = getattr(priv_loader, "batch_size", None) or args.batch_size
+        q_sample = float(batch_size) / float(private_size)
         logger.info("Sampling model: sample-level DP (Poisson subsampling approximation)")
         sigma, total_steps, actual_epsilon = _solve_and_plot(
             label=f"sample-level (q={q_sample:.4f})",

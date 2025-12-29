@@ -10,6 +10,27 @@ This repository provides a comprehensive comparison of three major DP-SGD enhanc
 2. **DP-SAT**: Differentially Private Sharpness-Aware Training ([Park et al., ICML 2023](https://proceedings.mlr.press/v202/park23g.html))
 3. **Vanilla DP-SGD**: Standard baseline ([Abadi et al., CCS 2016](https://dl.acm.org/doi/abs/10.1145/2976749.2978318))
 
+## 🎯 **High-Level Idea: How This Repo Improves DP Utility**
+
+At a fixed privacy target \((\varepsilon,\delta)\), the DP-SGD mechanism is still:
+
+1. **Per-user (or per-sample) gradient clipping** to enforce sensitivity.
+2. **Gaussian noise** added once per step, with noise scale chosen by a proper accountant.
+
+Our "free-lunch utility" improvements are achieved via *geometry* and *post-processing*:
+
+- **Fisher-DP-SGD (training-time geometry)**  
+  Replace Euclidean clipping + isotropic noise with **Mahalanobis clipping in a Fisher metric** and **anisotropic noise** aligned with \(F^{-1}\) (implemented via low-rank eigenpairs).
+
+- **DP-SAT (optimizer-time post-processing / sharpness awareness)**  
+  Use the **previous privatized gradient** to define a perturbation direction or a flatness term. Since it is computed from DP outputs, it is **privacy-free post-processing** and consumes no additional budget. Supports both **exact** (weight perturbation) and **approximate** (gradient addition) methods.
+  
+- **Public Rehearsal (training-time post-processing)**  
+  Combine DP private gradient with non-DP public gradient: `g_total = g_priv_DP + λ * g_public`. This is privacy-free post-processing since the public gradient uses only public data. Helps prevent catastrophic forgetting in non-IID scenarios.
+
+- **IF-Calibration (deployment-time post-processing)**  
+  Use only the released DP model \(\hat\theta_{\mathrm{DP}}\) plus **public data** to compute a correction \(\Delta\theta\) that repairs a critical slice. This is pure post-processing and preserves \((\varepsilon,\delta)\).
+
 ## 🚀 **Quick Start**
 
 ### Install Dependencies
@@ -159,10 +180,11 @@ we achieve **strict DP** while maintaining computational feasibility and strong 
   - Use `--clean` flag to force retraining from scratch
 - **Freezing**: All parameters NOT in `--dp-layer`/`--dp-param-count` are automatically frozen during DP training (`requires_grad=False`).
 - **Verification**: The code logs `🔒 Strict DP: Frozen N parameter groups` to confirm the setup.
-- **Public Rehearsal**: All DP training functions support optional public rehearsal via `--rehearsal-lambda`:
+- **Public Rehearsal**: All DP training functions (`train_with_vanilla_dp`, `train_with_dp_sat`, `train_with_dp`) support optional public rehearsal via `public_loader` and `rehearsal_lambda` parameters (accessible via `--rehearsal-lambda` flag):
   - Combines DP private gradient with non-DP public gradient: `g_total = g_priv_DP + λ * g_public`
   - Privacy-free post-processing (public gradient uses only public data)
   - Helps prevent catastrophic forgetting in non-IID scenarios
+- **IID/Non-IID Data Splits**: Support for both IID and non-IID dataset splits via `--non-iid` flag. Non-IID mode excludes specified classes from public pretrain and moves them to private, with optional rehearsal buffer to prevent catastrophic forgetting.
 
 **Example**:
 ```bash
