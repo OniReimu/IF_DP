@@ -46,6 +46,8 @@ data/
 
 saved_models/
 
+.worktrees/
+
 AGENTS.md
 TODO.md
 STATE_SUMMARY.md
