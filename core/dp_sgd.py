@@ -13,6 +13,7 @@ from data.common import prepare_batch
 from models.utils import compute_loss
 from core.param_selection import select_parameters_by_budget
 from config import get_logger
+from core.device_utils import freeze_batchnorm_stats
 
 logger = get_logger("dp_sgd")
 
@@ -47,6 +48,9 @@ def train_with_vanilla_dp(model, train_loader, epsilon=8.0, delta=1e-6,
         Trained model with vanilla DP-SGD
     """
     model.train()
+    bn_frozen = freeze_batchnorm_stats(model)
+    if bn_frozen:
+        logger.info("   • BatchNorm stats frozen during DP fine-tuning (%s modules)", bn_frozen)
     opt = torch.optim.SGD(model.parameters(), lr=lr)
     
     # Privacy accounting

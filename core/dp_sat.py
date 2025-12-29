@@ -16,6 +16,7 @@ from tqdm import tqdm
 from data.common import prepare_batch
 from core.param_selection import select_parameters_by_budget
 from config import get_logger
+from core.device_utils import freeze_batchnorm_stats
 
 logger = get_logger("dp_sat")
 
@@ -63,6 +64,9 @@ def train_with_dp_sat(model, train_loader, epsilon=8.0, delta=1e-6,
         rho_sat = lambda_flatness
 
     model.train()
+    bn_frozen = freeze_batchnorm_stats(model)
+    if bn_frozen:
+        logger.info("   • BatchNorm stats frozen during DP fine-tuning (%s modules)", bn_frozen)
     opt = torch.optim.SGD(model.parameters(), lr=lr)
     
     # Privacy accounting (same as vanilla DP-SGD) — note dp_epochs below

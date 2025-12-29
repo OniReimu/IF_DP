@@ -34,7 +34,7 @@ from core.privacy_accounting import (
     get_privacy_params_for_target_epsilon, 
 )
 from models import available_models, create_model
-from core.device_utils import resolve_device, maybe_wrap_model_for_multi_gpu
+from core.device_utils import resolve_device, maybe_wrap_model_for_multi_gpu, freeze_batchnorm_stats
 from data import DATASET_REGISTRY, DatasetConfig, build_dataset_builder
 from core.mia import (
     evaluate_membership_inference,
@@ -743,6 +743,9 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
         4. Final update: θ ← θ - η g_fisher_priv
     """
     model.train()
+    bn_frozen = freeze_batchnorm_stats(model)
+    if bn_frozen:
+        logger.info(f"   • BatchNorm stats frozen during DP fine-tuning ({bn_frozen} modules)")
     opt = torch.optim.SGD(model.parameters(), lr=lr)
     
     # Fisher eigendecomposition (use pre-computed if available)

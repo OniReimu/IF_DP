@@ -88,3 +88,13 @@ def maybe_wrap_model_for_multi_gpu(model: torch.nn.Module, args):
 
     logger.info("Enabling DataParallel on CUDA devices %s", device_ids)
     return torch.nn.DataParallel(model, device_ids=device_ids)
+
+
+def freeze_batchnorm_stats(model: torch.nn.Module) -> int:
+    """Freeze BatchNorm running stats to avoid private-data leakage via buffers."""
+    count = 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+            count += 1
+    return count

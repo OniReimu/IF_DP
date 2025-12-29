@@ -14,6 +14,7 @@ from data.common import prepare_batch
 from models.utils import compute_loss
 from core.param_selection import select_parameters_by_budget
 from config import get_logger
+from core.device_utils import freeze_batchnorm_stats
 
 logger = get_logger("fisher_dp")
 
@@ -196,6 +197,9 @@ def train_with_dp(model, train_loader, fisher,
                          Only used if public_loader is provided.
     """
     model.train()
+    bn_frozen = freeze_batchnorm_stats(model)
+    if bn_frozen:
+        logger.info("   • BatchNorm stats frozen during DP fine-tuning (%s modules)", bn_frozen)
     opt = torch.optim.SGD(model.parameters(), lr=lr)
 
     lam, U       = topk_eigh_with_floor(fisher, k=k, lam_floor=lam_floor)
