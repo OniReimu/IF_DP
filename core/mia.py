@@ -205,31 +205,120 @@ def _collect_user_groups(dataset):
     return user_samples
 
 
-def prepare_user_level_groups(priv_ds, eval_data, num_users, mia_users):
-    """Prepare fixed user groups for a user-level audit attack."""
+def _excluded_fraction(dataset, indices, excluded_set):
+    if not indices:
+        return 0.0
+    excluded = 0
+    for idx in indices:
+        label = _extract_label(dataset[idx])
+        if label in excluded_set:
+            excluded += 1
+    return float(excluded) / float(len(indices))
+
+
+def _split_indices_by_excluded(dataset, excluded_set):
+    excluded = []
+    rest = []
+    for idx in range(len(dataset)):
+        label = _extract_label(dataset[idx])
+        if label in excluded_set:
+            excluded.append(idx)
+        else:
+            rest.append(idx)
+    return excluded, rest
+
+
+def prepare_user_level_groups(priv_ds, eval_data, num_users, mia_users, *, seed=None, excluded_classes=None):
+    """Prepare fixed user groups for a user-level audit (user in / user out).
+
+    Notes:
+      - `mia_users` is interpreted as number of USERS to audit (not samples).
+      - When `excluded_classes` is provided, we match non-member users by excluded/rest ratio
+        to reduce non-IID class-mix artifacts.
+    """
+    rng = np.random.RandomState(seed) if seed is not None else np.random
+
     member_groups_map = _collect_user_groups(priv_ds)
     eval_user_ds = SyntheticUserDataset(eval_data, num_users)
 
     n_users = min(mia_users, len(member_groups_map))
-    member_user_ids = np.random.choice(list(member_groups_map.keys()), n_users, replace=False)
+    if n_users <= 0:
+        return [], [], eval_user_ds
+
+    member_user_ids = rng.choice(list(member_groups_map.keys()), n_users, replace=False)
     member_groups = [member_groups_map[uid] for uid in member_user_ids]
 
-    member_indices = [idx for group in member_groups for idx in group]
-    target_counts = _collect_label_counts(priv_ds, member_indices)
-    non_member_indices = _sample_indices_by_label(eval_user_ds, target_counts)
-    if len(non_member_indices) < len(member_indices):
-        missing = len(member_indices) - len(non_member_indices)
-        fallback = np.random.choice(len(eval_user_ds), missing, replace=True).tolist()
-        non_member_indices.extend(fallback)
+    group_sizes = [len(group) for group in member_groups]
+    total_needed = sum(group_sizes)
 
     non_member_groups = []
-    cursor = 0
-    for group in member_groups:
-        size = len(group)
-        non_member_groups.append(non_member_indices[cursor:cursor + size])
-        cursor += size
+    if excluded_classes:
+        excluded_set = set(int(x) for x in excluded_classes)
+        eval_excluded, eval_rest = _split_indices_by_excluded(eval_user_ds, excluded_set)
+        member_fracs = [
+            _excluded_fraction(priv_ds, member_groups_map[uid], excluded_set) for uid in member_user_ids
+        ]
+        excluded_counts = [int(round(size * frac)) for size, frac in zip(group_sizes, member_fracs)]
+        rest_counts = [size - excl for size, excl in zip(group_sizes, excluded_counts)]
+        total_excluded_needed = sum(excluded_counts)
+        total_rest_needed = sum(rest_counts)
 
-    logger.info("   • Non-members: label-matched to member distribution (user-level).")
+        use_excl_replacement = total_excluded_needed > len(eval_excluded)
+        use_rest_replacement = total_rest_needed > len(eval_rest)
+        if use_excl_replacement or use_rest_replacement or total_needed > len(eval_user_ds):
+            logger.warn(
+                "MIA non-member sampling: requested %s samples from eval size %s; sampling with replacement.",
+                total_needed,
+                len(eval_user_ds),
+            )
+
+        if not use_excl_replacement:
+            eval_excluded = rng.permutation(eval_excluded).tolist()
+        if not use_rest_replacement:
+            eval_rest = rng.permutation(eval_rest).tolist()
+        excl_cursor = 0
+        rest_cursor = 0
+
+        for size, excl_count, rest_count in zip(group_sizes, excluded_counts, rest_counts):
+            if excl_count <= 0:
+                excl_indices = []
+            elif use_excl_replacement:
+                excl_indices = rng.choice(eval_excluded, excl_count, replace=True).tolist()
+            else:
+                excl_indices = eval_excluded[excl_cursor:excl_cursor + excl_count]
+                excl_cursor += excl_count
+
+            if rest_count <= 0:
+                rest_indices = []
+            elif use_rest_replacement:
+                rest_indices = rng.choice(eval_rest, rest_count, replace=True).tolist()
+            else:
+                rest_indices = eval_rest[rest_cursor:rest_cursor + rest_count]
+                rest_cursor += rest_count
+
+            group_indices = excl_indices + rest_indices
+            rng.shuffle(group_indices)
+            non_member_groups.append(group_indices)
+        logger.info("   • Non-members: size-matched with excluded/rest ratio.")
+    else:
+        use_replacement = total_needed > len(eval_user_ds)
+        if use_replacement:
+            logger.warn(
+                "MIA non-member sampling: requested %s samples from eval size %s; sampling with replacement.",
+                total_needed,
+                len(eval_user_ds),
+            )
+            for size in group_sizes:
+                group_indices = rng.choice(len(eval_user_ds), size, replace=True).tolist()
+                non_member_groups.append(group_indices)
+        else:
+            all_indices = rng.permutation(len(eval_user_ds)).tolist()
+            cursor = 0
+            for size in group_sizes:
+                non_member_groups.append(all_indices[cursor:cursor + size])
+                cursor += size
+        logger.info("   • Non-members: size-matched from evaluation pool.")
+
     return member_groups, non_member_groups, eval_user_ds
 
 

@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 from core.mia import (
     align_mia_datasets,
     prepare_shadow_splits,
+    prepare_user_level_groups,
     user_level_loss_attack,
     user_level_shadow_attack,
 )
@@ -92,6 +93,29 @@ class TestMiaUtilities(unittest.TestCase):
             device=torch.device("cpu"),
         )
         self.assertAlmostEqual(result["auc"], 0.5, places=6)
+
+    def test_prepare_user_level_groups_user_in_out(self):
+        priv_base = DummyTransformDataset(20, transform=None)
+        eval_base = DummyTransformDataset(20, transform=None)
+        priv_ds = SyntheticUserDataset(priv_base, num_users=4)
+
+        member_groups, non_member_groups, eval_user_ds = prepare_user_level_groups(
+            priv_ds,
+            eval_base,
+            num_users=4,
+            mia_users=3,
+            seed=123,
+            excluded_classes=[0],
+        )
+
+        self.assertEqual(len(member_groups), 3)
+        self.assertEqual(len(non_member_groups), 3)
+        self.assertEqual(len(eval_user_ds), len(eval_base))
+        self.assertEqual([len(g) for g in member_groups], [len(g) for g in non_member_groups])
+
+        # Indices in groups should be valid for their respective datasets.
+        self.assertTrue(all(0 <= idx < len(priv_ds) for g in member_groups for idx in g))
+        self.assertTrue(all(0 <= idx < len(eval_user_ds) for g in non_member_groups for idx in g))
 
 
 if __name__ == "__main__":

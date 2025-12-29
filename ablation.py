@@ -1751,22 +1751,20 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
                 )
             logger.success("MIA member source verified.")
         
-        # Prepare member and non-member datasets
-        if mia_use_sample:
-            logger.info("Sample-level MIA: using actual private training samples as members.")
-            member_set, non_member_set = prepare_mia_data_sample_level(mia_train_data, eval_source, priv_idx, args.mia_size)
-        else:
-            logger.info("User-level MIA: using actual private users as members.")
-            member_set, non_member_set = prepare_mia_data_user_level(mia_priv_ds, eval_source, args.users, args.mia_size)
-        
-        member_loader = DataLoader(member_set, batch_size=64, shuffle=False)
-        non_member_loader = DataLoader(non_member_set, batch_size=64, shuffle=False)
-        
-        logger.info(f"   • Members: {len(member_set)} samples")
-        logger.info(f"   • Non-members: {len(non_member_set)} samples")
-
+        member_loader = None
+        non_member_loader = None
         shadow_splits = None
         if mia_use_sample:
+            logger.info("Sample-level MIA: using actual private training samples as members.")
+            member_set, non_member_set = prepare_mia_data_sample_level(
+                mia_train_data, eval_source, priv_idx, args.mia_size
+            )
+            member_loader = DataLoader(member_set, batch_size=64, shuffle=False)
+            non_member_loader = DataLoader(non_member_set, batch_size=64, shuffle=False)
+
+            logger.info(f"   • Members: {len(member_set)} samples")
+            logger.info(f"   • Non-members: {len(non_member_set)} samples")
+
             shadow_splits = prepare_shadow_splits(mia_train_data, eval_source, seed=get_random_seed())
             logger.info(
                 "Shadow split fixed: %s members / %s non-members",
@@ -1776,8 +1774,22 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         user_groups = None
         user_shadow_splits = None
         if mia_use_user:
-            user_groups = prepare_user_level_groups(mia_priv_ds, eval_source, args.users, args.mia_size)
-            logger.info("User-level audit: %s users", len(user_groups[0]))
+            logger.info("User-level MIA: using actual private users as members.")
+            excluded_classes = []
+            if args.non_iid and args.public_pretrain_exclude_classes:
+                excluded_classes = [int(x) for x in args.public_pretrain_exclude_classes.split(",") if x.strip() != ""]
+            user_groups = prepare_user_level_groups(
+                mia_priv_ds,
+                eval_source,
+                args.users,
+                args.mia_size,
+                seed=get_random_seed(),
+                excluded_classes=excluded_classes,
+            )
+            member_groups, non_member_groups, _ = user_groups
+            logger.info("User-level audit: %s users", len(member_groups))
+            logger.info("   • Members: %s users (%s samples)", len(member_groups), sum(len(g) for g in member_groups))
+            logger.info("   • Non-members: %s users (%s samples)", len(non_member_groups), sum(len(g) for g in non_member_groups))
             if args.mia_attack == "shadow":
                 _, _, non_member_user_ds = user_groups
                 user_shadow_splits = prepare_user_shadow_splits(
