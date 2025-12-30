@@ -8,6 +8,7 @@ from typing import Dict, Optional, Sequence
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
 from .base import (
@@ -16,16 +17,27 @@ from .base import (
     DatasetLoaders,
     split_private_public_calibration_indices,
 )
-from .common import SyntheticUserDataset, UserBatchSampler
 from .registry import register_dataset
 
 
+def _maybe_distributed_sampler(dataset, *, shuffle: bool, drop_last: bool = False):
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last)
+    return None
+
+
+def _build_loader(dataset, *, batch_size: int, shuffle: bool) -> DataLoader:
+    sampler = _maybe_distributed_sampler(dataset, shuffle=shuffle, drop_last=False)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(sampler is None and shuffle),
+        sampler=sampler,
+    )
+
+
 def _build_private_loader(private_subset: Dataset, config: DatasetConfig) -> DataLoader:
-    if config.sample_level:
-        return DataLoader(private_subset, batch_size=config.batch_size, shuffle=True)
-    synthetic = SyntheticUserDataset(private_subset, config.num_users)
-    sampler = UserBatchSampler(synthetic.uid)
-    return DataLoader(synthetic, batch_sampler=sampler)
+    return _build_loader(private_subset, batch_size=config.batch_size, shuffle=True)
 
 
 class HFTextClassificationDataset(Dataset):
@@ -143,9 +155,9 @@ class _HFTextDatasetBuilder(DatasetBuilder):
         calibration_subset = Subset(train_dataset, calib_idx.tolist())
 
         priv_loader = _build_private_loader(private_subset, config)
-        pub_loader = DataLoader(public_subset, batch_size=config.batch_size, shuffle=True)
-        calib_loader = DataLoader(calibration_subset, batch_size=config.batch_size, shuffle=True)
-        eval_loader = DataLoader(eval_dataset, batch_size=config.eval_batch_size, shuffle=False)
+        pub_loader = _build_loader(public_subset, batch_size=config.batch_size, shuffle=True)
+        calib_loader = _build_loader(calibration_subset, batch_size=config.batch_size, shuffle=True)
+        eval_loader = _build_loader(eval_dataset, batch_size=config.eval_batch_size, shuffle=False)
 
         return DatasetLoaders(
             private=priv_loader,
