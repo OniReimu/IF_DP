@@ -19,6 +19,31 @@ from core.device_utils import freeze_batchnorm_stats
 logger = get_logger("fisher_dp")
 
 # ============================================================
+# 0.  Utilities
+# ============================================================
+def apply_noise_floor(noise_scaling: torch.Tensor, floor: float = 1.0) -> torch.Tensor:
+    """
+    Enforce a per-direction lower bound on Fisher subspace noise scaling.
+
+    This is useful when combining Fisher-shaped noise with full complement noise and
+    wanting an isotropic Gaussian noise floor (i.e., no Fisher direction receives
+    less noise than isotropic).
+    """
+    if floor is None:
+        return noise_scaling
+    return torch.clamp(noise_scaling, min=float(floor))
+
+def maybe_apply_noise_floor(
+    noise_scaling: torch.Tensor,
+    full_complement_noise: bool,
+    floor: float = 1.0,
+) -> torch.Tensor:
+    """Apply an isotropic noise floor only when complement noise is enabled."""
+    if not full_complement_noise:
+        return noise_scaling
+    return apply_noise_floor(noise_scaling, floor=floor)
+
+# ============================================================
 # 1.  Fisher estimation (damped) on chosen layer set
 # ============================================================
 def compute_fisher(model, dataloader, device,
@@ -309,6 +334,17 @@ def train_with_dp(model, train_loader, fisher,
     else:
         noise_scaling = inv_sqrt_lam
         strategy_name = "Negatively correlated noise (noise ∝ 1/√λ, default)"
+
+    if full_complement_noise:
+        before_min = float(noise_scaling.min().item())
+        noise_scaling = maybe_apply_noise_floor(noise_scaling, full_complement_noise=True, floor=1.0)
+        after_min = float(noise_scaling.min().item())
+        if after_min > before_min + 1e-12:
+            logger.info("   • Noise floor applied: min scaling %.4f → %.4f (floor=1.0)", before_min, after_min)
+        else:
+            logger.info("   • Noise floor check: min scaling %.4f (no clamp needed)", after_min)
+    else:
+        logger.warn("   • Full complement noise disabled: subspace-only noise may not match standard DP accountant (non-strict DP).")
     
     # Clipping always uses inverse scaling to maintain consistent Mahalanobis norm definition
     clip_scaling = inv_sqrt_lam

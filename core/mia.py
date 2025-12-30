@@ -21,6 +21,8 @@ from data.common import SyntheticUserDataset, prepare_batch
 from models.model import CNN
 from config import get_logger
 
+logger = get_logger("mia")
+
 def auc_star(auc: float) -> float:
     """Sign-invariant attack strength: attacker can flip score direction."""
     return float(max(auc, 1.0 - auc))
@@ -35,17 +37,12 @@ def _mia_fallback(reason: str) -> None:
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# Set reproducible random seeds for consistent MIA evaluation
-from config import get_dataset_location, set_random_seeds
+# Avoid import-time side effects (seeding, filesystem / download config).
+# These should be configured by the calling script (e.g., ablation.py, training/mia_only.py)
+# and only performed in this module's standalone CLI entrypoint.
 from .device_utils import resolve_device
-set_random_seeds()
-dataset_root, allow_download = get_dataset_location(
-    dataset_key='cifar10',
-    required_subdir='cifar-10-batches-py'
-)
 
 NUM_RUNS = 5 
-logger = get_logger("mia")
 
 
 class _TransformOverrideDataset(Dataset):
@@ -1560,6 +1557,14 @@ def main():
     
     args = parser.parse_args()
     device = get_device(args)
+
+    # Standalone usage: set deterministic seeds and resolve dataset location here (not at import time).
+    from config import get_dataset_location, set_random_seeds
+    set_random_seeds()
+    dataset_root, allow_download = get_dataset_location(
+        dataset_key='cifar10',
+        required_subdir='cifar-10-batches-py'
+    )
     
     # Load data
     trans = T.Compose([T.ToTensor(), T.Normalize((.5,.5,.5),(.5,.5,.5))])

@@ -24,7 +24,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Project-specific helpers
-from core.fisher_dp_sgd import compute_fisher, topk_eigh_with_floor, maha_clip, l2_clip, calibrate_mahalanobis_radius
+from core.fisher_dp_sgd import (
+    compute_fisher,
+    topk_eigh_with_floor,
+    maha_clip,
+    l2_clip,
+    calibrate_mahalanobis_radius,
+    maybe_apply_noise_floor,
+)
 from core.dp_sgd import train_with_vanilla_dp
 from core.dp_sat import train_with_dp_sat
 from core.param_selection import select_parameters_by_budget
@@ -770,6 +777,17 @@ def train_fisher_dp_with_optimizer(model, train_loader, fisher,
     else:
         noise_scaling = inv_sqrt_lam
         strategy_name = "Negatively correlated noise (noise ∝ 1/√λ, default)"
+
+    if full_complement_noise:
+        before_min = float(noise_scaling.min().item())
+        noise_scaling = maybe_apply_noise_floor(noise_scaling, full_complement_noise=True, floor=1.0)
+        after_min = float(noise_scaling.min().item())
+        if after_min > before_min + 1e-12:
+            logger.info(f"   • Noise floor applied: min scaling {before_min:.4f} → {after_min:.4f} (floor=1.0)")
+        else:
+            logger.info(f"   • Noise floor check: min scaling {after_min:.4f} (no clamp needed)")
+    else:
+        logger.warn("   • Full complement noise disabled: subspace-only noise may not match standard DP accountant (non-strict DP).")
     
     # Clipping always uses inverse scaling to maintain consistent Mahalanobis norm definition
     clip_scaling = inv_sqrt_lam
