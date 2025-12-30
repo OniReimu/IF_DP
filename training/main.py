@@ -135,9 +135,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--sample-level", action="store_true")
     parser.add_argument("--users", type=int, default=10)
-    parser.add_argument("--full-complement-noise", action="store_true")
-    parser.add_argument("--positively-correlated-noise", action="store_true",
-                        help="Use positively correlated Fisher noise (default: negatively correlated)")
+    parser.add_argument(
+        "--positively-correlated-noise",
+        action="store_true",
+        help="(Unsupported) Mechanism-aligned Fisher DP-SGD uses negatively correlated F^{-1} noise.",
+    )
     parser.set_defaults(positively_correlated_noise=False)
 
     parser.add_argument("--run-mia", action="store_true")
@@ -268,7 +270,8 @@ def main() -> None:
     logger.info("   • Sample rate    : %.4f", sample_rate)
     logger.info("   • Noise multiplier: %.4f", noise_multiplier)
     logger.info("   • Sigma (multiplier): %.4f", sigma)
-    logger.info("   • Noise std (σ×C): %.4f", sigma * args.clip_radius)
+    logger.info("   • Vanilla noise std: σ×Δ₂ = %.4f×%.3f = %.4f", sigma, args.clip_radius, sigma * args.clip_radius)
+    logger.info("   • Fisher noise std: σ×C_F where C_F is calibrated from public data inside Fisher DP-SGD")
     logger.info("   • Total steps     : %s", total_steps)
 
     fisher_dp_model = train_with_dp(
@@ -278,7 +281,6 @@ def main() -> None:
         epsilon=display_epsilon,
         delta=args.delta,
         sigma=sigma,
-        full_complement_noise=args.full_complement_noise,
         clip_radius=args.clip_radius,
         k=args.k,
         device=device,
@@ -396,7 +398,6 @@ def main() -> None:
             "dataset": args.dataset_name,
             "accuracy": baseline_acc,
             "critical_accuracy": crit_accuracy(baseline),
-            "training_indices": priv_indices,
             "dataset_size": args.dataset_size,
             "sample_level": args.sample_level,
             "num_users": args.users if not args.sample_level else None,
@@ -415,7 +416,6 @@ def main() -> None:
             "critical_accuracy": crit_accuracy(fisher_dp_model),
             "epsilon": display_epsilon,
             "clip_radius": args.clip_radius,
-            "training_indices": priv_indices,
             "dataset_size": args.dataset_size,
             "sample_level": args.sample_level,
             "num_users": args.users if not args.sample_level else None,
@@ -435,7 +435,6 @@ def main() -> None:
                 "critical_accuracy": crit_accuracy(vanilla_dp_model),
                 "epsilon": display_epsilon,
                 "clip_radius": args.clip_radius,
-                "training_indices": priv_indices,
                 "dataset_size": args.dataset_size,
                 "sample_level": args.sample_level,
                 "num_users": args.users if not args.sample_level else None,
@@ -456,7 +455,6 @@ def main() -> None:
                 "epsilon": display_epsilon,
                 "clip_radius": args.clip_radius,
                 "lambda_flatness": args.lambda_flatness,
-                "training_indices": priv_indices,
                 "dataset_size": args.dataset_size,
                 "sample_level": args.sample_level,
                 "num_users": args.users if not args.sample_level else None,

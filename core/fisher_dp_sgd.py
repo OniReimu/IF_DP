@@ -2,7 +2,7 @@
 # ------------------------------------------------------------
 #  * Supports single layer, multiple layers, or "all" layers
 #  * Works on GPU, CPU, *and* Apple-Silicon MPS (CPU fallback for eigvals)
-#  * Per-sample Mahalanobis clipping, low-rank anisotropic Gaussian noise
+#  * Fisher-metric clipping (aligned with F^{-1} noise), low-rank anisotropic Gaussian noise
 #  * Accepts batches of (x, y)  or  (x, y, user_id)
 
 import math, numpy as np, torch, torch.nn.functional as F
@@ -15,34 +15,13 @@ from models.utils import compute_loss
 from core.param_selection import select_parameters_by_budget
 from config import get_logger
 from core.device_utils import freeze_batchnorm_stats
+from core.privacy_accounting import compute_actual_epsilon
 
 logger = get_logger("fisher_dp")
 
 # ============================================================
 # 0.  Utilities
 # ============================================================
-def apply_noise_floor(noise_scaling: torch.Tensor, floor: float = 1.0) -> torch.Tensor:
-    """
-    Enforce a per-direction lower bound on Fisher subspace noise scaling.
-
-    This is useful when combining Fisher-shaped noise with full complement noise and
-    wanting an isotropic Gaussian noise floor (i.e., no Fisher direction receives
-    less noise than isotropic).
-    """
-    if floor is None:
-        return noise_scaling
-    return torch.clamp(noise_scaling, min=float(floor))
-
-def maybe_apply_noise_floor(
-    noise_scaling: torch.Tensor,
-    full_complement_noise: bool,
-    floor: float = 1.0,
-) -> torch.Tensor:
-    """Apply an isotropic noise floor only when complement noise is enabled."""
-    if not full_complement_noise:
-        return noise_scaling
-    return apply_noise_floor(noise_scaling, floor=floor)
-
 # ============================================================
 # 1.  Fisher estimation (damped) on chosen layer set
 # ============================================================
@@ -177,10 +156,21 @@ def topk_eigh_with_floor(mat: torch.Tensor,
     return torch.from_numpy(lam).float(), torch.from_numpy(U).float()
 
 # ============================================================
-# 3.  Mahalanobis per-sample clipping
+# 3.  Fisher-metric clipping helpers
 # ============================================================
 def maha_clip(vec, U, inv_sqrt_lam, radius):
-    proj = (U.T @ vec) * inv_sqrt_lam           # (Uᵀg)/√λ
+    """
+    Clip a vector using a quadratic metric defined by (U, scaling).
+
+    If `scaling = sqrt_lam`, this computes the Fisher (F) norm in the subspace:
+        ||g||_F = || sqrt(Λ) U^T g ||_2
+    If `scaling = inv_sqrt_lam`, this computes the F^{-1} norm in the subspace:
+        ||g||_{F^{-1}} = || (1/sqrt(Λ)) U^T g ||_2
+
+    Note: this scales the *full* vector `vec` by a single factor, which is fine when
+    the update will be projected into span(U) afterwards (subspace-only updates).
+    """
+    proj = (U.T @ vec) * inv_sqrt_lam
     norm = proj.norm() + 1e-10
     if norm > radius: vec.mul_(radius / norm)
     return vec, norm.item()
@@ -204,9 +194,19 @@ def calibrate_mahalanobis_radius(
     device,
     max_batches=5,
 ):
-    """Calibrate Mahalanobis radius using public data only."""
+    """
+    Calibrate a Fisher-metric clipping radius using public data only.
+
+    Option 1 semantics (paper default):
+      - `euclidean_target` is the *vanilla DP-SGD* Euclidean clip radius Δ₂.
+      - We pick a Fisher-metric radius so the Fisher clip rate matches the Euclidean
+        clip rate measured on public gradients.
+
+    The Fisher metric here is determined by the caller-provided `clip_scaling`:
+      - for aligned Fisher DP-SGD, pass `sqrt_lam` so the clipped norm is ||g||_F.
+    """
     if loader is None:
-        logger.warn("Public loader unavailable for norm calibration; using fixed Δ₂.")
+        logger.warn("Public loader unavailable for norm calibration; using Δ₂ as the Fisher radius (fallback).")
         return euclidean_target, False
 
     was_training = model.training
@@ -263,18 +263,18 @@ def calibrate_mahalanobis_radius(
                 maha_high = maha_mid
         actual_radius = (maha_low + maha_high) / 2
         logger.info("Public norm calibration (sample-level):")
-        logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f", euclidean_target)
-        logger.info("   • Calibrated Mahalanobis threshold: %.3f", actual_radius)
+        logger.info("   • Target Euclidean clip radius (vanilla Δ₂): %.3f", euclidean_target)
+        logger.info("   • Calibrated Fisher radius: %.3f", actual_radius)
         logger.info("   • Euclidean clip rate: %.1f%%", euclidean_clip_rate * 100.0)
-        logger.info("   • Mahalanobis clip rate: %.1f%%", np.mean(mahalanobis_norms > actual_radius) * 100.0)
+        logger.info("   • Fisher clip rate: %.1f%%", np.mean(mahalanobis_norms > actual_radius) * 100.0)
     else:
         ratios = euclidean_norms / (mahalanobis_norms + 1e-8)
         ratio = float(np.median(ratios))
         actual_radius = euclidean_target / (ratio + 1e-8)
         logger.info("Public norm calibration (user-level):")
-        logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f", euclidean_target)
-        logger.info("   • Calibrated Mahalanobis threshold: %.3f", actual_radius)
-        logger.info("   • Sample ratio: ||g||₂/||g||_{F⁻¹} ≈ %.3f", ratio)
+        logger.info("   • Target Euclidean clip radius (vanilla Δ₂): %.3f", euclidean_target)
+        logger.info("   • Calibrated Fisher radius: %.3f", actual_radius)
+        logger.info("   • Median ratio: ||g||₂ / ||g||_F ≈ %.3f", ratio)
 
     return actual_radius, True
 
@@ -285,7 +285,7 @@ def train_with_dp(model, train_loader, fisher,
                   epsilon=8.0, delta=1e-6,
                   clip_radius=10.0, k=32, lam_floor=5e-1,
                   device="cuda", target_layer="conv1",
-                  sample_level=None, epochs=1, sigma=None, full_complement_noise=False,
+                  sample_level=None, epochs=1, sigma=None,
                   positive_noise_correlation=False,
                   dp_sat_mode="none", rho_sat=0.001, dp_epochs=None,
                   lr=1e-3, public_loader=None, rehearsal_lambda=1.0):
@@ -293,17 +293,14 @@ def train_with_dp(model, train_loader, fisher,
     Train with Fisher-informed DP-SGD
     
     Args:
-        clip_radius: Target Euclidean sensitivity Δ₂ (same as vanilla DP-SGD for fair comparison).
-                    This will be converted to appropriate Mahalanobis threshold internally.
+        clip_radius: Target Euclidean clip radius Δ₂ (same as vanilla DP-SGD for fair comparison).
+                    This is used only to calibrate a Fisher radius (public-only), which is then used for Fisher clipping.
         sample_level: If True, use sample-level DP (clip per sample).
                      If False, use user-level DP (clip per user).
                      If None, auto-detect from batch structure.
         epochs: Number of training epochs (for privacy accounting)
         sigma: If provided, use this sigma directly (for proper privacy accounting).
                If None, compute sigma from epsilon using legacy method.
-        full_complement_noise: If True, add full noise to orthogonal complement.
-                              If False, only add noise in Fisher subspace.
-                              Setting to False preserves curvature-aware benefits.
         positive_noise_correlation: If False (default), use negatively correlated noise (noise ∝ 1/√λ).
                                    If True, use positively correlated noise (noise ∝ √λ).
         dp_sat_mode: "none" (default), "euclidean" (Euclidean DP-SAT), "fisher" (Fisher DP-SAT).
@@ -323,31 +320,20 @@ def train_with_dp(model, train_loader, fisher,
     lam, U       = topk_eigh_with_floor(fisher, k=k, lam_floor=lam_floor)
     lam, U       = lam.to(device), U.to(device)
     
-    # Compute both scaling factors
-    inv_sqrt_lam = lam.rsqrt()  # 1/√λ (negatively correlated: less noise in high curvature)
-    sqrt_lam = lam.sqrt()       # √λ (positively correlated: more noise in high curvature)
-    
-    # Choose noise scaling strategy
-    if positive_noise_correlation:
-        noise_scaling = sqrt_lam
-        strategy_name = "Positively correlated noise (noise ∝ √λ)"
-    else:
-        noise_scaling = inv_sqrt_lam
-        strategy_name = "Negatively correlated noise (noise ∝ 1/√λ, default)"
+    # Aligned Fisher DP-SGD (paper default):
+    #   - Clip in Fisher norm: ||g||_F = || sqrt(Λ) U^T g ||_2
+    #   - Add noise with covariance ∝ F^{-1}: in eigen-coordinates, scale by 1/sqrt(λ)
+    inv_sqrt_lam = lam.rsqrt()
+    sqrt_lam = lam.sqrt()
 
-    if full_complement_noise:
-        before_min = float(noise_scaling.min().item())
-        noise_scaling = maybe_apply_noise_floor(noise_scaling, full_complement_noise=True, floor=1.0)
-        after_min = float(noise_scaling.min().item())
-        if after_min > before_min + 1e-12:
-            logger.info("   • Noise floor applied: min scaling %.4f → %.4f (floor=1.0)", before_min, after_min)
-        else:
-            logger.info("   • Noise floor check: min scaling %.4f (no clamp needed)", after_min)
-    else:
-        logger.warn("   • Full complement noise disabled: subspace-only noise may not match standard DP accountant (non-strict DP).")
-    
-    # Clipping always uses inverse scaling to maintain consistent Mahalanobis norm definition
-    clip_scaling = inv_sqrt_lam
+    if positive_noise_correlation:
+        raise ValueError(
+            "positive_noise_correlation is not supported in mechanism-aligned Fisher DP-SGD. "
+            "Keep it disabled for standard accountant claims."
+        )
+
+    # For calibration and clipping we pass sqrt_lam so the clipped norm is ||g||_F.
+    clip_scaling = sqrt_lam
     
     # Privacy accounting
     if sigma is not None:
@@ -389,16 +375,16 @@ def train_with_dp(model, train_loader, fisher,
             sample_level = unique_users.numel() > 1
     
     mode_str = "Sample-level" if sample_level else "User-level"
-    logger.highlight(f"Fisher DP-SGD config: {mode_str} DP  layers={target_layer}  ε={epsilon}")
+    logger.highlight(f"Fisher DP-SGD config (subspace-only): {mode_str} DP  layers={target_layer}  ε={epsilon}")
     if sigma is not None:
         logger.info("   • Proper privacy accounting: σ=%.4f", sigma)
     else:
         logger.info("   • Multi-epoch privacy: T=%s, σ_single=%.3f, σ_adjusted=%.3f", epochs, sigma_single_epoch, sigma)
-    logger.info("   • Fisher subspace: k=%s, complement dim=%s", actual_k, param_dim - actual_k)
-    logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f (will convert to Mahalanobis)", clip_radius)
-    logger.info("   • Full-space L2 clipping: enabled (Δ₂ bound)")
-    logger.info("   • Full complement noise: %s", full_complement_noise)
-    logger.info("   • Noise scaling strategy: %s", strategy_name)
+    logger.info("   • Fisher subspace: k=%s, DP param dim=%s", actual_k, param_dim)
+    logger.info("   • Target Euclidean clip radius (vanilla Δ₂): %.3f (used only to calibrate Fisher radius)", clip_radius)
+    logger.info("   • Private updates: projected into span(U) (no complement updates)")
+    logger.info("   • Clipping norm: Fisher (F) norm, ||sqrt(Λ) U^T g||₂")
+    logger.info("   • Noise: covariance ∝ F^{-1} (eigen scaling 1/sqrt(λ)), multiplier σ")
     
     if dp_sat_mode != "none":
         logger.info("   • DP-SAT enabled: mode=%s, ρ=%s", dp_sat_mode, rho_sat)
@@ -434,8 +420,8 @@ def train_with_dp(model, train_loader, fisher,
         sample_level,
         device,
     )
-    calibration_computed = True  # Avoid private-data calibration in the training loop
-    
+    calibration_computed = True  # Avoid any private-data calibration in the training loop
+
     # Initialize previous step's noisy gradient for DP-SAT
     g_prev_priv = None
 
@@ -443,6 +429,30 @@ def train_with_dp(model, train_loader, fisher,
     if dp_epochs is None:
         dp_epochs = max(1, int(math.ceil(epochs / 10)))
     logger.info("   • DP finetuning epochs: %s (requested %s)", dp_epochs, epochs)
+
+    # Reporting-only ε from standard accountant using (σ, q, T).
+    # The linear transform argument applies because (U, Λ) are computed from public data.
+    if sample_level:
+        batch_size = getattr(train_loader, "batch_size", None)
+        q = float(batch_size) / float(len(train_loader.dataset)) if batch_size else 0.0
+    else:
+        num_users = getattr(getattr(train_loader, "dataset", None), "num_users", None)
+        q = 1.0 / float(num_users) if num_users else float(len(train_loader)) / float(len(train_loader.dataset))
+    total_steps = int(dp_epochs) * int(len(train_loader))
+    eps_report = compute_actual_epsilon(
+        noise_multiplier=float(sigma),
+        sample_rate=float(q),
+        steps=int(total_steps),
+        target_delta=float(delta),
+    )
+    logger.info(
+        "   • Accounting (reporting): σ=%.4f, q=%.6f, steps=%s → ε≈%.4f at δ=%.1e",
+        float(sigma),
+        float(q),
+        int(total_steps),
+        float(eps_report),
+        float(delta),
+    )
 
     for epoch in range(dp_epochs):
         # Reset public loader iterator each epoch
@@ -484,91 +494,57 @@ def train_with_dp(model, train_loader, fisher,
             losses = F.cross_entropy(logits, labels, reduction="none")
 
             if sample_level:
-                # SAMPLE-LEVEL DP: Compute per-sample gradients
-                per_g = []
+                # SAMPLE-LEVEL DP (subspace-only): project, clip in Fisher norm, then average.
+                alpha_list = []
                 for i in range(batch_size):
                     gi = grad(losses[i], params, retain_graph=True)
-                    per_g.append(torch.cat([g.view(-1) for g in gi]).detach())
-                per_g = torch.stack(per_g)
-
-                # Full-space L2 clipping (DP sensitivity bound)
-                for i in range(per_g.size(0)):
-                    per_g[i], _ = l2_clip(per_g[i], euclidean_target)
-
-                # Mahalanobis clipping with calibrated threshold
-                for i in range(per_g.size(0)):
-                    per_g[i], nrm = maha_clip(per_g[i], U, clip_scaling, actual_radius)
-                    grad_norm.append(nrm)
-                g_bar = per_g.mean(0)
+                    g_flat = torch.cat([g.view(-1) for g in gi]).detach()
+                    alpha = U.T @ g_flat
+                    f_norm = (sqrt_lam * alpha).norm() + 1e-10
+                    if f_norm > actual_radius:
+                        alpha = alpha * (actual_radius / f_norm)
+                    grad_norm.append(float(f_norm.item()))
+                    alpha_list.append(alpha)
+                alpha_bar = torch.stack(alpha_list).mean(0)
 
             else:
-                # USER-LEVEL DP: Compute gradient per user (more robust approach)
-                user_gradients = []
+                # USER-LEVEL DP (subspace-only): aggregate per user, then project+clip in Fisher norm.
+                alpha_users = []
                 unique_users = torch.unique(user_ids) if user_ids is not None else [0]
-                
+
                 for uid in unique_users:
                     if user_ids is not None:
                         mask = (user_ids == uid)
                         user_losses = losses[mask]
                     else:
-                        # If no user_ids (shouldn't happen in user-level mode), treat all as one user
                         user_losses = losses
-                        mask = torch.ones_like(losses, dtype=torch.bool)
-                    
-                    # Compute gradient of user's total loss: ∇_θ ∑_{i ∈ user} ℓ(x_i, y_i, θ)
+
                     user_total_loss = user_losses.sum()
                     user_grad = grad(user_total_loss, params, retain_graph=True)
-                    user_grad_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
-                    user_gradients.append(user_grad_flat)
-                    
-                # In user-level DP with UserBatchSampler, we should have exactly one user per batch
-                if len(user_gradients) != 1:
-                    logger.warn("Expected 1 user per batch, got %s users", len(user_gradients))
+                    g_flat = torch.cat([g.view(-1) for g in user_grad]).detach()
+                    alpha = U.T @ g_flat
+                    f_norm = (sqrt_lam * alpha).norm() + 1e-10
+                    if f_norm > actual_radius:
+                        alpha = alpha * (actual_radius / f_norm)
+                    grad_norm.append(float(f_norm.item()))
+                    alpha_users.append(alpha)
+
+                if len(alpha_users) != 1:
+                    logger.warn("Expected 1 user per batch, got %s users", len(alpha_users))
                     logger.warn("   Unique users in batch: %s", unique_users.tolist())
-                
-                # Full-space L2 clipping (DP sensitivity bound)
-                clipped_user_grads = []
-                for user_grad_flat in user_gradients:
-                    user_grad_flat, _ = l2_clip(user_grad_flat, euclidean_target)
-                    clipped_user_grads.append(user_grad_flat)
 
-                # Clip each user's gradient in Mahalanobis norm
-                user_gradients = clipped_user_grads
-                clipped_user_grads = []
-                for user_grad_flat in user_gradients:
-                    clipped_grad, user_norm = maha_clip(user_grad_flat, U, clip_scaling, actual_radius)
-                    grad_norm.append(user_norm)
-                    clipped_user_grads.append(clipped_grad)
-                
-                # Average across users in batch (should be just one user for UserBatchSampler)
-                g_bar = torch.stack(clipped_user_grads).mean(0)
+                alpha_bar = torch.stack(alpha_users).mean(0)
 
             # ============================================================
-            # TWO-COMPONENT NOISE: Fisher subspace + orthogonal complement
+            # Subspace-only Fisher DP noise (mechanism-aligned):
+            #   - Clip in Fisher norm (actual_radius)
+            #   - Add noise with covariance ∝ F^{-1}
+            #   - Update is projected into span(U)
             # ============================================================
-            
-            # 1. Low-rank noise in Fisher subspace (anisotropic)
-            z_fisher = torch.randn(actual_k, device=device)
-            fisher_noise = U @ (z_fisher * noise_scaling) * sigma * actual_radius
-            
-            if full_complement_noise:
-                # 2. Complement noise in orthogonal subspace (isotropic)
-                # Generate noise in full space, then project to orthogonal complement
-                z_full = torch.randn_like(g_bar)
-                z_complement = z_full - U @ (U.T @ z_full)  # Project to complement: (I - UU^T)z
-                
-                # Scale complement noise properly: σΔ (not divided by √P)
-                complement_noise = z_complement * sigma * actual_radius
-                
-                # Total noise = Fisher subspace noise + complement noise
-                total_noise = fisher_noise + complement_noise
-                complement_noise_norm = complement_noise.norm().item()
-            else:
-                # Only Fisher subspace noise (preserves curvature-aware benefits)
-                total_noise = fisher_noise
-                complement_noise_norm = 0.0
-            
-            g_priv = g_bar + total_noise
+            z = torch.randn(actual_k, device=device)
+            alpha_noise = (z * inv_sqrt_lam) * float(sigma) * float(actual_radius)
+            alpha_priv = alpha_bar + alpha_noise
+            g_priv = U @ alpha_priv
             
             # ============================================================
             # DP-SAT: Sharpness-Aware Optimization
@@ -585,9 +561,7 @@ def train_with_dp(model, train_loader, fisher,
             # Store current noisy gradient for next iteration
             g_prev_priv = g_priv.clone().detach()
             
-            # Track noise components
-            fisher_noise_norm = fisher_noise.norm().item()
-            total_noise_norm = total_noise.norm().item()
+            total_noise_norm = float((U @ alpha_noise).norm().item())
             noise_l2.append(total_noise_norm)
 
             # ============================================================
@@ -635,20 +609,13 @@ def train_with_dp(model, train_loader, fisher,
                 idx += n
             opt.step()
 
-    grad_type = "‖g_user‖_Mah" if not sample_level else "‖g‖_Mah"
+    grad_type = "‖g_user‖_F" if not sample_level else "‖g‖_F"
     logger.info("Fisher DP-SGD final stats:")
-    logger.info("   • Target Euclidean sensitivity: Δ₂ = %.3f (same as vanilla DP-SGD)", euclidean_target)
-    logger.info("   • Calibrated Mahalanobis threshold: %.3f", actual_radius)
+    logger.info("   • Target Euclidean clip radius (vanilla Δ₂): %.3f", euclidean_target)
+    logger.info("   • Calibrated Fisher radius (||g||_F bound): %.3f", actual_radius)
     logger.info("   • Median %s = %.2f", grad_type, np.median(grad_norm))
     logger.info("   • Total noise ℓ₂ ∈ [%.1f,%.1f]", min(noise_l2), max(noise_l2))
-    if len(noise_l2) > 0:
-        last_idx = len(noise_l2) - 1
-        if full_complement_noise:
-            logger.info("   • Last batch noise components: Fisher=%.1f, Complement=%.1f", fisher_noise_norm, complement_noise_norm)
-        else:
-            logger.info("   • Last batch noise: Fisher only=%.1f (complement disabled)", fisher_noise_norm)
     logger.info("   • Privacy: (ε=%s, δ=%s) over %s DP epochs", epsilon, delta, dp_epochs)
-    logger.success("Fair comparison: same noise scale σ×Δ=%.3f as vanilla DP-SGD", sigma * actual_radius)
-    logger.success("Noise scaling fixed: using actual_radius for noise (not euclidean_target)")
+    logger.info("   • Noise multiplier: σ=%.4f; Fisher radius C_F=%.3f; noise std in transformed space: σ×C_F=%.3f", float(sigma), float(actual_radius), float(sigma) * float(actual_radius))
 
     return model

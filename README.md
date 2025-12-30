@@ -20,7 +20,7 @@ At a fixed privacy target \((\varepsilon,\delta)\), the DP-SGD mechanism is stil
 Our "free-lunch utility" improvements are achieved via *geometry* and *post-processing*:
 
 - **Fisher-DP-SGD (training-time geometry)**  
-  Replace Euclidean clipping + isotropic noise with **Mahalanobis clipping in a Fisher metric** and **anisotropic noise** aligned with \(F^{-1}\) (implemented via low-rank eigenpairs).
+  Replace Euclidean clipping + isotropic noise with **Fisher-metric (F-norm) clipping** and **anisotropic Gaussian noise** aligned with \(F^{-1}\) (implemented via low-rank public eigenpairs) using subspace-only private updates.
 
 - **DP-SAT (optimizer-time post-processing / sharpness awareness)**  
   Use the **previous privatized gradient** to define a perturbation direction or a flatness term. Since it is computed from DP outputs, it is **privacy-free post-processing** and consumes no additional budget. Supports both **exact** (weight perturbation) and **approximate** (gradient addition) methods.
@@ -234,8 +234,8 @@ uv run scripts/plot_privacy_profile.py \
 The script rebuilds the same private/public splits as the ablation runners, computes the implied sampling rate and steps, and then plots ε(δ) with a highlighted marker at the target δ.
 
 Important accounting notes:
-- The privacy profile uses only the subsampled Gaussian mechanism parameters (q, T, C, sigma). Extra implementation details such as `--full-complement-noise`, DP-SAT, Fisher shaping, or calibration do not change the accountant curve and can only make privacy stronger in practice.
-- The plot is valid only if the implemented step matches the assumed mechanism. If `--full-complement-noise` is disabled, DP correctness requires subspace-only updates (or otherwise bounding complement sensitivity); if complement updates are allowed, enable full complement noise to keep the per-step sensitivity bounded by C.
+- For DP-SGD-style mechanisms, the standard subsampled-Gaussian accountant depends on the noise multiplier σ (noise std / sensitivity), sampling rate q, total steps T, and δ. The absolute product “σ × C” is the *implemented* noise std given a chosen clipping bound C, but ε is determined by σ, q, and T.
+- The plot is valid only if the implemented step matches the assumed mechanism (same σ, q, T). DP-SAT, public rehearsal, and IF-calibration are post-processing / public-only additions and do not consume additional privacy budget.
 - User-level subsampling nuance: for “one user per step” training, a standard Poisson-subsampling approximation would use `q_user = 1 / num_users` and `T = dp_epochs × num_users`. In this repo’s current ablation runners and plotter we instead use an “effective” rate `q_eff = len(priv_loader) / len(priv_base)` (typically `num_users / num_private_samples`). This can be larger than `q_user` and therefore yields a more conservative (higher-noise) accountant solution for a fixed target ε. If you want the most standard reporting, use Poisson user subsampling (`q_user`) and state it explicitly (recommended for papers).
 
 
@@ -305,13 +305,12 @@ Use **sample-level DP** if you care about individual examples, and **user-level 
 - **`--k` (Fidelity)**: Sets the rank of the Fisher approximation within that scope.
   - **Constraint**: $k \le P$ (automatically clamped if larger).
   - **Tradeoff**: Higher $k$ captures more curvature information but requires more memory/compute. Lower $k$ is faster but uses a coarser approximation.
-  - **Noise magnitude**: By default, Fisher DP adds noise **only in the Fisher subspace** (top-$k$ directions), so noise ℓ₂ norm scales like $\sqrt{k} \times \sigma \times C$ instead of $\sqrt{P} \times \sigma \times C$ (vanilla DP-SGD). This makes Fisher DP's noise **much smaller** (e.g., $\sqrt{512}$ vs $\sqrt{20000}$ ≈ **6× smaller**), which can lead to better utility but makes direct comparison with vanilla DP-SGD less fair.
+  - **Update/noise subspace**: Mechanism-aligned Fisher DP-SGD confines the private update to the public Fisher subspace `span(U)` (rank `k`) within the chosen DP scope. The orthogonal complement is untouched by the private mechanism.
 
-**For fairer comparison with vanilla DP-SGD**: Use `--full-complement-noise` to add isotropic noise in the **orthogonal complement** (remaining $P-k$ dimensions) in addition to the Fisher subspace noise. This makes total noise magnitude similar to vanilla DP-SGD ($\sqrt{P} \times \sigma \times C$) while still preserving curvature-aware benefits in the Fisher subspace. The tradeoff: utility may drop closer to vanilla levels, but privacy accounting becomes more aligned with standard DP-SGD mechanisms.
-
-**Accounting-safe noise floor**: When `--full-complement-noise` is enabled, the Fisher subspace scaling is floored at 1.0 so that **no direction receives less noise than isotropic**. This guarantees total noise covariance dominates $(\sigma C)^2 I$, making the Opacus subsampled-Gaussian accountant valid without a bespoke elliptical accountant.
-
-**Important**: Fisher DP uses **norm calibration** to ensure fair comparison. The `--clip-radius` argument sets the target Euclidean sensitivity Δ₂ (same as vanilla DP-SGD). During training, the code calibrates a Mahalanobis threshold (`actual_radius`) using **public data only** (e.g., the public pretrain split) and then applies that threshold throughout DP fine-tuning. Both clipping and noise scaling use this calibrated `actual_radius` to ensure the same privacy-utility tradeoff as vanilla DP-SGD.
+**Mechanism-aligned Fisher DP-SGD (paper default)**:
+- **Subspace-only private updates**: each noisy private update is projected into the public Fisher subspace `span(U)` (top-k eigenvectors). This makes complement sensitivity exactly 0 for the private mechanism.
+- **Clipping ↔ noise alignment**: we clip in the **Fisher (F) norm** and add Gaussian noise with covariance proportional to **F⁻¹**, which becomes a standard isotropic Gaussian mechanism after a fixed public linear transform. This supports using a standard subsampled-Gaussian RDP accountant with the same σ.
+- **Norm calibration for fair comparison**: `--clip-radius` still denotes the target *Euclidean* clip radius Δ₂ used by vanilla DP-SGD. Fisher DP uses public-only calibration to choose an F-norm radius `C_F` so that the Fisher clipping rate matches the Euclidean clipping rate measured on public gradients. Privacy accounting uses the noise multiplier σ (and q, T), not a conversion to a Euclidean “σ_eff”.
 
 ### Advanced Features
 ```bash
