@@ -1,11 +1,10 @@
 #!/bin/bash
 #SBATCH --account=project_462001050  # project account to bill 
 #SBATCH --partition=standard-g         # other options are small-g and standard-g
-#SBATCH --gpus-per-node=8            # Use all available GPUs on the node
+#SBATCH --gpus-per-node=4            # Use all available GPUs on the node
 #SBATCH --ntasks-per-node=1          # Single task controlling multiple GPUs
-#SBATCH --cpus-per-task=56           # Allocate full CPU socket per node for 8 GPUs
-#SBATCH --nodes=1
-#SBATCH --mem=240G            # CPU RAM per GPU (GPU memory is always 64GB per GPU)
+#SBATCH --cpus-per-task=28           # Allocate full CPU socket per node for 8 GPUs
+#SBATCH --mem-per-gpu=60G            # CPU RAM per GPU (GPU memory is always 64GB per GPU)
 #SBATCH --time=8:00:00               # time limit
 
 # this module facilitates the use of singularity containers on LUMI
@@ -20,7 +19,7 @@ ENV=${RESOURCE_DIR}/ifdp-venv/bin/activate
 singularity exec "${SIF}" \
     bash -lc  "\$WITH_CONDA  &&\
         source ${ENV} &&\
-        python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=8 ablation.py \
+        python -m debugpy --listen 0.0.0.0:5678 --wait-for-client  ablation.py \
             --model-type vit \
             --dataset cifar10 \
             --k 512 \
@@ -40,4 +39,6 @@ singularity exec "${SIF}" \
             --non-iid \
             --full-complement-noise \
             --reg 10\
-            --combined-steps 10"
+            --combined-steps 10\
+            --multi-gpu\
+            --cuda-devices 0,1,2,3"

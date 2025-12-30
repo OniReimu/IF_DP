@@ -126,35 +126,54 @@ def compute_fisher(model, dataloader, device,
 # ============================================================
 # 2.  Top-k eigendecomposition with numeric floor
 # ============================================================
-def topk_eigh_with_floor(mat: torch.Tensor,
-                         k: int = 128,
-                         lam_floor: float = 5e-1):
-    # Ensure k doesn't exceed matrix size
-    actual_k = min(k, mat.shape[0])
-    logger.info("Compute top-%s eigenpairs (requested %s), λ_floor = %s", actual_k, k, lam_floor)
-    
-    mat_cpu = mat.cpu().numpy()
-    try:
-        start   = max(0, mat.shape[0]-actual_k)
-        lam, U  = eigh(mat_cpu, subset_by_index=[start, mat.shape[0]-1])
-        lam, U  = lam[::-1].copy(), U[:, ::-1].copy()    # descending order
-        lam     = np.maximum(lam, lam_floor)
-    except Exception as e:
-        logger.warn("eigh failed (%s) – using diagonal fallback", e)
-        diag  = np.diag(mat_cpu)
-        idx   = np.argpartition(-diag, actual_k)[:actual_k]
-        lam   = np.maximum(diag[idx], lam_floor)
-        U     = np.zeros((mat.shape[0], actual_k))
-        for i,j in enumerate(idx): U[j,i]=1.0
-    
-    # Ensure we have the right number of eigenvalues and eigenvectors
-    actual_returned_k = len(lam)
-    if actual_returned_k != actual_k:
-        logger.warn("Returned %s eigenpairs instead of requested %s", actual_returned_k, actual_k)
-    
-    logger.info("Eigenvalue range: [%.3f, %.3f] (got %s eigenpairs)", lam[-1], lam[0], len(lam))
-    return torch.from_numpy(lam).float(), torch.from_numpy(U).float()
 
+def topk_eigh_with_floor_gpu(mat: torch.Tensor,
+                             k: int = 128,
+                             lam_floor: float = 5e-1):
+    """
+    GPU optimized version of top-k eigen decomposition.
+    """
+    device = mat.device
+    n = mat.shape[0]
+    actual_k = min(k, n)
+    
+    logger.info("GPU Compute top-%s eigenpairs (requested %s), λ_floor = %s", actual_k, k, lam_floor)
+    
+    try:
+        # torch.linalg.eigh 返回升序排列的特征值 (ascending)
+        # 注意：这里会计算完整的 n*n 分解，对于超大矩阵需注意显存
+        lam, U = torch.linalg.eigh(mat)
+        
+        # 截取最后的 actual_k 个（即最大的特征值）
+        # 然后翻转进入降序模式 (descending)
+        lam_top = lam[-actual_k:].flip(dims=[0])
+        U_top = U[:, -actual_k:].flip(dims=[1])
+        
+        # 截断最小值 (Floor)
+        lam_top = torch.clamp(lam_top, min=lam_floor)
+        
+        # 为了保持一致性，如果需要释放中间的大变量，可以考虑 del lam, U
+        
+    except Exception as e:
+        logger.warn("GPU eigh failed (%s) – using diagonal fallback", e)
+        # 回退逻辑：提取对角线
+        diag = torch.diagonal(mat)
+        # 获取 Top-K 的索引
+        vals, idx = torch.topk(diag, actual_k, sorted=True)
+        
+        lam_top = torch.clamp(vals, min=lam_floor)
+        
+        # 构造稀疏的基向量矩阵
+        U_top = torch.zeros((n, actual_k), device=device)
+        U_top.scatter_(0, idx.unsqueeze(0).expand(n, -1), 0) # 初始化零
+        # 将对应位置设为 1.0
+        U_top[idx, torch.arange(actual_k, device=device)] = 1.0
+    
+    logger.info("Eigenvalue range: [%.3f, %.3f] (got %s eigenpairs)", 
+                lam_top[-1].item(), lam_top[0].item(), len(lam_top))
+    
+    return lam_top.float(), U_top.float()
+    
 # ============================================================
 # 3.  Fisher-metric clipping helpers
 # ============================================================
