@@ -127,7 +127,7 @@ def compute_fisher(model, dataloader, device,
 # 2.  Top-k eigendecomposition with numeric floor
 # ============================================================
 
-def topk_eigh_with_floor_gpu(mat: torch.Tensor,
+def topk_eigh_with_floor(mat: torch.Tensor,
                              k: int = 128,
                              lam_floor: float = 5e-1):
     """
