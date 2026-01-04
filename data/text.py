@@ -10,7 +10,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
-
+from .common import SyntheticUserDataset, UserBatchSampler
 from .base import (
     DatasetBuilder,
     DatasetConfig,
@@ -37,7 +37,12 @@ def _build_loader(dataset, *, batch_size: int, shuffle: bool) -> DataLoader:
 
 
 def _build_private_loader(private_subset: Dataset, config: DatasetConfig) -> DataLoader:
-    return _build_loader(private_subset, batch_size=config.batch_size, shuffle=True)
+    if config.sample_level:
+        return DataLoader(private_subset, batch_size=config.batch_size, shuffle=True)
+    synthetic = SyntheticUserDataset(private_subset, config.num_users)
+    sampler = UserBatchSampler(synthetic.uid)
+    return DataLoader(synthetic, batch_sampler=sampler)
+
 
 
 class HFTextClassificationDataset(Dataset):

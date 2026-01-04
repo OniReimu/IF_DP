@@ -81,7 +81,9 @@ def split_private_public_calibration_indices(
     public_ratio = float(public_ratio)
     if not (0.0 <= public_ratio <= 1.0):
         raise ValueError("--public-ratio must be in [0, 1]")
-
+    # total_size = 500
+    # private_size = 100
+    # calibration_size = 100
     # Use a seeded permutation so splits match the randomized strategy.
     rng = np.random.RandomState(int(seed))
     perm = rng.permutation(total_size)

@@ -21,23 +21,23 @@ singularity exec "${SIF}" \
     bash -lc  "\$WITH_CONDA  &&\
         source ${ENV} &&\
         python -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=8 ablation.py \
-            --model-type vit \
-            --dataset cifar10 \
             --k 512 \
             --epochs 100 \
             --target-epsilon 0.5 \
             --delta 1e-5 \
-            --dp-layer module.backbone.heads \
-            --clip-radius 2.0 \
+            --dp-layer module.backbone.head\
+            --model-type vit \
+            --dataset cifar100\
+            --clip-radius 3.0 \
             --run-mia \
-            --users 200 \
+            --user 200 \
             --calibration-k 400 \
             --dp-sat-mode fisher \
             --dp-epochs 10 \
             --shadow-epochs 10 \
-            --dp-lr 1e-2 \
-            --public-pretrain-exclude-classes 0,1 \
             --non-iid \
-            --full-complement-noise \
-            --reg 10\
-            --combined-steps 10"
+            --public-pretrain-exclude-classes 0,1 \
+            --dp-lr 5e-2 \
+            --reg 10 \
+            --combined-steps 10
+            --rehearsal-lambda 1"

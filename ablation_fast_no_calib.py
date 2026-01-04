@@ -1805,7 +1805,7 @@ def main():
     parser.add_argument('--mps', action='store_true')
     parser.add_argument('--cuda-id', type=int)
     parser.add_argument('--cpu', action='store_true')
-    parser.add_argument('--cuda-devices', type=str, default=None,
+    parser.add_argument('--cuda-devices', type=str, default=0,
                        help='Comma-separated CUDA device ids for multi-GPU execution (e.g., "0,1,2")')
     parser.add_argument('--multi-gpu', action='store_true',
                        help='Enable torch.nn.DataParallel across the requested CUDA devices')
