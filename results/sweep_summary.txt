@@ -1,0 +1,10 @@
+Sweep started at: Wed Jan  7 18:12:21 Asia 2026
+==================================================
+k        clip     users    dp_epochs  dp_lr      lambda       | Vanilla_DP         Vanilla_SAT        Fisher             Fisher_SAT         | Status    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+512      3.0      10       10         1e-2       0.5          | 12.64(DP-SGD)      21.02(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      10       10         1e-2       1.0          | 16.70(DP-SGD)      29.26(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      10       10         5e-2       0.5          | 11.58(DP-SGD)      18.50(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      10       10         5e-2       1.0          | 15.71(DP-SGD)      27.97(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      10       20         1e-2       0.5          | 18.33(DP-SGD)      24.61(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      10       20         1e-2       1.0          | 26.33(DP-SGD)      31.03(DP-SAT)      N/A                N/A                | SUCCESS   

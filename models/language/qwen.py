@@ -12,7 +12,7 @@ class QwenSequenceClassifier(ModelBase):
     def __init__(
         self,
         num_labels: int = 2,
-        checkpoint: str = "Qwen/Qwen2.5-0.5B",
+        checkpoint: str = "Qwen/Qwen2-0.5B",
         trust_remote_code: bool = True,
     ) -> None:
         super().__init__(

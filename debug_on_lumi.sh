@@ -19,7 +19,7 @@ ENV=${RESOURCE_DIR}/ifdp-venv/bin/activate
 singularity exec "${SIF}" \
     bash -lc  "\$WITH_CONDA  &&\
         source ${ENV} &&\
-        python  ablation_fast_no_calib.py \
+        python  ablation.py \
             --k 512 \
             --epochs 100 \
             --target-epsilon 0.5 \
@@ -39,4 +39,5 @@ singularity exec "${SIF}" \
             --dp-lr 5e-2 \
             --reg 10 \
             --combined-steps 10\
-            --rehearsal-lambda 1"
+            --rehearsal-lambda 1\
+            --method public-fisher"

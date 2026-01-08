@@ -1,0 +1,43 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+      {
+          "name": "Python: Ablation Research (IF Calibration)",
+          "type": "debugpy",
+          "request": "launch",
+          "program": "${file}", 
+          "console": "integratedTerminal",
+          "justMyCode": false, // 设置为 false 以便调试进入 torch 或其他库源码
+          "env": {
+              "PYTHONPATH": "${workspaceFolder}",
+              "CUDA_VISIBLE_DEVICES": "0",
+              "DEBUG_MODE": "true",
+              "LOG_PATH": "${workspaceFolder}/debug_log.txt",
+              "HF_ENDPOINT": "https://hf-mirror.com",
+              "HF_HOME": "/mnt/nas/suyanzhou.syz/Huggingface_Hub/hub"
+          },
+          "args": [
+              "--k", "512",
+              "--epochs", "100",
+              "--target-epsilon", "0.5",
+              "--delta", "1e-5",
+              "--dp-layer", "backbone.score",
+              "--dataset", "dbpedia_ontology",
+              "--model-type", "qwen",
+              "--clip-radius", "3.0",
+              "--run-mia",
+              "--user", "200",
+              "--calibration-k", "400",
+              "--dp-sat-mode", "fisher",
+              "--dp-epochs", "10",
+              "--shadow-epochs", "10",
+              "--non-iid",
+              "--public-pretrain-exclude-classes", "0,1",
+              "--dp-lr", "5e-2",
+              "--reg", "10",
+              "--combined-steps", "10",
+              "--rehearsal-lambda", "1"
+          ]
+      }
+  ]
+}

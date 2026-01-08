@@ -196,146 +196,168 @@ def compute_slice_gradient(model, crit_x, crit_y, device):
     F.cross_entropy(model(crit_x), crit_y, reduction='mean').backward()
     return {n: (p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p))
             for n, p in model.named_parameters()}
-
+import heapq
 # --------------------------------------------------------------
 # 2.  Influence-vector bank  H⁻¹ ∇ℓ(z)
 # --------------------------------------------------------------
-def compute_influence_vectors(model, public_loader, train_loader,
-                              device, method="linear",
-                              reg=0.1,  # ✨ PRIVACY-PRESERVING: Reduced regularization
-                              strict=True):
+
+def compute_top_influence_vectors(model, public_loader, J_flat, J_keys, device, eta=200, reg=10.0):
     """
     🔒 PRIVACY-PRESERVING: Compute influence vectors using ONLY public data and DP model.
-    
-    IMPORTANT: For post-processing theorem compliance, this function must NOT use
-    any statistics computed on the private training data (train_loader).
-    
-    Only 'linear' method is privacy-preserving. Other methods violate DP guarantees.
     """
-    # flatten public data to list[(x,y)]
-    public_samples = []
-    for batch_data in public_loader:
+  
+    top_heap = []
+    model.eval()
+    J_flat_device = J_flat.to(device)
+    
+    # Counter serves as a unique tie-breaker
+    push_count = 0 
+
+    # 遍历 public 数据
+    for batch_data in tqdm(public_loader, desc="Top-K Influence Mining"):
         x, y, _ = unpack_batch(batch_data)
+        x = move_to_device(x, device)
+        y = _ensure_tensor(y).to(device)
         batch_size = _infer_batch_size(x)
-        labels = _ensure_tensor(y)
 
         for i in range(batch_size):
             sample_x = _slice_feature(x, i)
-            sample_y = labels[i:i+1]
-            public_samples.append((
-                move_to_device(sample_x, device),
-                move_to_device(sample_y, device),
-            ))
-
-    infl_vecs = []
-
-    if method == "linear":                                 # -----------------
-        logger.info("Using privacy-preserving 'linear' method (reg=%s)", reg)
-        for x, y in tqdm(public_samples, desc="Privacy-preserving linear-IF"):
+            sample_y = y[i:i+1]
+            
+            # --- 1. 计算单样本梯度 ---
             model.zero_grad()
-            F.cross_entropy(model(x), y).backward()
-            vec = {}
+            loss = F.cross_entropy(model(sample_x), sample_y)
+            loss.backward()
+            
+            vec_parts = []
+            vec_dict = {}
             for n, p in model.named_parameters():
-                if p.grad is not None:
-                    g = p.grad.detach()
-                    # ✨ MORE CONSERVATIVE: Scale by (1 + ||g||) instead of ||g|| alone for stability
-                    g_norm = g.norm() + 1e-8
-                    scaling_factor = 1.0 + g_norm  # More conservative scaling
-                    vec[n] = (g / (scaling_factor * reg)).cpu()  # store on CPU to avoid MPS/GPU OOM
-                else:
-                    vec[n] = torch.zeros_like(p, device="cpu")
-            infl_vecs.append(vec)
+                if n in J_keys:
+                    if p.grad is not None:
+                        g = p.grad.detach()
+                        g_norm = g.norm() + 1e-8
+                        v = g / ((1.0 + g_norm) * reg)
+                        vec_dict[n] = v.cpu() 
+                        vec_parts.append(v.flatten())
+                    else:
+                        vec_dict[n] = torch.zeros_like(p).cpu()
+                        vec_parts.append(torch.zeros_like(p).flatten().to(device))
 
-    elif method == "public-fisher":                       # -----------------
-        logger.info("Using privacy-preserving 'public-fisher' method (reg=%s)", reg)
-        logger.info("   Computing Fisher information from PUBLIC data only")
+            # --- 2. 计算 Score ---
+            v_flat = torch.cat(vec_parts)
+            score = -torch.dot(J_flat_device, v_flat).item()
+
+            # --- 3. 维护堆 (Top-eta) ---
+            # 使用 push_count 作为 tie-breaker
+            # Tuple 结构: (score, push_count, vec_dict)
+            if len(top_heap) < eta:
+                heapq.heappush(top_heap, (score, push_count, vec_dict))
+            else:
+                # 堆顶是最小的 (Min-Heap)，如果当前 score 比堆顶大，则替换
+                if score > top_heap[0][0]:
+                    heapq.heapreplace(top_heap, (score, push_count, vec_dict))
+            
+            push_count += 1
+                    
+    # 按分数从大到小排序返回
+    top_heap.sort(key=lambda x: x[0], reverse=True)
+    
+    final_scores = [item[0] for item in top_heap]
+    # 注意：现在 vec_dict 在索引 2
+    final_vecs = [item[2] for item in top_heap] 
+    
+    return final_vecs, final_scores
+
+    # elif method == "public-fisher":                       # -----------------
+    #     logger.info("Using privacy-preserving 'public-fisher' method (reg=%s)", reg)
+    #     logger.info("   Computing Fisher information from PUBLIC data only")
         
-        # Use a smaller subset for Fisher computation to avoid memory issues
-        max_fisher_samples = min(100, len(public_samples))  # Much smaller for memory efficiency
-        fisher_samples = public_samples[:max_fisher_samples]
+    #     # Use a smaller subset for Fisher computation to avoid memory issues
+    #     max_fisher_samples = min(100, len(public_samples))  # Much smaller for memory efficiency
+    #     fisher_samples = public_samples[:max_fisher_samples]
         
-        logger.info("   Using %s public samples for Fisher matrix computation", max_fisher_samples)
+    #     logger.info("   Using %s public samples for Fisher matrix computation", max_fisher_samples)
         
-        # Compute Fisher matrix from public data only (privacy-preserving)
-        public_grads = []
-        for x, y in tqdm(fisher_samples, desc="Computing public Fisher"):
-            try:
-                model.zero_grad()
-                F.cross_entropy(model(x), y).backward()
-                grad_vec = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
-                public_grads.append(grad_vec.detach().cpu())  # Move to CPU to save GPU memory
-            except RuntimeError as e:
-                logger.warn("Error computing gradient: %s", e)
-                continue
+    #     # Compute Fisher matrix from public data only (privacy-preserving)
+    #     public_grads = []
+    #     for x, y in tqdm(fisher_samples, desc="Computing public Fisher"):
+    #         try:
+    #             model.zero_grad()
+    #             F.cross_entropy(model(x), y).backward()
+    #             grad_vec = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+    #             public_grads.append(grad_vec.detach().cpu())  # Move to CPU to save GPU memory
+    #         except RuntimeError as e:
+    #             logger.warn("Error computing gradient: %s", e)
+    #             continue
         
-        if len(public_grads) >= 10:  # Need minimum samples for stable Fisher
-            try:
-                G_public = torch.stack(public_grads)
-                dim = G_public.shape[1]
+    #     if len(public_grads) >= 10:  # Need minimum samples for stable Fisher
+    #         try:
+    #             G_public = torch.stack(public_grads)
+    #             dim = G_public.shape[1]
                 
-                # Add strong regularization for stability
-                fisher_public = (G_public.T @ G_public) / len(G_public) + reg * torch.eye(dim)
+    #             # Add strong regularization for stability
+    #             fisher_public = (G_public.T @ G_public) / len(G_public) + reg * torch.eye(dim)
                 
-                logger.info("   Public Fisher shape: %s", tuple(fisher_public.shape))
-                logger.success("Computed Fisher from %s public samples", len(public_grads))
+    #             logger.info("   Public Fisher shape: %s", tuple(fisher_public.shape))
+    #             logger.success("Computed Fisher from %s public samples", len(public_grads))
                 
-                # Compute influence vectors using public Fisher
-                for x, y in tqdm(public_samples[:200], desc="Public-Fisher influence vectors"):  # Limit total computations
-                    try:
-                        model.zero_grad()
-                        F.cross_entropy(model(x), y).backward()
-                        grad_vec = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]).cpu()
+    #             # Compute influence vectors using public Fisher
+    #             for x, y in tqdm(public_samples[:200], desc="Public-Fisher influence vectors"):  # Limit total computations
+    #                 try:
+    #                     model.zero_grad()
+    #                     F.cross_entropy(model(x), y).backward()
+    #                     grad_vec = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]).cpu()
                         
-                        # Solve: fisher_public * v = grad_vec
-                        try:
-                            influence_vec_flat = torch.linalg.solve(fisher_public, grad_vec.unsqueeze(1)).squeeze(1)
-                        except:
-                            # Fallback to pseudo-inverse if singular
-                            logger.warn("Using pseudo-inverse for stability")
-                            influence_vec_flat = torch.pinverse(fisher_public) @ grad_vec
+    #                     # Solve: fisher_public * v = grad_vec
+    #                     try:
+    #                         influence_vec_flat = torch.linalg.solve(fisher_public, grad_vec.unsqueeze(1)).squeeze(1)
+    #                     except:
+    #                         # Fallback to pseudo-inverse if singular
+    #                         logger.warn("Using pseudo-inverse for stability")
+    #                         influence_vec_flat = torch.pinverse(fisher_public) @ grad_vec
                         
-                        # Reconstruct parameter-wise influence vector
-                        vec = {}
-                        idx = 0
-                        for n, p in model.named_parameters():
-                            if p.grad is not None:
-                                n_params = p.numel()
-                                vec[n] = influence_vec_flat[idx:idx+n_params].view_as(p).to(device)
-                                idx += n_params
-                            else:
-                                vec[n] = torch.zeros_like(p)
-                        infl_vecs.append(vec)
-                    except Exception as e:
-                        logger.warn("Error in influence computation: %s", e)
-                        # Fallback: create zero influence vector
-                        vec = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
-                        infl_vecs.append(vec)
+    #                     # Reconstruct parameter-wise influence vector
+    #                     vec = {}
+    #                     idx = 0
+    #                     for n, p in model.named_parameters():
+    #                         if p.grad is not None:
+    #                             n_params = p.numel()
+    #                             vec[n] = influence_vec_flat[idx:idx+n_params].view_as(p).to(device)
+    #                             idx += n_params
+    #                         else:
+    #                             vec[n] = torch.zeros_like(p)
+    #                     infl_vecs.append(vec)
+    #                 except Exception as e:
+    #                     logger.warn("Error in influence computation: %s", e)
+    #                     # Fallback: create zero influence vector
+    #                     vec = {n: torch.zeros_like(p) for n, p in model.named_parameters()}
+    #                     infl_vecs.append(vec)
                         
-            except Exception as e:
-                logger.warn("Error computing public Fisher matrix: %s", e)
-                logger.warn("Falling back to linear method")
-                return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
-        else:
-            logger.warn("Insufficient public gradients (%s < 10), falling back to linear method", len(public_grads))
-            return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
+    #         except Exception as e:
+    #             logger.warn("Error computing public Fisher matrix: %s", e)
+    #             logger.warn("Falling back to linear method")
+    #             return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
+    #     else:
+    #         logger.warn("Insufficient public gradients (%s < 10), falling back to linear method", len(public_grads))
+    #         return compute_influence_vectors(model, public_loader, train_loader, device, method="linear", reg=reg, strict=strict)
 
-    elif method == "batch":                                # -----------------
-        raise ValueError(
-            f"🚨 PRIVACY VIOLATION: 'batch' method uses private training data statistics. "
-            f"This violates the post-processing theorem. Use method='linear' instead."
-        )
+    # elif method == "batch":                                # -----------------
+    #     raise ValueError(
+    #         f"🚨 PRIVACY VIOLATION: 'batch' method uses private training data statistics. "
+    #         f"This violates the post-processing theorem. Use method='linear' instead."
+    #     )
 
-    elif method == "original":                             # -----------------
-        raise ValueError(
-            f"🚨 PRIVACY VIOLATION: 'original' method uses private training data statistics. "
-            f"This violates the post-processing theorem. Use method='linear' instead."
-        )
+    # elif method == "original":                             # -----------------
+    #     raise ValueError(
+    #         f"🚨 PRIVACY VIOLATION: 'original' method uses private training data statistics. "
+    #         f"This violates the post-processing theorem. Use method='linear' instead."
+    #     )
 
-    else:                                                  # -----------------
-        raise ValueError(f"unknown method '{method}'. Choose 'linear' for privacy-preserving influence functions.")
+    # else:                                                  # -----------------
+    #     raise ValueError(f"unknown method '{method}'. Choose 'linear' for privacy-preserving influence functions.")
 
-    logger.success("Computed %s privacy-preserving influence vectors using only public data", len(infl_vecs))
-    return infl_vecs, public_samples
+    # logger.success("Computed %s privacy-preserving influence vectors using only public data", len(infl_vecs))
+    # return infl_vecs, public_samples
 
 # --------------------------------------------------------------
 # 3.  Trust-region scaling (shared util)
@@ -421,28 +443,23 @@ def calibrate_model_research_protocol(model,
     # Paper mapping — Step c(a): J = ∇_θ (1/m Σ_{s∈S_crit} ℓ(s, θ̂)) at the current θ̂
     J = compute_slice_gradient(model, crit_x, crit_y, device)
     J_flat = torch.cat([v.flatten() for v in J.values()])
-
+    J_keys = list(J.keys())
     # ---- b) influence vectors (PRIVACY-PRESERVING: only uses public data + DP model)
     # Paper mapping — Step c(b): v(z) ≈ H_{θ̂}^{-1} ∇_θ ℓ(z, θ̂) for z in the public pool
-    infl_vecs, public_samples = compute_influence_vectors(model, public_loader,
-                                             train_loader, device,
-                                             method=method, reg=reg, strict=strict)
-
-    # ---- c) influence scores: how much would adding each public sample help the evaluation slice?
-    # Paper mapping — Step c(c): α(z) = - J^T v(z).
-    # If J points to increasing loss and v(z) points to decreasing loss, then α(z) > 0 is helpful.
-    # Note: α(z) depends on current θ̂, so it must be recomputed after each update in the refinement loop.
-    scores = np.array([
-        -torch.dot(
-            J_flat,
-            torch.cat([v[n].flatten() for n in J.keys()]).to(J_flat.device)
-        ).item()
-        for v in infl_vecs
-    ])
+    infl_vecs, scores = compute_top_influence_vectors(
+        model, 
+        public_loader, 
+        J_flat, 
+        J_keys, 
+        device, 
+        eta=eta, 
+        reg=reg
+    )
 
     # ---- d) choose η most helpful samples 
     # Paper mapping — Step d(i): Initial selection via sparse re-weighting
     # ✨ Implementation: indicator weights by selecting the η largest (most helpful) α(z)
+    scores = np.array(scores)
     idx = np.argsort(scores)[-eta:]  # Select largest (most positive) scores
     w = np.zeros_like(scores)
     w[idx] = 1.0

@@ -1136,10 +1136,10 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         logger.info(f"   • Private data will ONLY be used for DP-training selected layers ({args.dp_layer if not args.dp_param_count else f'budget={args.dp_param_count}'})")
         
         # Stronger from-scratch recipe for public pretrain (no ImageNet weights)
-        base_lr = 0.1
-        weight_decay = 5e-4
+        base_lr = 1e-4 #0.1
+        weight_decay = 5e-5
         momentum = 0.9
-        opt_b = torch.optim.SGD(baseline.parameters(), lr=base_lr, momentum=momentum, weight_decay=weight_decay)
+        opt_b = torch.optim.AdamW(baseline.parameters(), lr=base_lr, weight_decay=weight_decay)
         
         # Cosine schedule over public pretrain epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=args.epochs)
