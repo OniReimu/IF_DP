@@ -10,3 +10,5 @@ datasets>=2.16.0
 sentencepiece>=0.1.99
 accelerate>=0.27.0
 cvxpy
+peft==0.17.1
+bitsandbytes

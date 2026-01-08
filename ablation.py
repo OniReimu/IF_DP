@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
+from peft import LoraConfig, get_peft_model, TaskType
 from torch.autograd import grad  # Required for per-sample gradients
 
 # Ensure project root on sys.path for direct script execution
@@ -650,8 +651,30 @@ def get_device(args):
 
 def build_model_for_device(model_type, model_kwargs, args, device):
     model = create_model(model_type, **model_kwargs)
-    model = maybe_wrap_model_for_multi_gpu(model, args)
-    return model.to(device)
+    if model_type in ["qwen", "llama"]:
+        logger.info(f"🚀 正在为 {model_type} 应用 LoRA 配置...")
+        
+
+        peft_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS, # 如果是分类任务
+            inference_mode=False,
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"] # 建议覆盖更多层以保证 Fisher 捕捉完整
+        )
+        
+        # 2. 包装 PEFT
+        model.backbone = get_peft_model(model.backbone, peft_config)
+        
+        # 3. 启用梯度检查点（LLM 必备，节省显存）
+        model.backbone.gradient_checkpointing_enable()
+        
+       
+        return model.to(device)
+    else:
+        model = maybe_wrap_model_for_multi_gpu(model, args)
+        return model.to(device)
 
 def accuracy(model, loader, device):
     model.eval(); tot=correct=0
@@ -1100,7 +1123,7 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         non_iid=args.non_iid,
     )
     legacy_pretrain_path = os.path.join(models_dir, f"Pretrain_{args.model_type}_{args.epochs}_public.pth")
-
+    from peft import set_peft_model_state_dict
     loaded_baseline = False
     if os.path.exists(pretrain_path) and not args.clean:
         logger.info(f'\n📥 Loading pretrained baseline from {pretrain_path}...')
@@ -1113,7 +1136,14 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             logger.warn(f"   ⚠️  Cache IID/non-IID mode mismatch: checkpoint={'non-IID' if ck_non_iid else 'IID'} vs requested={'non-IID' if args.non_iid else 'IID'}. Retraining baseline.")
         else:
             state_dict = checkpoint.get('model_state_dict', checkpoint)
-            load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline")
+            # --- 核心修改：针对 LoRA 的加载方式 ---
+            if checkpoint.get('is_lora', False) or args.model_type in ["qwen", "llama"]:
+                # 注意：baseline.backbone 必须已经是 get_peft_model 包装过的对象
+                set_peft_model_state_dict(baseline.backbone, state_dict)
+                logger.success(f"   ✅ Loaded LoRA adapters into {args.model_type} backbone")
+            else:
+                # 兼容原有非 LoRA 模型的加载
+                load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline")
             baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
             logger.success(f"   ✅ Loaded baseline (eval accuracy: {baseline_acc_cached})")
             loaded_baseline = True
@@ -1127,7 +1157,13 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
             logger.warn(f"   ⚠️  Legacy cache dataset mismatch: checkpoint={legacy_dataset} vs requested={args.dataset_name}. Skipping.")
         else:
             state_dict = checkpoint.get('model_state_dict', checkpoint)
-            load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline (legacy cache)")
+            if checkpoint.get('is_lora', False) or args.model_type in ["qwen", "llama"]:
+                # 注意：baseline.backbone 必须已经是 get_peft_model 包装过的对象
+                set_peft_model_state_dict(baseline.backbone, state_dict)
+                logger.success(f"   ✅ Loaded LoRA adapters into {args.model_type} backbone")
+            else:
+                # 兼容原有非 LoRA 模型的加载
+                load_state_dict_forgiving(baseline, state_dict, description="pretrained baseline (legacy cache)")
             baseline_acc_cached = checkpoint.get('accuracy', 'N/A')
             logger.success(f"   ✅ Loaded baseline from legacy cache (eval accuracy: {baseline_acc_cached})")
             loaded_baseline = True
@@ -1140,7 +1176,14 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         logger.info(f"   • Private data will ONLY be used for DP-training selected layers ({args.dp_layer if not args.dp_param_count else f'budget={args.dp_param_count}'})")
         
         # Stronger from-scratch recipe for public pretrain (no ImageNet weights)
-        base_lr = 1e-4 #0.1
+        if args.model_type == "qwen":
+            base_lr = 1e-4
+        elif args.model_type == 'efficientnet':
+            base_lr = 0.1
+        elif args.model_type == 'vit':
+            base_lr = 1e-4
+        else:
+            base_lr = 1e-4 
         weight_decay = 5e-5
         momentum = 0.9
         opt_b = torch.optim.AdamW(baseline.parameters(), lr=base_lr, weight_decay=weight_decay)
@@ -1161,20 +1204,37 @@ def run_ablation_study(args, device, priv_loader, eval_loader, priv_base, priv_i
         # Evaluate baseline accuracy on eval set
         baseline.eval()
         baseline_acc = accuracy(baseline, eval_loader, device)
-        
-        # Save pretrained baseline (dataset-scoped cache filename)
-        torch.save({
-            'model_state_dict': baseline.state_dict(),
-            'model_type': args.model_type,
-            'dataset_name': args.dataset_name,
-            'epochs': args.epochs,
-            'accuracy': baseline_acc,
-            'public_data_size': len(pub_loader.dataset),
-            'non_iid': args.non_iid,
-            'timestamp': __import__('time').strftime('%Y%m%d_%H%M%S')
-        }, pretrain_path)
-        logger.info(f"\n💾 Saved pretrained baseline to {pretrain_path}")
-        logger.info("   • Baseline accuracy: %.2f%%", baseline_acc)
+        if args.model_type == "qwen":
+            from peft import get_peft_model_state_dict
+
+            # 注意：fisher_baseline.backbone 是被 get_peft_model 包装后的模型
+            lora_state_dict = get_peft_model_state_dict(baseline.backbone)
+
+            torch.save({
+                'model_state_dict': lora_state_dict,  # 这里现在只包含几 MB 的 LoRA 权重
+                'model_type': args.model_type,
+                'dataset_name': args.dataset_name,
+                'epochs': args.epochs,
+                'accuracy': baseline_acc,
+                'public_data_size': len(pub_loader.dataset),
+                'non_iid': args.non_iid,
+                'is_lora': True,                      # 标记这是 LoRA 权重
+                'timestamp': __import__('time').strftime('%Y%m%d_%H%M%S')
+            }, pretrain_path)
+        else:
+            # Save pretrained baseline (dataset-scoped cache filename)
+            torch.save({
+                'model_state_dict': baseline.state_dict(),
+                'model_type': args.model_type,
+                'dataset_name': args.dataset_name,
+                'epochs': args.epochs,
+                'accuracy': baseline_acc,
+                'public_data_size': len(pub_loader.dataset),
+                'non_iid': args.non_iid,
+                'timestamp': __import__('time').strftime('%Y%m%d_%H%M%S')
+            }, pretrain_path)
+            logger.info(f"\n💾 Saved pretrained baseline to {pretrain_path}")
+            logger.info("   • Baseline accuracy: %.2f%%", baseline_acc)
 
     # Privacy accounting setup
     if args.dp_epochs is not None:
@@ -2283,6 +2343,8 @@ def main():
     
     # Train a baseline model for Fisher computation (public-only)
     fisher_baseline = build_model_for_device(args.model_type, model_kwargs, args, device)
+    if args.model_type:
+        args.dp_layer = [name for name, p in fisher_baseline.named_parameters() if p.requires_grad][-1]
     ensure_model_dataset_compatibility(fisher_baseline, dataset_task_type, args.dataset_name, args.model_type)
     fisher_opt = torch.optim.SGD(fisher_baseline.parameters(), lr=1e-3, momentum=.9)
 

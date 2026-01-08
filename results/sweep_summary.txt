@@ -8,3 +8,8 @@ k        clip     users    dp_epochs  dp_lr      lambda       | Vanilla_DP      
 512      3.0      10       10         5e-2       1.0          | 15.71(DP-SGD)      27.97(DP-SAT)      N/A                N/A                | SUCCESS   
 512      3.0      10       20         1e-2       0.5          | 18.33(DP-SGD)      24.61(DP-SAT)      N/A                N/A                | SUCCESS   
 512      3.0      10       20         1e-2       1.0          | 26.33(DP-SGD)      31.03(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      10       20         5e-2       0.5          | 17.24(DP-SGD)      23.87(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      10       20         5e-2       1.0          | 24.13(DP-SGD)      29.67(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      100      10         1e-2       0.5          | 46.01(DP-SGD)      37.85(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      100      10         1e-2       1.0          | 49.06(DP-SGD)      45.54(DP-SAT)      N/A                N/A                | SUCCESS   
+512      3.0      100      10         5e-2       0.5          | 45.96(DP-SGD)      37.71(DP-SAT)      N/A                N/A                | SUCCESS   

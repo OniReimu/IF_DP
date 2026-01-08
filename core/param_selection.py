@@ -152,7 +152,9 @@ def select_parameters_by_budget(
             layers = [s.strip() for s in target_layer.split(",")]
             names = [n for n, _ in all_params
                     if any(_match(n, l) for l in layers)]
-        elif target_layer:
+        elif type(target_layer) is list:
+            names = [n for n, _ in all_params if any(_match(n, l) for l in target_layer)]
+        elif type(target_layer) is not list and target_layer:
             names = [n for n, _ in all_params if _match(n, target_layer)]
         else:
             names = [n for n, _ in all_params]

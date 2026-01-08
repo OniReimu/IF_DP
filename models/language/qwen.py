@@ -5,7 +5,7 @@ from __future__ import annotations
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
 from .. import ModelBase, register_model
-
+import torch
 
 @register_model("qwen")
 class QwenSequenceClassifier(ModelBase):
@@ -41,6 +41,7 @@ class QwenSequenceClassifier(ModelBase):
             checkpoint,
             config=config,
             trust_remote_code=trust_remote_code,
+            torch_dtype=torch.float32
         )
         self.backbone.resize_token_embeddings(len(self.tokenizer))
 
